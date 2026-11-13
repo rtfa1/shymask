@@ -13,8 +13,10 @@
  * - recovery requires a confirmed stretch of reliable one-face samples, so the
  *   output cannot flap between processed frames and the paused screen;
  * - the per-sample pose-jump guard only applies while tracking is continuous:
- *   once the phase leaves `tracking`, the pre-loss pose is no longer a valid
- *   reference for a person who may have moved legitimately.
+ *   the reference is seeded only by a reliable sample observed while the phase
+ *   is `tracking` (or by the sample that completes recovery), so one outlier
+ *   first-recovery sample cannot latch the guard and reject every healthy
+ *   sample that follows it.
  *
  * Manual pause is deliberately *not* modelled here: the output policy checks it
  * before tracking state, so automatic recovery can never override it.
@@ -45,8 +47,13 @@ export interface TrackingSample {
 
 export type TrackingPhase = 'initializing' | 'tracking' | 'lost' | 'multiple-faces' | 'unreliable';
 
+/** How the state machine classified one tracker sample. */
+export type Classification = 'reliable' | 'unreliable' | 'none' | 'multiple';
+
 export interface TrackingSnapshot {
   phase: TrackingPhase;
+  /** How the latest sample was classified; null until the first sample. */
+  classification: Classification | null;
   /** Raw face count from the latest sample. */
   faceCount: number;
   landmarkCount: number;
@@ -95,8 +102,6 @@ export const TRACKING_LIMITS = {
   maxConsecutiveInferenceErrors: 5,
 } as const;
 
-type Classification = 'reliable' | 'unreliable' | 'none' | 'multiple';
-
 function finitePose(pose: TrackingPose | null): pose is TrackingPose {
   if (!pose) return false;
   return (
@@ -121,12 +126,15 @@ function poseJumpExceeded(previous: TrackingPose, next: TrackingPose): boolean {
 
 export class TrackingStateMachine {
   private phase: TrackingPhase = 'initializing';
+  private classification: Classification | null = null;
   private phaseSinceMs = 0;
   private lastGoodAtMs: number | null = null;
   private recoverySinceMs: number | null = null;
   private previousPose: TrackingPose | null = null;
   /** First sample of the current continuous zero-face run, if any. */
   private zeroSinceMs: number | null = null;
+  /** First sample of the current continuous one-unreliable-face run, if any. */
+  private unreliableSinceMs: number | null = null;
   private faceCount = 0;
   private landmarkCount = 0;
   private hasTransform = false;
@@ -134,11 +142,13 @@ export class TrackingStateMachine {
 
   reset(nowMs: number): void {
     this.phase = 'initializing';
+    this.classification = null;
     this.phaseSinceMs = nowMs;
     this.lastGoodAtMs = null;
     this.recoverySinceMs = null;
     this.previousPose = null;
     this.zeroSinceMs = null;
+    this.unreliableSinceMs = null;
     this.faceCount = 0;
     this.landmarkCount = 0;
     this.hasTransform = false;
@@ -170,23 +180,35 @@ export class TrackingStateMachine {
    */
   update(sample: TrackingSample, nowMs: number, injected = false): TrackingSnapshot {
     const classification = this.classify(sample);
+    this.classification = classification;
     this.faceCount = sample.faceCount;
     this.landmarkCount = sample.landmarkCount;
     this.hasTransform = sample.hasTransform;
     this.injected = injected;
     this.zeroSinceMs = classification === 'none' ? (this.zeroSinceMs ?? nowMs) : null;
+    this.unreliableSinceMs = classification === 'unreliable' ? (this.unreliableSinceMs ?? nowMs) : null;
 
     if (classification === 'reliable') {
       this.lastGoodAtMs = nowMs;
-      this.previousPose = sample.pose;
       if (this.phase === 'tracking') {
         this.recoverySinceMs = null;
+        // A reliable sample observed while the output is being published is the
+        // continuity reference for the next sample.
+        this.previousPose = sample.pose;
       } else {
         // Hold the paused output until one face has been reliably visible for
         // the recovery window, so a flapping detector cannot reveal frames.
         this.recoverySinceMs ??= nowMs;
         if (nowMs - this.recoverySinceMs >= TRACKING_LIMITS.recoveryConfirmMs) {
           this.setPhase('tracking', nowMs);
+          // The sample that completes recovery is observed as tracking begins,
+          // so it is the continuity reference for the next sample. During the
+          // paused window before this point no reference is kept: one outlier
+          // first-recovery sample must not reject every healthy sample after it
+          // and latch the guard, blocking reacquisition (AC3).
+          this.previousPose = sample.pose;
+        } else {
+          this.previousPose = null;
         }
       }
       return this.snapshot(nowMs);
@@ -223,6 +245,17 @@ export class TrackingStateMachine {
       // faces have persisted through the grace window, report the accurate
       // reason (no face) instead of claiming that more than one is visible.
       this.setPhase('lost', nowMs);
+    } else if (
+      this.phase === 'multiple-faces' &&
+      classification === 'unreliable' &&
+      this.unreliableSinceMs !== null &&
+      nowMs - this.unreliableSinceMs > TRACKING_LIMITS.unreliableConfirmMs
+    ) {
+      // The second face left but the remaining one is not trustworthy. The
+      // output is already hidden; once one unreliable face has persisted
+      // through the confirmation window, report the actual problem instead of
+      // claiming that more than one face is still visible.
+      this.setPhase('unreliable', nowMs);
     }
     return this.snapshot(nowMs);
   }
@@ -231,6 +264,7 @@ export class TrackingStateMachine {
   snapshot(nowMs: number): TrackingSnapshot {
     return {
       phase: this.phase,
+      classification: this.classification,
       faceCount: this.faceCount,
       landmarkCount: this.landmarkCount,
       hasTransform: this.hasTransform,
@@ -259,6 +293,7 @@ export class TrackingStateMachine {
 export function initialTrackingSnapshot(nowMs = 0): TrackingSnapshot {
   return {
     phase: 'initializing',
+    classification: null,
     faceCount: 0,
     landmarkCount: 0,
     hasTransform: false,
@@ -267,6 +302,18 @@ export function initialTrackingSnapshot(nowMs = 0): TrackingSnapshot {
     lastGoodAtMs: null,
     sinceGoodMs: null,
   };
+}
+
+/**
+ * Whether the sample behind `snapshot` may update the mask projection.
+ *
+ * The renderer applies a detected facial transformation matrix only when this
+ * returns true; otherwise it keeps the previous accepted projection. During the
+ * unreliable confirmation window the phase is still `tracking`, so gating on
+ * the phase alone would let one glitched pose draw a teleported mask frame.
+ */
+export function acceptsDetectedPose(snapshot: TrackingSnapshot): boolean {
+  return snapshot.classification === 'reliable';
 }
 
 /**

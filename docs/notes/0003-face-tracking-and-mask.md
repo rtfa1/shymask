@@ -22,10 +22,10 @@ claim.
   existing color treatments. Manual pause is evaluated before tracking, so
   automatic recovery cannot override it.
 - **Diagnostics.** The public diagnostics and the diagnostic injection control
-  expose the tracking phase, face/landmark counts, thresholds, inference timing,
-  mask origin/pose/probe and the model checksum. The injected states are labelled
-  `injected=true`; the real detector is authoritative when the control is on
-  `Use detected face (normal)`.
+  expose the tracking phase, the latest sample classification, face/landmark
+  counts, thresholds, inference timing, mask origin/pose/probe and the model
+  checksum. The injected states are labelled `injected=true`; the real detector
+  is authoritative when the control is on `Use detected face (normal)`.
 
 ## Tracker choice
 
@@ -86,12 +86,22 @@ the only frame source.
   there is no confirmation delay for that state. If the second face leaves and
   then no face is detected, the phase moves to `lost` after the grace window so
   the explanation says "no face was detected" instead of claiming that more than
-  one face is still visible; the output stays hidden throughout.
+  one face is still visible. If the second face leaves but the remaining face is
+  unreliable (for example too few landmarks), the phase moves to `unreliable`
+  after its confirmation window, so the explanation describes the actual problem
+  instead of claiming that more than one face is still visible. The output stays
+  hidden throughout.
 - **Recovery is automatic** once exactly one reliable face has persisted for the
   recovery window, unless the operator paused manually.
-- **The pose-jump guard is scoped to continuous tracking.** A single implausible
-  jump (more than 30 cm or 60 degrees in one sample) is still rejected while the
-  phase is `tracking`, so a detector glitch cannot teleport the mask. When the
+- **The pose-jump guard is scoped to continuous tracking.** The jump reference is
+  seeded by a reliable sample observed while the phase is `tracking` (and by the
+  sample that completes recovery); no reference is kept during the paused
+  recovery window, so one outlier first-recovery sample cannot reject every
+  healthy sample after it and latch the guard. While `tracking`, a single
+  implausible jump (more than 30 cm or 60 degrees in one sample) is classified
+  `unreliable` and the mask renderer does not project its matrix: the last
+  accepted projection is reused through the 250 ms unreliable confirmation
+  window, so a detector glitch cannot draw one teleported mask frame. When the
   phase leaves `tracking` (lost, unreliable or multiple faces), the pre-loss pose
   reference is discarded: a person who legitimately turned while the output was
   paused must be able to reacquire through the normal recovery window (issue #4,
@@ -184,6 +194,18 @@ cameras, call applications and live-human acceptance remain later slices.
   not part of this slice.
 - The app cannot detect every visual defect (for example a technically valid but
   visually wrong landmark fit). The model's own confidence gates and the
-  plausibility checks above reduce, but do not eliminate, that risk.
+  plausibility checks above reduce, but do not eliminate, that risk. The mask
+  projection uses those same app-level plausibility checks; the Tasks JS result
+  does not expose a per-sample model confidence value to gate it separately.
+- A rejected sample keeps the previous accepted projection for up to the 250 ms
+  unreliable confirmation window, so if the person moves faster than the
+  per-sample jump limit the mask can lag the face for those frames before the
+  paused output takes over. That is the deliberate trade-off that stops a
+  detector glitch from teleporting the mask.
+- The first sample that completes recovery is checked for plausibility but is
+  not compared with the pre-loss pose, because the person may legitimately have
+  moved while the output was paused. If that exact sample were a detector
+  outlier, it would define the first restored frame; the samples after it are
+  continuity-checked again.
 - WebGL2 and the GPU delegate are assumed. A machine without them shows the
   actionable hidden-output error instead of a fallback.

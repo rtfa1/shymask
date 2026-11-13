@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  acceptsDetectedPose,
   initialTrackingSnapshot,
   poseFromColumnMajorMatrix,
   TrackingStateMachine,
@@ -185,6 +186,85 @@ test('multiple faces falling back to zero faces reports tracking lost, not multi
   assert.equal(machine.update(sample(), reacquiredAt + TRACKING_LIMITS.recoveryConfirmMs).phase, 'tracking');
 });
 
+
+test('an outlier first recovery sample cannot latch the pose guard', () => {
+  const machine = new TrackingStateMachine();
+  const zero = sample({ faceCount: 0, landmarkCount: 0, hasTransform: false, pose: null });
+  machine.reset(0);
+  machine.update(sample(), 100);
+  machine.update(sample(), 400);
+  const lostAt = 400 + TRACKING_LIMITS.lostGraceMs + 10;
+  machine.update(zero, lostAt);
+  assert.equal(machine.snapshot(lostAt).phase, 'lost');
+
+  // The first sample after the gap is a detector outlier: plausible on its own,
+  // but a 150 degree yaw far from the person's continuing pose. The state
+  // machine accepts it as reliable (there is no continuity reference after a
+  // paused gap), so it must not become the permanent jump reference.
+  const outlier = sample({ pose: { yawDeg: 150, pitchDeg: 0, rollDeg: 0, tx: 0, ty: 0, tz: -56 } });
+  const recoveredAt = lostAt + 100;
+  assert.equal(machine.classify(outlier), 'reliable');
+  assert.equal(machine.update(outlier, recoveredAt).phase, 'lost');
+
+  // The person's stable pose is a large rotation away from that outlier. If the
+  // outlier had seeded the jump reference every stable sample would be rejected
+  // as unreliable and the phase would stay `lost` forever. The recovery window
+  // still applies before output is restored.
+  const stable = sample({ pose: { yawDeg: -90, pitchDeg: 0, rollDeg: 0, tx: 0, ty: 0, tz: -56 } });
+  const midRecovery = machine.update(stable, recoveredAt + 100);
+  assert.equal(midRecovery.phase, 'lost');
+  assert.equal(midRecovery.classification, 'reliable');
+  const recovered = machine.update(stable, recoveredAt + TRACKING_LIMITS.recoveryConfirmMs);
+  assert.equal(recovered.phase, 'tracking');
+  assert.equal(recovered.classification, 'reliable');
+});
+
+test('the projection gate rejects a sample classified unreliable while tracking continues', () => {
+  const machine = new TrackingStateMachine();
+  machine.reset(0);
+  machine.update(sample(), 100);
+  machine.update(sample(), 400);
+  const glitch = sample({ pose: { yawDeg: 0, pitchDeg: 0, rollDeg: 0, tx: 0, ty: 0, tz: 20 } });
+  const rejected = machine.update(glitch, 440);
+  // The phase stays `tracking` inside the confirmation window, so the phase
+  // alone cannot gate the projection; the sample classification must.
+  assert.equal(rejected.phase, 'tracking');
+  assert.equal(rejected.classification, 'unreliable');
+  assert.equal(acceptsDetectedPose(rejected), false);
+  const accepted = machine.update(sample(), 480);
+  assert.equal(accepted.phase, 'tracking');
+  assert.equal(accepted.classification, 'reliable');
+  assert.equal(acceptsDetectedPose(accepted), true);
+});
+
+test('no sample has been accepted before the first tracker update', () => {
+  assert.equal(initialTrackingSnapshot(0).classification, null);
+  assert.equal(acceptsDetectedPose(initialTrackingSnapshot(0)), false);
+});
+
+test('multiple faces falling back to one unreliable face reports unreliable, not multiple faces', () => {
+  const machine = new TrackingStateMachine();
+  machine.reset(0);
+  machine.update(sample(), 100);
+  machine.update(sample(), 400);
+  assert.equal(machine.update(sample({ faceCount: 2 }), 440).phase, 'multiple-faces');
+  const unreliable = sample({ landmarkCount: 120, hasTransform: false, pose: null });
+  const firstUnreliableAt = 500;
+  const stillMultiple = machine.update(unreliable, firstUnreliableAt);
+  assert.equal(stillMultiple.phase, 'multiple-faces');
+  assert.equal(stillMultiple.faceCount, 1);
+  assert.equal(
+    machine.update(unreliable, firstUnreliableAt + TRACKING_LIMITS.unreliableConfirmMs - 10).phase,
+    'multiple-faces',
+  );
+  const switched = machine.update(unreliable, firstUnreliableAt + TRACKING_LIMITS.unreliableConfirmMs + 10);
+  assert.equal(switched.phase, 'unreliable');
+  assert.equal(switched.faceCount, 1);
+  // A healthy face still recovers through the normal recovery window.
+  const recoveredAt = firstUnreliableAt + TRACKING_LIMITS.unreliableConfirmMs + 20;
+  assert.equal(machine.update(sample(), recoveredAt).phase, 'unreliable');
+  assert.equal(machine.update(sample(), recoveredAt + TRACKING_LIMITS.recoveryConfirmMs).phase, 'tracking');
+});
 
 test('injected samples are labelled but use the same transitions', () => {
   const machine = new TrackingStateMachine();

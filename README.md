@@ -101,7 +101,10 @@ screen, in the preview **and** in the virtual camera. Closing Shymask stops its 
   MediaPipe's canonical face units, attaches it to the facial transformation matrix (not screen
   coordinates), and renders it to an offscreen transparent WebGL canvas. `src/core/pipeline.ts`
   composites that canvas into the single output canvas. The camera uses MediaPipe's 63-degree
-  vertical-FOV assumption, which is what makes the mask land on the face. See
+  vertical-FOV assumption, which is what makes the mask land on the face. Only a sample the tracking
+  state machine classifies reliable updates the mask transform; a rejected sample (for example one
+  implausible pose jump) keeps the previous accepted projection through the confirmation window, so a
+  detector glitch cannot draw one teleported mask frame. See
   [`docs/notes/0003-face-tracking-and-mask.md`](docs/notes/0003-face-tracking-and-mask.md).
 - **Failure policy.** The policy in `src/core/output-policy.ts` returns the opaque
   "Tracking paused" decision for startup, first-frame wait, missing/invalid fixture, missing/corrupt

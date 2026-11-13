@@ -10,6 +10,7 @@ import { PreviewPipeline, type FrameStats } from '../core/pipeline';
 import { ReplayTimeline, type ReplayFrameTimestamp } from '../core/replay-clock';
 import { EFFECT_OPTIONS, getEffectLabel, getTreatment, isMaskEffect, type ColorTreatment, type EffectId } from '../core/treatments';
 import {
+  acceptsDetectedPose,
   initialTrackingSnapshot,
   TrackingStateMachine,
   TRACKING_LIMITS,
@@ -650,10 +651,16 @@ function updateTracking(element: HTMLVideoElement, nowMs: number): void {
     }
     lastDetection = detected;
     sample = detected;
-    if (detected.matrix && maskRenderer) {
+    // Classify/update the state machine before the mask is drawn, then project
+    // the detected pose only for a sample it accepted. A rejected sample (for
+    // example one implausible pose jump) keeps the previous accepted projection
+    // through the unreliable confirmation window instead of teleporting the
+    // mask for one frame.
+    const snapshot = tracking.update(sample, nowMs, false);
+    state.tracking = snapshot;
+    if (acceptsDetectedPose(snapshot) && detected.matrix && maskRenderer) {
       lastMaskProjection = maskRenderer.setPose(detected.matrix);
     }
-    state.tracking = tracking.update(sample, nowMs, false);
   } catch (error) {
     detectionErrors += 1;
     const message = (error as Error).message;
@@ -883,7 +890,7 @@ function updateTrackingDiagnostics(): void {
   const snapshot = state.tracking;
   setDiag(
     'diag-tracking',
-    `phase=${snapshot.phase} faces=${snapshot.faceCount} landmarks=${snapshot.landmarkCount} transform=${snapshot.hasTransform} injected=${snapshot.injected} source=${snapshot.injected ? trackingInjection : 'detector'} sinceGoodMs=${snapshot.sinceGoodMs === null ? 'none' : Math.round(snapshot.sinceGoodMs)} graceMs=${TRACKING_LIMITS.lostGraceMs} recoveryMs=${TRACKING_LIMITS.recoveryConfirmMs} detectionConfidence=${TRACKING_LIMITS.minFaceDetectionConfidence} presenceConfidence=${TRACKING_LIMITS.minFacePresenceConfidence} trackingConfidence=${TRACKING_LIMITS.minTrackingConfidence}`,
+    `phase=${snapshot.phase} sample=${snapshot.classification ?? 'none'} faces=${snapshot.faceCount} landmarks=${snapshot.landmarkCount} transform=${snapshot.hasTransform} injected=${snapshot.injected} source=${snapshot.injected ? trackingInjection : 'detector'} sinceGoodMs=${snapshot.sinceGoodMs === null ? 'none' : Math.round(snapshot.sinceGoodMs)} graceMs=${TRACKING_LIMITS.lostGraceMs} recoveryMs=${TRACKING_LIMITS.recoveryConfirmMs} detectionConfidence=${TRACKING_LIMITS.minFaceDetectionConfidence} presenceConfidence=${TRACKING_LIMITS.minFacePresenceConfidence} trackingConfidence=${TRACKING_LIMITS.minTrackingConfidence}`,
   );
   const lastInference = detectionTimings.length > 0 ? detectionTimings[detectionTimings.length - 1] ?? 0 : 0;
   setDiag(

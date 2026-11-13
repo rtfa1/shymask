@@ -1273,6 +1273,7 @@ async function readTracking(page) {
 function injectedTrackingEvidence(tracking) {
   return {
     phase: tracking.phase,
+    classification: tracking.sample,
     injected: tracking.injected === 'true',
     source: tracking.source,
     faces: Number(tracking.faces),
@@ -1389,7 +1390,19 @@ async function trackingMaskScenario() {
     pass('Face tracker assets are validated before Start and startup stays paused', `${model.state} ${model.sha256}`);
 
     await page.locator('[data-testid="start"]').click();
-    const tracked = await waitForTrackingPhase(page);
+    // The mask transform is only updated from a sample the state machine
+    // classifies reliable, so the public diagnostic must expose that
+    // classification alongside the phase.
+    const tracked = await waitFor(
+      'tracking phase tracking with a reliably classified sample',
+      async () => {
+        const values = await readTracking(page);
+        return values.phase === 'tracking' && values.sample === 'reliable' ? values : null;
+      },
+      30000,
+      100,
+    );
+    assert.equal(tracked.sample, 'reliable');
     assert.equal(Number(tracked.faces), 1);
     assert.ok(Number(tracked.landmarks) >= 400, `tracked face must expose landmarks, got ${tracked.landmarks}`);
     assert.equal(tracked.transform, 'true');
@@ -1499,6 +1512,7 @@ async function trackingMaskScenario() {
     assert.equal(lostTracking.injected, true, 'tracking-loss evidence must come from the labelled injection');
     assert.equal(lostTracking.source, 'lost');
     assert.equal(lostTracking.phase, 'lost');
+    assert.equal(lostTracking.classification, 'none');
     assert.equal(lostTracking.faces, 0);
     await page.waitForTimeout(300);
     const lostRgb = await readRgb(page);
@@ -1527,6 +1541,7 @@ async function trackingMaskScenario() {
     assert.equal(multipleTracking.injected, true, 'multiple-face evidence must come from the labelled injection');
     assert.equal(multipleTracking.source, 'multiple');
     assert.equal(multipleTracking.phase, 'multiple-faces');
+    assert.equal(multipleTracking.classification, 'multiple');
     assert.ok(multipleTracking.faces > 1, `multiple-face evidence must report more than one face, got ${multipleTracking.faces}`);
     await page.waitForTimeout(300);
     const multipleRgb = await readRgb(page);
@@ -1555,6 +1570,7 @@ async function trackingMaskScenario() {
     assert.equal(unreliableTracking.injected, true, 'unreliable-tracking evidence must come from the labelled injection');
     assert.equal(unreliableTracking.source, 'unreliable');
     assert.equal(unreliableTracking.phase, 'unreliable');
+    assert.equal(unreliableTracking.classification, 'unreliable');
     assert.equal(unreliableTracking.faces, 1);
     await page.waitForTimeout(300);
     const unreliableRgb = await readRgb(page);
