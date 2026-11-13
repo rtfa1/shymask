@@ -455,13 +455,13 @@ source clip 3.379 s:
 | Measurement | Value |
 | --- | --- |
 | Camera media type | RGB32 1280×720 @ 30/1 |
-| Camera frames observed | 212 over 6.89 s (30.5 Hz sample rate) |
-| Camera frame interval, p95 | 47 ms |
-| Replay-to-camera latency, p50 / p95 | 33 ms / 56 ms in the latest run (32–37 / 55–77 ms across recent runs; canvas capture time → consumer receive time) |
+| Camera frames observed | 212 over 6.89–6.94 s (30.4–30.5 Hz sample rate) |
+| Camera frame interval, p95 | 47–48 ms |
+| Replay-to-camera latency, p50 / p95 | 32–33 ms / 54–62 ms across recent runs (canvas capture time → consumer receive time) |
 | Camera mean-RGB spread across the window | 19 (replay content changes across loops) |
 | Replay loops crossed during the camera window | 2 |
-| Source frame interval, p95 | 48.8 ms in the latest run; ~42–55 ms across passing runs (the clip presents at ~18–24 Hz here; no 30 FPS forcing) |
-| Render + filter cost, p95 | 16.9 ms in the latest run (main-thread draw/filter plus the diagnostics mean-RGB sample; a connected camera adds canvas readback) |
+| Source frame interval, p95 | 48.8–55.5 ms across recent runs; ~42–55 ms across passing runs (the clip presents at ~18–24 Hz here; no 30 FPS forcing) |
+| Render + filter cost, p95 | 16.9–17.1 ms in recent runs (main-thread draw/filter plus the diagnostics mean-RGB sample; a connected camera adds canvas readback) |
 | Mask render + composite cost, p95 | 10–15 ms across recent runs (offscreen mask render plus the drawImage composite into the output canvas, including the diagnostics sample) |
 | Tracker inference, steady-state p95 | 13.2–13.8 ms per presented frame |
 | Tracker inference, first-call warm-up | ~0.28 s in recent runs; ~0.3–2.0 s observed across runs (excluded from the p95) |
@@ -472,13 +472,13 @@ source clip 3.379 s:
 | Occlusion A/B at two turned frames (47.7 s about −20° to −22°, 16.0 s about +9° to +14°) | bundled mask 15,705–17,414 px changed (89–94% inside the tracked-face bbox); `guard-visor` 5,319–5,700 px (92–96.5%); `rose-visor` 2,257–2,306 px (100%); same-state repeats pixel-identical. ON reveal is proved by exact colour: package material ≥97% of changed pixels in OFF and ≤3% in ON (observed 0.3–1.5%); bundled dominant palette ≥90% coverage and ≤1% reappearance in ON (observed ≤0.1%, including 4 px in one opposite-view run) |
 | Occlusion camera A/B | the independent consumer received the same change on the held frame: total and inside-bbox pixel counts are asserted equal to the preview's for the bundled mask and `guard-visor`, with 0 same-state self-diff |
 | Face-distortion warp pass, p95 | 0.4 ms at 1280×720 (offscreen WebGL radial-warp pass, rolling p95 after warm-up) |
-| Face-distortion render + composite, p95 | 14.9 ms vs 13.9 ms for the color-only baseline on the same fixture (observed +1.0 ms, including the diagnostics sampling) |
-| Face-distortion presented-frame interval, p95 | 65.2 ms vs 48.8 ms in the sequential comparison; this difference exceeds the 0.4 ms warp cost and the two windows are not isolated, so it is reported as observed run variation, not attributed added cost |
-| Face-distortion pixel evidence (default clip) | about 70% of inside-ellipse samples changed vs 0.0% outside; warp delta about 0.9–1.1 (0–255 mean absolute); the exact 1280×720 preview PNG and the camera PNG both show non-paused processed content |
-| Face-distortion recorded-motion following | 18/18 sampled frames tracked on `pose-loop-v1`; warp centre moved about 91 × 80 px with the tracked face box; inside-ellipse change about 60% (every sample passes the ≥8% inside / ≤3% outside gates) |
-| Loop cycles observed | 3 seam crossings inside an 8.36 s sampling window |
+| Face-distortion render + composite, p95 | 14.9–15.3 ms across recent runs, with the color-only baseline 13.8–15.1 ms on the same fixture (observed sequential delta 0.1–1.5 ms, including the diagnostics sampling) |
+| Face-distortion presented-frame interval, p95 | ~65–76 ms vs ~49–56 ms in sequential comparisons; the observed delta (16–27 ms) exceeds the 0.4 ms warp cost and the two windows are not isolated, so it is reported as observed run variation, not attributed added cost |
+| Face-distortion pixel evidence (default clip) | about 70–73% of inside-ellipse samples changed vs 0.0% outside; warp delta about 0.8–1.1 (0–255 mean absolute); the exact 1280×720 preview PNG and the camera PNG both show non-paused processed content |
+| Face-distortion recorded-motion following | 18/18 sampled frames tracked on `pose-loop-v1`; warp centre moved about 91–97 × 67–80 px with the tracked face box; inside-ellipse change about 56–61% (every sample passes the ≥8% inside / ≤3% outside gates) |
+| Loop cycles observed | 3 seam crossings inside an 8.36–8.60 s sampling window |
 | Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
-| Replay pacing ratio | 0.999 processing time / wall time in the latest run |
+| Replay pacing ratio | 0.99–1.005 processing time / wall time across recent runs |
 
 Effect-package evidence from the same run (replay-based): the committed `guard-visor` sample is a
 1,715-byte archive with 2 entries and a 693-byte manifest, containing a 2,284-byte GLB with 96
@@ -494,7 +494,7 @@ material colour (RGB 32,196,128) is asserted in both preview and camera (about 3
 enforced >25,000), and a rapid double switch must leave only the later package's mask committed.
 `face-distortion` is a 415-byte schema v2 distortion-only archive whose public diagnostic reports the
 tracked face box and the resolved ellipse; a same-texture identity-vs-warped comparison changed about
-70% of inside-ellipse samples and 0.0% outside, and both the preview PNG and the independent camera PNG
+70–73% of inside-ellipse samples and 0.0% outside, and both the preview PNG and the independent camera PNG
 showed non-paused processed content. The schema v2 sample and the four distortion negative fixtures
 are generated by `npm run build:packages`; replay-based timing for the distortion path is recorded
 for the later complete-effect benchmark (see the table below and

@@ -1130,6 +1130,25 @@ async function captureCameraState(page, prefix, frames = 4) {
 }
 
 /**
+ * Paused capture with bounded retries. A newly started consumer can receive
+ * only the native paused fallback until the app notices the client and its
+ * 100 ms heartbeat publishes the opaque paused canvas; with only four consumer
+ * frames that race can lose. Retry a bounded number of times and still require
+ * an app-published frame in the caller, so a persistent fallback fails.
+ */
+async function capturePausedCameraState(page, prefix, label, frames = 8) {
+  let lastRun = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    lastRun = await captureCameraState(page, prefix, frames);
+    const appFrames = lastRun.frames.filter((frame) => frame.captureUnixMs > 0).length;
+    log(`[${label}] paused camera attempt ${attempt + 1}/3: frames=${lastRun.frames.length} appFrames=${appFrames}`);
+    if (appFrames >= 1) return lastRun;
+    await page.waitForTimeout(400);
+  }
+  return lastRun;
+}
+
+/**
  * A newly started consumer can briefly receive only the native paused fallback
  * before the app's first published frame. The media source clears its cache for
  * every consumer stream and the renderer only starts publishing once the camera
@@ -3859,7 +3878,7 @@ async function effectPackageScenario() {
       return /paused manually/i.test(status.explanation) ? status : null;
     });
     await page.waitForTimeout(300);
-    const distortionManualRun = await captureCameraState(page, 'distortion-manual-pause', 4);
+    const distortionManualRun = await capturePausedCameraState(page, 'distortion-manual-pause', 'face distortion manual pause');
     assertAllPausedFrames(distortionManualRun.frames, 'face distortion manual pause');
     const distortionManualPng = assertPausedPng(distortionManualRun.frames, 'face distortion manual pause');
     await page.locator('[data-testid="pause-toggle"]').click();
@@ -3873,7 +3892,7 @@ async function effectPackageScenario() {
     await page.waitForTimeout(300);
     const distortionLostRgb = await readRgb(page);
     assert.ok(rgbSum(distortionLostRgb) < 120, `tracking loss must hide the distortion, got ${JSON.stringify(distortionLostRgb)}`);
-    const distortionLostRun = await captureCameraState(page, 'distortion-tracking-lost', 4);
+    const distortionLostRun = await capturePausedCameraState(page, 'distortion-tracking-lost', 'face distortion tracking loss');
     assertAllPausedFrames(distortionLostRun.frames, 'face distortion tracking loss');
     const distortionLostPng = assertPausedPng(distortionLostRun.frames, 'face distortion tracking loss');
     await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
@@ -3887,7 +3906,7 @@ async function effectPackageScenario() {
     await page.waitForTimeout(300);
     const distortionMultipleRgb = await readRgb(page);
     assert.ok(rgbSum(distortionMultipleRgb) < 120, `multiple faces must hide the distortion, got ${JSON.stringify(distortionMultipleRgb)}`);
-    const distortionMultipleRun = await captureCameraState(page, 'distortion-multiple-faces', 4);
+    const distortionMultipleRun = await capturePausedCameraState(page, 'distortion-multiple-faces', 'face distortion multiple faces');
     assertAllPausedFrames(distortionMultipleRun.frames, 'face distortion multiple faces');
     const distortionMultiplePng = assertPausedPng(distortionMultipleRun.frames, 'face distortion multiple faces');
     await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
@@ -3901,7 +3920,7 @@ async function effectPackageScenario() {
     await page.waitForTimeout(300);
     const distortionInterruptedRgb = await readRgb(page);
     assert.ok(rgbSum(distortionInterruptedRgb) < 120, `a processing failure must hide the distortion, got ${JSON.stringify(distortionInterruptedRgb)}`);
-    const distortionInterruptedRun = await captureCameraState(page, 'distortion-processing-failure', 4);
+    const distortionInterruptedRun = await capturePausedCameraState(page, 'distortion-processing-failure', 'face distortion processing failure');
     assertAllPausedFrames(distortionInterruptedRun.frames, 'face distortion processing failure');
     const distortionInterruptedPng = assertPausedPng(distortionInterruptedRun.frames, 'face distortion processing failure');
     await page.locator('[data-testid="simulate-failure"]').uncheck();
@@ -3934,7 +3953,7 @@ async function effectPackageScenario() {
     await page.waitForTimeout(300);
     const distortionDisabledRgb = await readRgb(page);
     assert.ok(rgbSum(distortionDisabledRgb) < 120, `No effect must hide the distortion output, got ${JSON.stringify(distortionDisabledRgb)}`);
-    const distortionDisabledRun = await captureCameraState(page, 'distortion-no-effect', 4);
+    const distortionDisabledRun = await capturePausedCameraState(page, 'distortion-no-effect', 'face distortion disabled');
     assertAllPausedFrames(distortionDisabledRun.frames, 'face distortion disabled');
     const distortionDisabledPng = assertPausedPng(distortionDisabledRun.frames, 'face distortion disabled');
 
@@ -3952,7 +3971,7 @@ async function effectPackageScenario() {
     await page.waitForTimeout(300);
     const distortionRemovedRgb = await readRgb(page);
     assert.ok(rgbSum(distortionRemovedRgb) < 120, `removing the distortion must leave the paused output, got ${JSON.stringify(distortionRemovedRgb)}`);
-    const distortionRemovedRun = await captureCameraState(page, 'distortion-removed', 4);
+    const distortionRemovedRun = await capturePausedCameraState(page, 'distortion-removed', 'face distortion removed');
     assertAllPausedFrames(distortionRemovedRun.frames, 'face distortion removed');
     const distortionRemovedPng = assertPausedPng(distortionRemovedRun.frames, 'face distortion removed');
     const optionsAfterDistortionRemoval = await effectOptionValues(page);

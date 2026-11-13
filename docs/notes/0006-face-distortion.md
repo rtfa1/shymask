@@ -156,13 +156,13 @@ manifest, no mask asset). The public check's run recorded:
 
 | Measurement | Value |
 | --- | --- |
-| Default-clip warp change | about 70% of inside-ellipse samples changed, 0.0% outside, warp delta about 0.9-1.1 (0-255 mean absolute) |
-| Distortion preview PNG | exact 1280×720 captured output, non-paused (mean RGB about 139,51,43 on the run's frame) |
+| Default-clip warp change | about 70–73% of inside-ellipse samples changed, 0.0% outside, warp delta about 0.8–1.1 (0-255 mean absolute) |
+| Distortion preview PNG | exact 1280×720 captured output, non-paused (mean RGB about 138–140,51–52,43–46 across recent runs) |
 | Distortion camera PNG | independent Media Foundation consumer mean matched the preview within the check's tolerance |
 | Offscreen warp pass, p95 | 0.4 ms at 1280×720 (rolling p95 after warm-up) |
-| Render + composite + diagnostics, p95 | 14.9 ms vs 13.9 ms for the color-only baseline (observed delta about 1.0 ms) |
-| Presented-frame interval, p95 | 65.2 ms vs 48.8 ms in the sequential comparison; this difference is larger than the 0.4 ms warp cost and the two 2.2 s windows are not isolated, so it is reported as observed run variation, not attributed added cost |
-| Recorded-motion window | 18/18 samples tracked on `pose-loop-v1`; warp centre moved about 91×80 px with the face box; inside-ellipse change about 60% (every sample passes the ≥8% inside / ≤3% outside gates) |
+| Render + composite + diagnostics, p95 | 14.9–15.3 ms across recent runs, with the color-only baseline 13.8–15.1 ms on the same fixture (observed sequential delta 0.1–1.5 ms) |
+| Presented-frame interval, p95 | ~65–76 ms vs ~49–56 ms in sequential comparisons; the observed delta (16–27 ms) exceeds the 0.4 ms warp cost and the two 2.2 s windows are not isolated, so it is reported as observed run variation, not attributed added cost |
+| Recorded-motion window | 18/18 samples tracked on `pose-loop-v1`; warp centre moved about 91–97×67–80 px with the face box; inside-ellipse change about 56–61% (every sample passes the ≥8% inside / ≤3% outside gates) |
 | Paused-output camera captures | manual pause, tracking loss, multiple faces, processing failure, no-effect and removal all delivered the opaque paused canvas (mean ≈ 12,15,20) |
 
 The measured inside/outside split is what distinguishes a face-following warp
