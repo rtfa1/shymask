@@ -1,0 +1,95 @@
+import type { ColorTreatment } from './treatments';
+
+export interface Rgb {
+  r: number;
+  g: number;
+  b: number;
+}
+
+export interface FrameStats {
+  renderCostMs: number;
+  meanRgb: Rgb;
+}
+
+/**
+ * The one canvas that produces every visible output frame. Processed frames
+ * and the opaque paused screen are both drawn here; later slices capture this
+ * same canvas for the virtual webcam instead of introducing a second path.
+ */
+export class PreviewPipeline {
+  private readonly context: CanvasRenderingContext2D;
+  private readonly sampleCanvas: HTMLCanvasElement;
+  private readonly sampleContext: CanvasRenderingContext2D;
+
+  constructor(private readonly canvas: HTMLCanvasElement) {
+    const context = canvas.getContext('2d', { alpha: false });
+    if (!context) throw new Error('Canvas 2D context is unavailable.');
+    this.context = context;
+
+    this.sampleCanvas = document.createElement('canvas');
+    this.sampleCanvas.width = 16;
+    this.sampleCanvas.height = 9;
+    const sampleContext = this.sampleCanvas.getContext('2d', { alpha: false, willReadFrequently: true });
+    if (!sampleContext) throw new Error('Canvas 2D sampling context is unavailable.');
+    this.sampleContext = sampleContext;
+  }
+
+  get width(): number {
+    return this.canvas.width;
+  }
+
+  get height(): number {
+    return this.canvas.height;
+  }
+
+  renderProcessedFrame(source: HTMLVideoElement, treatment: ColorTreatment): FrameStats {
+    const startedAt = performance.now();
+    this.context.save();
+    this.context.filter = treatment.cssFilter;
+    this.context.drawImage(source, 0, 0, this.width, this.height);
+    this.context.restore();
+    return this.finishFrame(startedAt);
+  }
+
+  renderPausedScreen(title: string): FrameStats {
+    const startedAt = performance.now();
+    this.context.save();
+    this.context.filter = 'none';
+    this.context.fillStyle = '#0a0d12';
+    this.context.fillRect(0, 0, this.width, this.height);
+    this.context.fillStyle = '#f4f6f8';
+    this.context.textAlign = 'center';
+    this.context.textBaseline = 'middle';
+    this.context.font = '600 72px "Segoe UI", system-ui, sans-serif';
+    this.context.fillText(title, this.width / 2, this.height / 2);
+    this.context.restore();
+    return this.finishFrame(startedAt);
+  }
+
+  private finishFrame(startedAt: number): FrameStats {
+    return {
+      renderCostMs: performance.now() - startedAt,
+      meanRgb: this.meanRgb(),
+    };
+  }
+
+  /** Cheap 16x9 downscale sample used only for public diagnostics. */
+  private meanRgb(): Rgb {
+    this.sampleContext.drawImage(this.canvas, 0, 0, this.sampleCanvas.width, this.sampleCanvas.height);
+    const pixels = this.sampleContext.getImageData(0, 0, this.sampleCanvas.width, this.sampleCanvas.height).data;
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    const count = pixels.length / 4;
+    for (let index = 0; index < pixels.length; index += 4) {
+      r += pixels[index] ?? 0;
+      g += pixels[index + 1] ?? 0;
+      b += pixels[index + 2] ?? 0;
+    }
+    return {
+      r: Math.round(r / count),
+      g: Math.round(g / count),
+      b: Math.round(b / count),
+    };
+  }
+}

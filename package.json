@@ -1,0 +1,27 @@
+{
+  "name": "shymask",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shymask development preview: a looped webcam-style replay with a selectable color treatment.",
+  "license": "UNLICENSED",
+  "main": "dist/src/main/main.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.json",
+    "start": "npm run build && node scripts/start.mjs",
+    "fetch:fixture": "node scripts/fetch-fixture.mjs",
+    "test": "npm run build && node --test \"dist/tests/**/*.test.js\"",
+    "check": "npm run build && node scripts/check-app.mjs",
+    "check:all": "npm test && npm run check"
+  },
+  "devDependencies": {
+    "@types/node": "^24.9.0",
+    "electron": "45.3.1",
+    "esbuild": "^0.25.0",
+    "playwright-core": "^1.65.0",
+    "typescript": "^5.9.0"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}
