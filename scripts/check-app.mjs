@@ -4018,15 +4018,20 @@ async function effectPackageScenario() {
       renderCostP95Ms: Number(treatmentRenderCost.p95Ms ?? 0),
       frameIntervalP95Ms: Number(treatmentFrameDelta.p95Ms ?? 0),
     };
-    evidence.distortion.timing.addedRenderCostP95Ms = Number(
+    // The two 2.2 s sampling windows run sequentially, so the frame-interval
+    // difference is an observed delta rather than an isolated causal cost. The
+    // render-cost delta and the offscreen warp cost are the attributable numbers.
+    evidence.distortion.timing.observedRenderCostDeltaP95Ms = Number(
       (evidence.distortion.timing.renderCostP95Ms - evidence.distortion.timingBaseline.renderCostP95Ms).toFixed(2),
     );
-    evidence.distortion.timing.addedFrameIntervalP95Ms = Number(
+    evidence.distortion.timing.observedFrameIntervalDeltaP95Ms = Number(
       (evidence.distortion.timing.frameIntervalP95Ms - evidence.distortion.timingBaseline.frameIntervalP95Ms).toFixed(2),
     );
+    evidence.distortion.timing.frameIntervalNote =
+      'Observed difference between sequential 2.2 s windows; not isolated and not attributed to the distortion. The offscreen warp cost and the render-cost delta are the attributable measurements.';
     pass(
       'Replay-based timing for the distortion path is recorded for the later complete-effect benchmark',
-      `warp p95=${evidence.distortion.timing.warpCostP95Ms}ms render p95=${evidence.distortion.timing.renderCostP95Ms}ms baseline render p95=${evidence.distortion.timingBaseline.renderCostP95Ms}ms frame interval p95 ${evidence.distortion.timing.frameIntervalP95Ms}ms vs ${evidence.distortion.timingBaseline.frameIntervalP95Ms}ms`,
+      `warp p95=${evidence.distortion.timing.warpCostP95Ms}ms render p95=${evidence.distortion.timing.renderCostP95Ms}ms baseline render p95=${evidence.distortion.timingBaseline.renderCostP95Ms}ms observed frame interval ${evidence.distortion.timing.frameIntervalP95Ms}ms vs ${evidence.distortion.timingBaseline.frameIntervalP95Ms}ms (sequential, not isolated)`,
     );
 
     // --- Negative imports keep the current effect and never crash ------------
@@ -4466,8 +4471,8 @@ async function main() {
   log(`occlusion A/B (opposite):    ${recordedMotion.occlusion.opposite.bundled.changedPixels}px changed at yaw=${recordedMotion.occlusion.opposite.bundled.mask.yaw}, ${(100 * recordedMotion.occlusion.opposite.bundled.insideFaceFraction).toFixed(1)}% inside face bbox; camera ${recordedMotion.occlusion.opposite.camera.changedPixels}px; guard ${recordedMotion.occlusion.opposite.guardVisor.changedPixels}px`);
   log('\n== Face distortion (replay-based) ==');
   log(`distortion warp cost p95:    ${effectPackages.distortion.timing.warpCostP95Ms}ms (offscreen WebGL pass at 1280x720)`);
-  log(`distortion render cost p95:  ${effectPackages.distortion.timing.renderCostP95Ms}ms vs ${effectPackages.distortion.timingBaseline.renderCostP95Ms}ms color-only baseline (added ${effectPackages.distortion.timing.addedRenderCostP95Ms}ms)`);
-  log(`distortion frame pacing p95: ${effectPackages.distortion.timing.frameIntervalP95Ms}ms vs ${effectPackages.distortion.timingBaseline.frameIntervalP95Ms}ms baseline (added ${effectPackages.distortion.timing.addedFrameIntervalP95Ms}ms)`);
+  log(`distortion render cost p95:  ${effectPackages.distortion.timing.renderCostP95Ms}ms vs ${effectPackages.distortion.timingBaseline.renderCostP95Ms}ms color-only baseline (observed delta ${effectPackages.distortion.timing.observedRenderCostDeltaP95Ms}ms)`);
+  log(`distortion frame pacing p95: ${effectPackages.distortion.timing.frameIntervalP95Ms}ms vs ${effectPackages.distortion.timingBaseline.frameIntervalP95Ms}ms baseline (sequential windows; observed delta ${effectPackages.distortion.timing.observedFrameIntervalDeltaP95Ms}ms, not isolated or attributed to the warp)`);
   log(`distortion face following:   ${recordedMotion.distortion.trackedSamples}/18 samples, warp centre moved ${recordedMotion.distortion.centerXRange}x${recordedMotion.distortion.centerYRange}px with the tracked face box`);
   log(`distortion pixel evidence:   changedInsidePct=${effectPackages.distortion.preview.active.changedInsidePct}% changedOutsidePct=${effectPackages.distortion.preview.active.changedOutsidePct}% warpDelta=${effectPackages.distortion.preview.active.warpDelta} on the default clip`);
   log(`tracker model:               ${trackerMetadata.id} sha256=${trackerMetadata.sha256.slice(0, 12)}…`);
