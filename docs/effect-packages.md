@@ -1,16 +1,19 @@
-# Effect packages (schema v2, v1 still accepted)
+# Effect packages (schema v3, v1/v2 still accepted)
 
 Shymask effects can be imported as **validated effect packages**. A package
 contains supported assets and declared behaviors only — never executable effect
-code. This document is the creator-facing contract for schema versions **1 and
-2**, the validation and import behavior, what is explicitly unsupported, and
+code. This document is the creator-facing contract for schema versions **1, 2
+and 3**, the validation and import behavior, what is explicitly unsupported, and
 guidance for the later AI-authoring slice ([issue #9]).
 
 - **v1** packages declare a rigid GLB mask and/or a color treatment. They remain
   accepted unchanged.
-- **v2** adds the optional bounded `faceDistortion` component. A v1 manifest
-  that declares `faceDistortion` is rejected (`schema-version-unsupported`)
-  instead of having the distortion silently dropped by a v1-only build.
+- **v2** adds the optional bounded `faceDistortion` component.
+- **v3** adds the optional bounded `secondaryMotion` component: 1-4 named mask
+  GLB nodes driven by a fixed spring simulation attached to the tracked head.
+- A lower-version manifest that declares a newer component is rejected
+  (`schema-version-unsupported`) instead of having the component silently
+  dropped by an older build.
 
 This slice was validated with recorded replay input and the Windows virtual
 camera (see [validation evidence](#validation-and-evidence)); no physical webcam
@@ -26,14 +29,17 @@ manifest.json                  required, at the archive root
 assets/<file>.glb              only the mask asset the manifest declares
 ```
 
-- The manifest is versioned with `schemaVersion: 1` or `schemaVersion: 2`.
-  Other versions are rejected with `schema-version-unsupported`. A
-  `faceDistortion` declaration requires schema version 2.
+- The manifest is versioned with `schemaVersion: 1`, `2` or `3`. Other versions
+  are rejected with `schema-version-unsupported`. A `faceDistortion`
+  declaration requires schema version 2 or later; a `secondaryMotion`
+  declaration requires schema version 3.
 - Only one complete effect is selected at a time. A complete effect may combine
-  a rigid mask, a bounded face distortion and a color treatment; there is no
-  stacking interface and no per-component selection.
+  a rigid mask, bounded movable parts, a bounded face distortion and a color
+  treatment; there is no stacking interface and no per-component selection.
 - A package may contain a mask, a face distortion, a color treatment, or a
   combination. Declaring none of them is rejected as `empty-effect`.
+  `secondaryMotion` is not a standalone effect: it must name nodes of a declared
+  mask.
 - Every archive entry must be the manifest or a declared asset. Extra files,
   scripts, `assets` subdirectories and `.gltf`/`.bin`/texture files are
   rejected.
@@ -120,6 +126,48 @@ matching preview and virtual-camera frames. The negative fixtures
 `distortion-schema-v1`, `distortion-invalid-mode`, `distortion-out-of-range` and
 `distortion-unknown-field` are rejected with their documented codes.
 
+The fifth committed sample, `fixtures/packages/reactive-ears.zip`, is a schema
+v3 mask with three movable parts: two ears driven by tracked yaw and a hair tuft
+driven by tracked pitch. Its manifest is:
+
+```json
+{
+  "schemaVersion": 3,
+  "id": "shymask.reactive-ears",
+  "name": "Reactive ears",
+  "version": "1.0.0",
+  "description": "Unlit visor with two spring-driven ears that react to tracked yaw and a hair tuft that reacts to tracked pitch.",
+  "author": {
+    "name": "Shymask sample author",
+    "attribution": "Generated reproducibly by scripts/build-package-fixtures.mjs",
+    "license": "CC0-1.0"
+  },
+  "mask": {
+    "asset": "assets/reactive-ears.glb",
+    "attachment": { "position": [0, 0, 0], "rotationDeg": [0, 0, 0], "scale": 1 }
+  },
+  "secondaryMotion": {
+    "parts": [
+      { "node": "ear-left",  "axis": "y", "drive": "yaw",   "stiffness": 60, "damping": 0.30, "maxAngleDeg": 32, "restAngleDeg": 0 },
+      { "node": "ear-right", "axis": "y", "drive": "yaw",   "stiffness": 60, "damping": 0.30, "maxAngleDeg": 32, "restAngleDeg": 0 },
+      { "node": "hair-tuft", "axis": "x", "drive": "pitch", "stiffness": 45, "damping": 0.25, "maxAngleDeg": 35, "restAngleDeg": 0 }
+    ]
+  }
+}
+```
+
+The GLB has four nodes (`visor`, `ear-left`, `ear-right`, `hair-tuft`). Each
+movable part's node origin is its pivot and its geometry is authored around that
+pivot, so a local-axis rotation swings the part. The public check imports this
+package, verifies preview and independent camera output, samples the recorded
+turn/nod window, measures post-turn spring settling, injects loop-seam and
+tracking-loss resets, and runs a held-frame simulated-vs-rest A/B in preview and
+camera. The negative fixtures `secondary-motion-schema-v2`,
+`secondary-motion-invalid-axis`, `secondary-motion-unknown-node`,
+`secondary-motion-out-of-range`, `secondary-motion-unknown-field`,
+`secondary-motion-rest-beyond-max` and `secondary-motion-without-mask` are
+rejected with their documented codes.
+
 Regenerate the committed sample and negative fixtures with:
 
 ```powershell
@@ -139,22 +187,24 @@ package is rejected. It is intentionally the same pure validator the app uses.
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `schemaVersion` | yes | `1` (mask/treatment only) or `2` (adds `faceDistortion`). |
+| `schemaVersion` | yes | `1` (mask/treatment only), `2` (adds `faceDistortion`) or `3` (adds `secondaryMotion`). |
 | `id` | yes | Stable package identity, 2-63 chars of lowercase letters, digits, `.`, `_`, `-`. Re-importing the same id replaces the stored copy. |
 | `name` | yes | Display name, 1-80 chars. Shown in the effect selector. |
 | `version` | yes | Semantic version core (`1.0.0`). Shown in the selector and diagnostics. |
 | `description` | yes | 1-500 chars. Shown in the app's package summary. |
 | `author` | yes | `{ name }`; optional `attribution` (≤200), `license` (≤40) and `url` (http/https). Informational only. |
-| `mask` | optional | Rigid face-attached mask component (below). |
-| `faceDistortion` | optional (schema v2) | Bounded declarative face warp (below). |
+| `mask` | optional | Rigid face-attached mask component (below). Required by `secondaryMotion`. |
+| `faceDistortion` | optional (schema v2+) | Bounded declarative face warp (below). |
+| `secondaryMotion` | optional (schema v3+) | 1-4 spring-driven named mask nodes (below). |
 | `colorTreatment` | optional | Declarative filter parameters (below). |
 | `expressionReactions` | reserved | Must be absent or an empty array. A non-empty declaration is rejected as `unsupported-behavior`. |
-| `behaviors` | reserved | Reserved for moving parts/secondary motion; absent or empty. Non-empty is rejected. |
+| `behaviors` | reserved | Reserved for later behavior types; absent or empty. Use `secondaryMotion` for supported moving parts. Non-empty is rejected. |
 
 Unknown top-level fields and unknown `author` fields produce an `unknown-field`
 **warning** (for forward compatibility) but do not enable behavior. Unknown
-fields inside `mask`, `attachment`, `faceDistortion` or `colorTreatment` are
-errors, because a typo there would silently change the effect.
+fields inside `mask`, `attachment`, `faceDistortion`, `secondaryMotion` or
+`colorTreatment` are errors, because a typo there would silently change the
+effect.
 
 ### `mask`
 
@@ -243,6 +293,90 @@ names the field, for example:
 A `faceDistortion` in a `schemaVersion: 1` manifest is rejected as
 `schema-version-unsupported`.
 
+### `secondaryMotion` (schema v3)
+
+A **bounded spring-driven movable-part behavior** for a small number of named
+nodes of the package mask. The package cannot supply a movement clip, code,
+shader, skeleton or per-frame animation: it names nodes and bounds a fixed
+runtime simulation. Playback derives the motion from the tracked head's angular
+velocity every processed frame.
+
+```json
+"secondaryMotion": {
+  "parts": [
+    { "node": "ear-left", "axis": "y", "drive": "yaw", "stiffness": 60, "damping": 0.3, "maxAngleDeg": 32 }
+  ]
+}
+```
+
+| Field | Required | Range / default | Meaning |
+| --- | --- | --- | --- |
+| `parts` | yes | 1-4 entries | Each entry is one movable mask GLB node. |
+| `node` | yes | 1-64 ASCII letters/digits/`_`/`-` | Node name in the mask GLB. Exactly one node must match; a missing or duplicate name is rejected at import. |
+| `axis` | yes | `"x"`, `"y"` or `"z"` | Local rotation axis of that node. |
+| `drive` | yes | `"yaw"`, `"pitch"` or `"roll"` | Tracked head-rotation component that drives the spring. |
+| `stiffness` | yes | `4`-`400` (1/s²) | Angular spring stiffness. Natural frequency ≈ `sqrt(stiffness)` rad/s. |
+| `damping` | yes | `0.05`-`1.5` | Dimensionless damping ratio. Below 1 overshoots and settles with a decaying oscillation; 1 is critically damped. |
+| `maxAngleDeg` | yes | `1`-`60` | Hard bound on the applied angle relative to the authored GLB pose. |
+| `restAngleDeg` | no | `-60`-`60`, default `0`, within `maxAngleDeg` | Constant offset from the authored GLB orientation at rest. |
+
+The node's **authored GLB orientation is the rest pose**. The part's node origin
+is the pivot; author the part geometry around that origin so a local-axis
+rotation swings it. A declared node may already carry a rotation in the GLB; the
+runtime applies the simulated angle relative to that orientation.
+
+Fixed runtime model (not tunable per package):
+
+```
+target = restAngle + maxAngle × clamp(headAngularVelocity[drive] / 45 deg/s, -1, 1)
+angle  = clamp(angle, -maxAngle, +maxAngle)
+```
+
+- Head angular velocity is computed from consecutive **accepted** tracked poses
+  (the same pose the mask is attached to), with shortest-arc angle differences.
+- The spring is integrated with a fixed 120 Hz internal sub-step
+  (semi-implicit Euler), so a given accepted-pose sequence is deterministic and
+  frame-rate independent.
+- `dt` is clamped and never exceeds **250 ms**. A longer gap, a per-sample pose
+  jump over **45°** (or an implied speed over **1080 °/s**), a loop seam, a
+  tracking reacquisition, and an explicit effect switch reset the spring to the
+  authored rest pose with zero velocity. Resets never inject an impulse: the
+  next frames drive from rest.
+- A positive head angular velocity around `drive` moves the target toward
+  `+maxAngleDeg`; when the head stops, the target returns to `restAngleDeg` and
+  the underdamped spring keeps moving briefly and settles. This is why the
+  parts continue moving after a turn instead of stopping with the head.
+- Every part is one rigid node; the runtime does not deform geometry and does
+  not animate a skeleton.
+
+What a package **can** express: up to four rigid mask nodes that swing around
+one local axis each, driven by tracked yaw/pitch/roll with bounded stiffness,
+damping, angle and rest offset.
+
+What a package **cannot** express: strand-level hair, cloth or soft-body
+simulation; multiple chained bones per tuft; collision between parts; arbitrary
+Blender physics export; per-frame keyframes or a canned movement clip;
+collision with the face; or a part that is not a named node in the mask GLB.
+Those need explicit runtime support in a later schema version.
+
+Invalid declarations are rejected as `secondary-motion-invalid`, naming the
+field, for example:
+`secondaryMotion.parts[0].node "left-ear" must name exactly one node in the mask GLB "assets/reactive-ears.glb"; found 0.`
+A `secondaryMotion` in a `schemaVersion: 1` or `2` manifest is rejected as
+`schema-version-unsupported`. A `secondaryMotion` without a `mask` is rejected
+as `secondary-motion-invalid`.
+
+The public **Secondary motion** diagnostic reports the active part names,
+number of updates, reset count and last reset reason, head speed, per-part
+applied angles and their bounds, simulation cost, and whether the simulated or
+rest orientation is being drawn. The diagnostic **Apply secondary motion (A/B)**
+toggle keeps the effect selected and draws the authored rest orientation, so a
+held-frame A/B can prove the published output contains the simulated angle. With
+the replay held, the diagnostic **Settle held frame** control advances the same
+simulator with the stationary accepted pose, so the retained post-turn angle can
+be observed decaying to rest; it is a diagnostic evidence path, not used during
+normal playback.
+
 ### `colorTreatment`
 
 All parameters are optional, but at least one must be declared. Every value must
@@ -285,15 +419,23 @@ authoring output.
 | Face distortion radiusScale | 0.25-2.5 |
 | Face distortion centerOffset | ±0.5 per axis (fraction of face size) |
 | Face distortion effective warp factor | fixed 0.75 maximum |
+| Movable parts per effect | 4 |
+| Movable-part stiffness | 4-400 (1/s²) |
+| Movable-part damping ratio | 0.05-1.5 |
+| Movable-part maxAngleDeg | 1-60° |
+| Movable-part restAngleDeg | within maxAngleDeg, ±60° |
+| Secondary-motion simulation step | fixed 120 Hz, dt ≤ 250 ms |
+| Secondary-motion drive full scale | fixed 45°/s |
 
 Validation reports `PackageComplexity` measurements (archive/manifest/mask bytes,
 entry count, triangle/mesh/material/node/texture counts, declared behavior count,
-color parameter count and a 0/1 distortion-component flag) from the pure validator
-and in the `validate:package` output, so #11 can turn measurements into budgets
-without changing the contract. No triangle or mesh **threshold** is enforced
-here. `summary.json` records the import result messages, which include the
-complexity subset the app displays (triangles, meshes, materials and archive
-bytes), not the full `PackageComplexity` record.
+color parameter count, a 0/1 distortion-component flag and a 0-4 movable-part
+count) from the pure validator and in the `validate:package` output, so #11 can
+turn measurements into budgets without changing the contract. No triangle or
+mesh **threshold** is enforced here. `summary.json` records the import result
+messages, which include the complexity subset the app displays (triangles,
+meshes, materials, moving parts and archive bytes), not the full
+`PackageComplexity` record.
 
 ## Archive safety
 
@@ -385,15 +527,16 @@ stops the camera output. No Blender or AI process is involved in playback.
 | `manifest-not-utf8` | Manifest is not valid UTF-8. |
 | `manifest-invalid-json` | Manifest is not valid JSON. |
 | `manifest-schema-invalid` | Wrong JSON shape, unknown component field, or empty color treatment. |
-| `schema-version-unsupported` | `schemaVersion` is not `1` or `2`, or a `faceDistortion` is declared in v1. |
+| `schema-version-unsupported` | `schemaVersion` is not `1`, `2` or `3`; a `faceDistortion` is declared below v2; or a `secondaryMotion` is declared below v3. |
 | `identity-invalid` | `id`/`name`/`version`/`description`/`author` invalid. |
 | `empty-effect` | No mask, color treatment or face distortion is declared. |
-| `unsupported-behavior` | Expression reactions/behaviors, glTF animations or skins are declared; this schema rejects rather than ignores them. |
+| `unsupported-behavior` | Expression reactions/`behaviors`, glTF animations or skins are declared; this schema rejects rather than ignores them. |
 | `unsupported-asset-type` | Asset is not a single-level `.glb` under `assets/` (for example `.gltf`). |
 | `missing-asset` | Declared mask asset is absent or its path is invalid. |
 | `color-parameter-out-of-range` | A color parameter is outside its bounded range (or not finite). |
 | `attachment-invalid` | Attachment position/rotation/scale is out of range or has unknown fields. |
 | `distortion-invalid` | Distortion mode unsupported, or strength/radiusScale/centerOffset out of range, not finite, or an unknown field. |
+| `secondary-motion-invalid` | A moving-part declaration is unsupported or invalid: unknown/duplicate node, node absent from or ambiguous in the mask GLB, unsupported axis/drive, >4 parts or 0 parts, out-of-range stiffness/damping/maxAngleDeg/restAngleDeg, unknown field, or no mask. |
 | `glb-invalid` | Not a valid self-contained GLB 2.0 / no triangle geometry. |
 | `glb-external-resource` | GLB references an external buffer/image; embed everything. |
 | `glb-unsupported-extension` | A required glTF extension other than `KHR_materials_unlit`. |
@@ -413,21 +556,25 @@ claim that every code is represented by a separate committed archive.
 ## Explicitly unsupported
 
 - Arbitrary executable or script effect code, WASM, HTML/SVG assets.
-- Expression reactions, blendshape-driven behavior, animations, skins,
-  secondary motion and moving parts. These need explicit runtime support in a
-  later schema version.
+- Expression reactions, blendshape-driven behavior, animations, skins, and
+  arbitrary declared behaviors other than the fixed components above. Use
+  `secondaryMotion` for the supported moving-part behavior; that needs schema
+  version 3.
+- Full strand-level hair simulation, cloth/soft-body simulation, collision,
+  chained bones per part, and automatic conversion of arbitrary Blender physics
+  into portable behavior. Each movable part is one rigid node rotating about one
+  local axis with a fixed spring model.
 - Distortion modes other than `bulge` and `pinch`; per-landmark/per-expression
   warps; a package-supplied distortion mesh or shader; animated or time-varying
   displacement. The runtime supports only the fixed bounded radial warp.
-- `faceDistortion` in a schema v1 manifest (raise `schemaVersion` to 2).
-- Hand-over-mask occlusion, Unreal authoring, Snapchat Lens imports, and
-  full strand-level hair simulation. Face-based occlusion of mask geometry
-  behind the tracked face is supported for every mask; hand-over-mask occlusion
-  is out of scope.
+- `faceDistortion` in a schema v1 manifest (raise `schemaVersion` to 2), and
+  `secondaryMotion` in a schema v1/v2 manifest (raise `schemaVersion` to 3).
+- Hand-over-mask occlusion, Unreal authoring, Snapchat Lens imports.
 - `.gltf` plus external `.bin`/textures, Draco/meshopt compression, ZIP64,
   encryption, multiple or nested asset folders.
 - More than one complete effect at a time, or combining components from two
-  packages (one package can combine its own mask, distortion and treatment).
+  packages (one package can combine its own mask, secondary motion, distortion
+  and treatment).
 - Physical-webcam or live-human validation of packages; this slice is
   replay-based. Laptop/integrated-graphics behavior is also unverified.
 - Final complexity budgets (issue #11). This slice only measures and reports.
@@ -441,14 +588,19 @@ other integration point is needed.
    (`.glb`)** with embedded resources. Apply modifiers, use triangle meshes, and
    do **not** include animations, skins, cameras or lights. Keep the mask around
    the canonical face origin, in centimetres, with +Z toward the camera; use the
-   manifest `attachment` for any offset/rotation/scale.
+   manifest `attachment` for any offset/rotation/scale. For secondary motion,
+   give each movable part its own **named node**, put the node origin at the
+   pivot, and author its geometry around that origin.
 2. Write `manifest.json` with the right schema: `schemaVersion: 1` for a mask
-   and/or color treatment, or `schemaVersion: 2` when declaring a
-   `faceDistortion`. Use a stable lowercase `id`, a semantic `version`, a
-   description and author attribution. Declare `mask`, bounded
-   `colorTreatment` parameters, and/or a bounded `faceDistortion`
+   and/or color treatment, `2` when declaring a `faceDistortion`, or `3` when
+   declaring `secondaryMotion`. Use a stable lowercase `id`, a semantic
+   `version`, a description and author attribution. Declare `mask`, bounded
+   `colorTreatment` parameters, a bounded `faceDistortion`
    (`mode: "bulge" | "pinch"`, `strength` 0-1, optional `radiusScale` 0.25-2.5
-   and `centerOffset` ±0.5 per axis).
+   and `centerOffset` ±0.5 per axis) and/or bounded `secondaryMotion` parts
+   (1-4, each `node` naming exactly one mask GLB node, `axis`/`drive`, stiffness
+   4-400, damping 0.05-1.5, `maxAngleDeg` 1-60, optional `restAngleDeg` within
+   the bound).
 3. Zip only `manifest.json` and the declared `assets/<file>.glb` (one level, no
    extra files). Keep it kilobytes where possible.
 4. Run `npm run validate:package -- <file.zip>` (or import it in the app) and
@@ -456,7 +608,9 @@ other integration point is needed.
    advisory; errors block import.
 5. Do not generate executable code, scripts, expression/animation declarations,
    or effect logic. New capabilities must be added to the runtime and this
-   contract first (ADR-0004).
+   contract first (ADR-0004). Do not export a Blender physics simulation and
+   expect it to play back: convert the intent into bounded `secondaryMotion`
+   parts instead.
 
 A package that passes validation renders through the same
 `src/core/pipeline.ts` path as the bundled mask and color treatments, so if it
@@ -467,14 +621,19 @@ for #11's complexity budgets.
 ## Validation and evidence
 
 - Unit tests: `npm test` covers schema/version rejection (including a v1
-  manifest that declares `faceDistortion`), color and distortion bounds,
-  distortion mode/field rejection, the face-relative warp geometry, archive
-  safety (zip-slip, absolute paths including directory entries, symlinks,
-  duplicates, oversized declared entries, a lying-size inflate bomb, CRC and
-  corruption, encryption and unsupported compression), GLB feature rejection
-  (including missing accessor `componentType`/`type`), effect resolution,
-  nonzero mask attachment conversion, and the extended output policy. Every
-  stable validation code is asserted by `tests/validation-coverage.test.ts`.
+  manifest that declares `faceDistortion` and a v2 manifest that declares
+  `secondaryMotion`), color and distortion bounds, distortion mode/field
+  rejection, the face-relative warp geometry, secondary-motion part validation
+  (unknown/duplicate node, unknown axis/drive/field, bounds, rest offset, part
+  count, missing mask), the pure spring simulation (bounds, clamped dt, gap and
+  discontinuity resets, loop-seam/reacquisition reset, post-turn settling,
+  determinism), archive safety (zip-slip, absolute paths including directory
+  entries, symlinks, duplicates, oversized declared entries, a lying-size
+  inflate bomb, CRC and corruption, encryption and unsupported compression), GLB
+  feature rejection (including missing accessor `componentType`/`type`), effect
+  resolution, nonzero mask attachment conversion, and the extended output
+  policy. Every stable validation code is asserted by
+  `tests/validation-coverage.test.ts`.
 - Public workflow: `npm run check` scenario I imports the generated samples
   through the **Import package…** control (only the OS file picker is stubbed in
   the main process; validation, storage, extraction, the local asset protocol and
@@ -494,7 +653,15 @@ for #11's complexity budgets.
   distortion (manual pause, tracking loss, multiple faces, processing failure,
   switching, no-effect and removal), rejects the distortion negative fixtures,
   and records replay-based warp-submission/render/frame-pacing timing for the
-  later benchmark. Scenario G adds recorded-motion evidence: the warp ellipse
+  later benchmark. Scenario J imports the schema v3 `reactive-ears` sample
+  through the same control, asserts the three declared parts and their bounds
+  across the recorded turn/nod window, measures post-turn spring settling in a
+  documented recorded window, crosses a loop seam and a tracking reacquisition
+  to verify deliberate resets with no impulse, runs a held-frame
+  simulated-vs-rest A/B in preview and camera (with 0 same-state self-diff),
+  exercises the paused-output policy, rejects every secondary-motion negative
+  fixture, and records simulation/render/frame-pacing workload. Scenario G adds
+  recorded-motion evidence: the warp ellipse
   follows the tracked face box across the documented turn/nod/lean window, with
   screenshots and the two-pose published-output A/B. Scenario G additionally
   holds a turned recorded frame and proves the same depth-only face occluder

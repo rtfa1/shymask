@@ -223,7 +223,7 @@ function scenarios(): Scenario[] {
     {
       expected: 'schema-version-unsupported',
       run: () => validate(mutateManifest((manifest) => {
-        manifest.schemaVersion = 3;
+        manifest.schemaVersion = 4;
       })),
     },
     {
@@ -231,6 +231,17 @@ function scenarios(): Scenario[] {
       // faceDistortion is a v2 capability; a v1 declaration must not be ignored.
       run: () => validate(mutateManifest((manifest) => {
         manifest.faceDistortion = { mode: 'bulge', strength: 0.5 };
+      })),
+    },
+    {
+      expected: 'schema-version-unsupported',
+      // secondaryMotion is a v3 capability; a v2 declaration must not be
+      // imported as a rigid mask whose declared parts silently never move.
+      run: () => validate(mutateManifest((manifest) => {
+        manifest.schemaVersion = 2;
+        manifest.secondaryMotion = {
+          parts: [{ node: 'mask', axis: 'y', drive: 'yaw', stiffness: 80, damping: 0.3, maxAngleDeg: 20 }],
+        };
       })),
     },
     {
@@ -281,6 +292,15 @@ function scenarios(): Scenario[] {
       run: () => validate(mutateManifest((manifest) => {
         manifest.schemaVersion = 2;
         manifest.faceDistortion = { mode: 'bulge', strength: 4 };
+      })),
+    },
+    {
+      expected: 'secondary-motion-invalid',
+      run: () => validate(mutateManifest((manifest) => {
+        manifest.schemaVersion = 3;
+        manifest.secondaryMotion = {
+          parts: [{ node: 'mask', axis: 'w', drive: 'yaw', stiffness: 80, damping: 0.3, maxAngleDeg: 20 }],
+        };
       })),
     },
     {

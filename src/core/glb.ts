@@ -17,6 +17,8 @@ export interface GlbSummary {
   materials: number;
   nodes: number;
   textures: number;
+  /** Names of the glTF nodes (empty string for unnamed nodes). */
+  nodeNames: string[];
 }
 
 export type GlbInspection = { ok: true; summary: GlbSummary } | { ok: false; issues: PackageIssue[] };
@@ -436,6 +438,9 @@ export function inspectGlb(bytes: Uint8Array): GlbInspection {
       materials: asArray(document.materials).length,
       nodes: asArray(document.nodes).length,
       textures: asArray(document.textures).length,
+      nodeNames: asArray(document.nodes).map((node) =>
+        isRecord(node) && typeof node.name === 'string' ? node.name : '',
+      ),
     },
   };
 }

@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import type { MaskAttachment } from '../core/effect-package-contract';
+import type { MaskAttachment, SecondaryMotionParameters } from '../core/effect-package-contract';
 import { maskAttachmentTransform } from '../core/mask-attachment';
 import { poseFromColumnMajorMatrix, type TrackingPose } from '../core/tracking';
 import {
@@ -65,6 +65,18 @@ export interface PackageMaskSummary {
 }
 
 /**
+ * A declared movable part resolved against the parsed package GLB. The node's
+ * authored orientation is the rest pose; the simulator supplies an angle about
+ * `axis` that is applied relative to that pose every rendered frame.
+ */
+export interface MaskMotionNode {
+  node: THREE.Object3D;
+  restQuaternion: THREE.Quaternion;
+  axis: THREE.Vector3;
+  maxAngleRad: number;
+}
+
+/**
  * A fully parsed package mask that has not touched the live scene yet. The
  * caller can discard it (stale switch) or commit it atomically (current switch).
  */
@@ -74,6 +86,8 @@ export interface ParsedPackageMask {
   summary: PackageMaskSummary;
   probeKind: ProbeKind;
   probeColor: { r: number; g: number; b: number } | null;
+  /** Resolved secondary-motion nodes (empty when the package declares none). */
+  motionNodes: MaskMotionNode[];
 }
 
 const EYE_COLOR = 0x67e8f9;
@@ -118,6 +132,9 @@ export class MaskRenderer {
   private visible = false;
   private probeKind: ProbeKind = 'eye';
   private materialProbeColor: { r: number; g: number; b: number } | null = null;
+  private motionNodes: MaskMotionNode[] = [];
+  /** Scratch objects reused every frame; no per-frame allocation. */
+  private readonly motionQuaternion = new THREE.Quaternion();
   private disposed = false;
   private readonly loader = new GLTFLoader();
 
@@ -205,12 +222,14 @@ export class MaskRenderer {
     if (this.content.children.includes(this.bundled)) {
       this.probeKind = 'eye';
       this.materialProbeColor = null;
+      this.motionNodes = [];
       return;
     }
     this.disposeContent();
     this.content.add(this.bundled);
     this.probeKind = 'eye';
     this.materialProbeColor = null;
+    this.motionNodes = [];
   }
 
   /** Builds the procedural mask geometry/material graph exactly once. */
@@ -286,7 +305,11 @@ export class MaskRenderer {
    * live scene, so a caller whose switch token went stale can discard it.
    * Only validated `.glb` bytes reach this method; no package code is evaluated.
    */
-  async parseGltfModel(data: ArrayBuffer, attachment: MaskAttachment): Promise<ParsedPackageMask> {
+  async parseGltfModel(
+    data: ArrayBuffer,
+    attachment: MaskAttachment,
+    secondaryMotion: SecondaryMotionParameters | null = null,
+  ): Promise<ParsedPackageMask> {
     const gltf = await new Promise<THREE.Group>((resolve, reject) => {
       this.loader.parse(
         data,
@@ -324,12 +347,57 @@ export class MaskRenderer {
         };
       }
     });
+    const motionNodes: MaskMotionNode[] = [];
+    for (const part of secondaryMotion?.parts ?? []) {
+      const matches: THREE.Object3D[] = [];
+      gltf.traverse((object: THREE.Object3D) => {
+        if (object.name === part.node) matches.push(object);
+      });
+      if (matches.length !== 1) {
+        throw new Error(
+          `the declared movable part node "${part.node}" must exist exactly once in the mask GLB; found ${matches.length}`,
+        );
+      }
+      const node = matches[0] as THREE.Object3D;
+      motionNodes.push({
+        node,
+        restQuaternion: node.quaternion.clone(),
+        axis:
+          part.axis === 'x'
+            ? new THREE.Vector3(1, 0, 0)
+            : part.axis === 'y'
+              ? new THREE.Vector3(0, 1, 0)
+              : new THREE.Vector3(0, 0, 1),
+        maxAngleRad: (part.maxAngleDeg * Math.PI) / 180,
+      });
+    }
     return {
       group: holder,
       summary: { meshes, materials, probeColor },
       probeKind: probeColor ? 'material' : 'none',
       probeColor,
+      motionNodes,
     };
+  }
+
+  /**
+   * Applies one simulated angle per declared movable part, relative to the
+   * node's authored rest orientation. Angles are clamped to the validated part
+   * bound as defense in depth; the simulator already enforces the same bound.
+   */
+  setSecondaryMotionAngles(anglesRad: readonly number[]): void {
+    for (const [index, motion] of this.motionNodes.entries()) {
+      const angle = Math.max(
+        -motion.maxAngleRad,
+        Math.min(motion.maxAngleRad, anglesRad[index] ?? 0),
+      );
+      this.motionQuaternion.setFromAxisAngle(motion.axis, angle);
+      motion.node.quaternion.copy(motion.restQuaternion).multiply(this.motionQuaternion);
+    }
+  }
+
+  get secondaryMotionPartCount(): number {
+    return this.motionNodes.length;
   }
 
   /**
@@ -342,6 +410,7 @@ export class MaskRenderer {
     this.content.add(content.group);
     this.probeKind = content.probeKind;
     this.materialProbeColor = content.probeColor;
+    this.motionNodes = content.motionNodes;
   }
 
   /** Releases an uncommitted parse (for example a switch superseded mid-load). */
@@ -365,6 +434,7 @@ export class MaskRenderer {
 
   /** Disposes everything under `content` except the reusable bundled graph. */
   private disposeContent(): void {
+    this.motionNodes = [];
     for (const child of [...this.content.children]) {
       if (child !== this.bundled) this.disposeObjectResources(child);
       this.content.remove(child);

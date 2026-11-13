@@ -11,6 +11,7 @@ import {
   type FaceDistortionParameters,
   type InstalledEffectPackage,
   type MaskAttachment,
+  type SecondaryMotionParameters,
 } from './effect-package-contract';
 import { COLOR_TREATMENTS, getEffectLabel, type ColorTreatment } from './treatments';
 
@@ -29,6 +30,8 @@ export interface EffectDefinition {
   treatment: ColorTreatment | null;
   /** Bounded face distortion applied around the tracked face, if any. */
   distortion: FaceDistortionParameters | null;
+  /** Bounded spring-driven movable mask parts, if any. */
+  secondaryMotion: SecondaryMotionParameters | null;
   /** Rigid face-attached mask, bundled or from a package, if any. */
   mask: EffectMask | null;
   /** Package version, for diagnostics on imported effects. */
@@ -49,6 +52,7 @@ export const BUNDLED_EFFECT_DEFINITIONS: readonly EffectDefinition[] = [
     description: 'Hides the processed output (the opaque paused screen) instead of passing the feed through.',
     treatment: null,
     distortion: null,
+    secondaryMotion: null,
     mask: null,
   },
   {
@@ -58,6 +62,7 @@ export const BUNDLED_EFFECT_DEFINITIONS: readonly EffectDefinition[] = [
     description: 'Bundled procedural low-poly helmet/visor attached to the tracked face.',
     treatment: null,
     distortion: null,
+    secondaryMotion: null,
     mask: { kind: 'bundled' },
   },
   ...COLOR_TREATMENTS.map((treatment): EffectDefinition => ({
@@ -67,6 +72,7 @@ export const BUNDLED_EFFECT_DEFINITIONS: readonly EffectDefinition[] = [
     description: treatment.description,
     treatment,
     distortion: null,
+    secondaryMotion: null,
     mask: null,
   })),
 ];
@@ -88,6 +94,7 @@ export function packageEffectDefinition(pkg: InstalledEffectPackage): EffectDefi
         }
       : null,
     distortion: pkg.distortion,
+    secondaryMotion: pkg.secondaryMotion,
     mask: pkg.mask
       ? {
           kind: 'gltf',
@@ -162,4 +169,9 @@ export function hasTreatment(effect: EffectDefinition): boolean {
 /** True when the complete effect declares a bounded face distortion. */
 export function hasDistortion(effect: EffectDefinition): boolean {
   return effect.distortion !== null;
+}
+
+/** True when the complete effect declares spring-driven movable mask parts. */
+export function hasSecondaryMotion(effect: EffectDefinition): boolean {
+  return effect.secondaryMotion !== null && effect.secondaryMotion.parts.length > 0;
 }

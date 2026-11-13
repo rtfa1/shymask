@@ -29,6 +29,8 @@ export interface PreviewState {
   effectHasTreatment?: boolean;
   /** Whether the complete effect applies a bounded face distortion. */
   effectHasDistortion?: boolean;
+  /** Whether the complete effect declares spring-driven movable mask parts. */
+  effectHasSecondaryMotion?: boolean;
   /** False when the selected id no longer resolves (for example a removed package). */
   effectValid?: boolean;
   /** Set when an imported effect failed to load; output stays paused. */
@@ -173,6 +175,7 @@ export function resolveOutput(state: PreviewState): OutputDecision {
   const effectHasMask = state.effectHasMask ?? isMaskEffect(state.effect);
   const effectHasTreatment = state.effectHasTreatment ?? getTreatment(state.effect) !== null;
   const effectHasDistortion = state.effectHasDistortion ?? false;
+  const effectHasSecondaryMotion = state.effectHasSecondaryMotion ?? false;
   // Compose the explanation from independent component phrases instead of one
   // branch per combination, so adding a component cannot silently miss a case.
   const labelLower = label.toLowerCase();
@@ -182,6 +185,8 @@ export function resolveOutput(state: PreviewState): OutputDecision {
   let subject: string;
   if (effectHasMask && effectHasDistortion) {
     subject = `the ${labelLower} mask and face distortion attached to the tracked face`;
+  } else if (effectHasMask && effectHasSecondaryMotion) {
+    subject = `the ${labelLower} mask with reactive movable parts attached to the tracked face`;
   } else if (effectHasMask) {
     subject = effectHasTreatment
       ? `the ${labelLower} mask attached to the tracked face`

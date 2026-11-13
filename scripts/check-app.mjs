@@ -992,13 +992,13 @@ async function releaseReplayFrame(page) {
  * harness/decoder artifact documented in the scenario comments); a fresh replay
  * load is deterministic and still uses the normal public processing path.
  */
-async function restartReplayAfterHold(page, label) {
+async function restartReplayAfterHold(page, label, fixtureId = metadata.id) {
   await page.locator('[data-testid="recheck"]').click();
   await waitFor(
     `${label} fixture rechecked`,
     async () => {
       const text = await readDiagnostic(page, 'diag-fixture');
-      return text.includes(metadata.id) ? text : null;
+      return text.includes(fixtureId) ? text : null;
     },
     20000,
     100,
@@ -1606,6 +1606,9 @@ const GUARD_VISOR_EFFECT_ID = 'package:shymask.guard-visor';
 const ROSE_VISOR_EFFECT_ID = 'package:shymask.rose-visor';
 const VERDANT_TINT_EFFECT_ID = 'package:shymask.verdant-tint';
 const FACE_DISTORTION_EFFECT_ID = 'package:shymask.face-distortion';
+/** Exact unlit material colour of the schema v3 secondary-motion sample mask. */
+const REACTIVE_EARS_RGB = { r: 150, g: 90, b: 240 };
+const REACTIVE_EARS_EFFECT_ID = 'package:shymask.reactive-ears';
 /**
  * Documented default-clip frame used for the warp on/off A/B. The clip is a
  * 3.379 s replay loop; 1.5 s is a tracked, non-paused frame with the face
@@ -1613,16 +1616,36 @@ const FACE_DISTORTION_EFFECT_ID = 'package:shymask.face-distortion';
  */
 const DISTORTION_AB_CAPTURE_SECONDS = 1.5;
 /**
+ * Documented `pose-loop-v1` frame used for the secondary-motion A/B. Just after
+ * the recorded left turn at ~47.6 s the ears hold a large simulated angle, so a
+ * held frame shows a substantial rest-vs-simulated change.
+ */
+const SECONDARY_MOTION_AB_CAPTURE_SECONDS = 47.7;
+/**
+ * Recorded window where a head turn (yaw/pitch peak around 25.9 s) is followed
+ * by ~1 s of low head angular velocity. The spring keeps moving after the turn
+ * and decays there, which is the replay-based settling evidence.
+ */
+const POST_TURN_WINDOW_START_SECONDS = 25.0;
+const POST_TURN_WINDOW_SECONDS = 1.9;
+/**
  * Required negative package fixtures and the actionable code each must produce.
  * They are generated reproducibly by `npm run build:packages`.
  */
 const NEGATIVE_PACKAGE_CASES = [
   { name: 'malformed-json', code: 'manifest-invalid-json' },
-  { name: 'schema-version-3', code: 'schema-version-unsupported' },
+  { name: 'schema-version-4', code: 'schema-version-unsupported' },
   { name: 'distortion-schema-v1', code: 'schema-version-unsupported' },
   { name: 'distortion-invalid-mode', code: 'distortion-invalid' },
   { name: 'distortion-out-of-range', code: 'distortion-invalid' },
   { name: 'distortion-unknown-field', code: 'distortion-invalid' },
+  { name: 'secondary-motion-schema-v2', code: 'schema-version-unsupported' },
+  { name: 'secondary-motion-invalid-axis', code: 'secondary-motion-invalid' },
+  { name: 'secondary-motion-unknown-node', code: 'secondary-motion-invalid' },
+  { name: 'secondary-motion-out-of-range', code: 'secondary-motion-invalid' },
+  { name: 'secondary-motion-unknown-field', code: 'secondary-motion-invalid' },
+  { name: 'secondary-motion-rest-beyond-max', code: 'secondary-motion-invalid' },
+  { name: 'secondary-motion-without-mask', code: 'secondary-motion-invalid' },
   { name: 'unsupported-behavior', code: 'unsupported-behavior' },
   { name: 'missing-asset', code: 'missing-asset' },
   { name: 'invalid-color', code: 'color-parameter-out-of-range' },
@@ -3382,6 +3405,7 @@ function verifyPackageFixtures() {
     path.join(PACKAGE_FIXTURES_DIR, 'guard-visor.zip'),
     path.join(PACKAGE_FIXTURES_DIR, 'verdant-tint.zip'),
     path.join(PACKAGE_FIXTURES_DIR, 'face-distortion.zip'),
+    path.join(PACKAGE_FIXTURES_DIR, 'reactive-ears.zip'),
     ...NEGATIVE_PACKAGE_CASES.map((entry) => path.join(PACKAGE_NEGATIVE_DIR, `${entry.name}.zip`)),
   ];
   for (const file of required) {
@@ -3778,6 +3802,189 @@ async function distortionAbEvidence(page, label, options = {}) {
     changedOutsideEllipsePixels: change.outside,
     insideEllipseFraction: Number(insideFraction.toFixed(3)),
     centroid: { x: Number(change.centroidX.toFixed(1)), y: Number(change.centroidY.toFixed(1)) },
+    camera,
+  };
+}
+
+async function readSecondaryMotion(page) {
+  return parseKeyValues(await readDiagnostic(page, 'diag-secondary-motion'));
+}
+
+function secondaryMotionAngleList(values, key) {
+  return String(values[key] ?? '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+    .map(Number);
+}
+
+/** Asserts every part angle the simulator reports is inside its declared bound. */
+function assertSecondaryMotionBounds(values, label) {
+  assert.equal(values.active, 'true', `${label}: the secondary-motion effect must be active`);
+  const angles = secondaryMotionAngleList(values, 'angles');
+  const maxima = secondaryMotionAngleList(values, 'maxAngleDeg');
+  assert.equal(angles.length, maxima.length, `${label}: every declared part must report one angle and one bound`);
+  assert.ok(angles.length >= 1, `${label}: at least one movable part must be declared`);
+  for (const [index, angle] of angles.entries()) {
+    const maximum = maxima[index];
+    assert.ok(Number.isFinite(angle), `${label}: part ${index} angle must be finite, got ${values.angles}`);
+    assert.ok(Number.isFinite(maximum) && maximum > 0, `${label}: part ${index} must have a positive bound`);
+    assert.ok(
+      Math.abs(angle) <= maximum + 0.01,
+      `${label}: part ${index} angle ${angle} must stay inside its ${maximum} degree bound`,
+    );
+  }
+  assert.ok(Number.isFinite(Number(values.maxAbsAngleDeg)), `${label}: maxAbsAngleDeg must be finite`);
+}
+
+/**
+ * Public published-output A/B for secondary motion on a held frame.
+ *
+ * The effect stays selected; the diagnostic toggle only draws the movable parts
+ * at their authored rest orientation. Exact 1280x720 PNGs through the public
+ * Capture control must differ substantially, the change must sit on the mask,
+ * same-state repeats must be pixel-identical, and the independent camera must
+ * receive the identical change. A dropped simulation makes ON == OFF.
+ */
+async function secondaryMotionAbEvidence(page, label, options = {}) {
+  const captureCamera = options.captureCamera === true;
+  const statusBefore = await readStatus(page);
+  assert.equal(
+    statusBefore.mode,
+    'render',
+    `${label}: the held A/B frame must be rendered, not the paused screen (${statusBefore.explanation})`,
+  );
+  const effectBefore = await readEffectDiagnostic(page);
+  assert.equal(effectBefore.mask, 'gltf', `${label}: a packaged mask must be selected`);
+  assert.equal(effectBefore.motion, '3', `${label}: the reactive-ears sample must declare 3 movable parts`);
+  const tracking = await readTracking(page);
+  assert.equal(tracking.phase, 'tracking', `${label}: the held A/B frame must be tracked`);
+  const motionBefore = await readSecondaryMotion(page);
+  assertSecondaryMotionBounds(motionBefore, label);
+  assert.equal(motionBefore.enabled, 'true', `${label}: secondary motion must start enabled`);
+  assert.equal(motionBefore.applied, 'simulated', `${label}: the simulated angles must be applied`);
+  const heldAngle = Number(motionBefore.maxAbsAngleDeg);
+  assert.ok(
+    heldAngle >= 5,
+    `${label}: the held post-turn frame must retain a visible simulated angle, got ${heldAngle} degrees (${JSON.stringify(motionBefore)})`,
+  );
+  const mask = await readMask(page);
+  assert.equal(mask.visible, 'true', `${label}: the held A/B frame must show the packaged mask`);
+  const maskRect = {
+    x: Number(mask.centerX) - Number(mask.widthPx) / 2 - 20,
+    y: Number(mask.centerY) - Number(mask.heightPx) / 2 - 20,
+    width: Number(mask.widthPx) + 40,
+    height: Number(mask.heightPx) + 40,
+  };
+
+  const on = await captureOutputThroughControl(page, `${label}-motion-on.png`);
+  await page.waitForTimeout(250);
+  const onRepeat = await captureOutputThroughControl(page, `${label}-motion-on-repeat.png`);
+  const onMotion = await readSecondaryMotion(page);
+
+  await page.locator('[data-testid="secondary-motion-toggle"]').uncheck();
+  await page.waitForTimeout(300);
+  const offMotion = await readSecondaryMotion(page);
+  assert.equal(offMotion.active, 'true', `${label}: disabling only the motion must keep the effect active`);
+  assert.equal(offMotion.enabled, 'false', `${label}: the diagnostic control must disable only the simulation application`);
+  assert.equal(offMotion.applied, 'rest', `${label}: the OFF state must draw the authored rest orientation`);
+  assert.equal(
+    offMotion.updates,
+    onMotion.updates,
+    `${label}: the held frame must not advance the simulator between ON and OFF captures`,
+  );
+  const offEffect = await readEffectDiagnostic(page);
+  assert.equal(offEffect.id, effectBefore.id, `${label}: the held A/B must not switch effects`);
+  assert.equal(offEffect.motion, effectBefore.motion, `${label}: the held A/B must not change the declaration`);
+  const off = await captureOutputThroughControl(page, `${label}-motion-off.png`);
+  await page.waitForTimeout(250);
+  const offRepeat = await captureOutputThroughControl(page, `${label}-motion-off-repeat.png`);
+
+  await page.locator('[data-testid="secondary-motion-toggle"]').check();
+  await page.waitForTimeout(300);
+  const restored = await readSecondaryMotion(page);
+  assert.equal(restored.enabled, 'true', `${label}: secondary motion must be restored after the A/B`);
+  const maskAfter = await readMask(page);
+  assert.equal(maskAfter.centerX, mask.centerX, `${label}: the held mask must not move during the A/B`);
+  assert.equal(maskAfter.centerY, mask.centerY, `${label}: the held mask must not move during the A/B`);
+
+  const selfDiff = pngPixelDiff(on, onRepeat);
+  const offSelfDiff = pngPixelDiff(off, offRepeat);
+  const change = pngPixelDiff(on, off);
+  const changeOnMask = pngPixelDiff(on, off, 4, maskRect);
+  assert.equal(selfDiff.count, 0, `${label}: two ON captures of the held frame must be pixel-identical, got ${selfDiff.count}`);
+  assert.equal(offSelfDiff.count, 0, `${label}: two OFF captures of the held frame must be pixel-identical, got ${offSelfDiff.count}`);
+  assert.ok(
+    change.count >= 800,
+    `${label}: the held visible angle must change a meaningful number of published pixels, got ${change.count}`,
+  );
+  assert.ok(
+    changeOnMask.inside >= change.count * 0.98,
+    `${label}: the secondary-motion change must sit on the packaged mask (${changeOnMask.inside}/${change.count} inside the mask rectangle)`,
+  );
+
+  let camera = null;
+  if (captureCamera) {
+    const previewOn = await readRgb(page);
+    const onRun = await captureProcessedCameraState(
+      page,
+      `${label}-motion-on-camera`,
+      PROCESSED_CAMERA_FRAMES,
+      previewOn,
+      `${label} motion on camera`,
+    );
+    const onPngs = onRun.frames.filter((frame) => frame.png && frame.captureUnixMs > 0).map((frame) => frame.png);
+    assert.ok(onPngs.length >= 2, `${label}: expected two app-published camera PNGs in the motion-on state, got ${onPngs.length}`);
+    await page.locator('[data-testid="secondary-motion-toggle"]').uncheck();
+    await page.waitForTimeout(300);
+    const previewOff = await readRgb(page);
+    const offRun = await captureProcessedCameraState(
+      page,
+      `${label}-motion-off-camera`,
+      PROCESSED_CAMERA_FRAMES,
+      previewOff,
+      `${label} motion off camera`,
+    );
+    const offPng = offRun.frames.find((frame) => frame.png && frame.captureUnixMs > 0)?.png;
+    assert.ok(offPng, `${label}: expected an app-published camera PNG in the motion-off state`);
+    await page.locator('[data-testid="secondary-motion-toggle"]').check();
+    await page.waitForTimeout(300);
+    const cameraSelfDiff = pngPixelDiff(onPngs[0], onPngs[1]);
+    const cameraChange = pngPixelDiff(onPngs[0], offPng);
+    assert.equal(
+      cameraSelfDiff.count,
+      0,
+      `${label}: two camera PNGs of the held frame must match, got ${cameraSelfDiff.count} changed pixels`,
+    );
+    assert.equal(
+      cameraChange.count,
+      change.count,
+      `${label}: camera and preview must receive the identical secondary-motion change (camera ${cameraChange.count}px, preview ${change.count}px)`,
+    );
+    camera = {
+      onPng: onPngs[0],
+      onRepeatPng: onPngs[1],
+      offPng,
+      selfDiffPixels: cameraSelfDiff.count,
+      changedPixels: cameraChange.count,
+    };
+  }
+
+  return {
+    effect: effectBefore,
+    face: await readFace(page),
+    mask,
+    motion: onMotion,
+    offMotion,
+    on,
+    onRepeat,
+    off,
+    offRepeat,
+    heldAngleDeg: heldAngle,
+    selfDiffPixels: selfDiff.count,
+    offSelfDiffPixels: offSelfDiff.count,
+    changedPixels: change.count,
+    changedOnMaskPixels: changeOnMask.inside,
     camera,
   };
 }
@@ -4636,6 +4843,657 @@ async function effectPackageScenario() {
   return evidence;
 }
 
+/**
+ * Scenario J: a schema v3 imported package whose two ears and hair tuft are
+ * spring-driven by recorded tracked head motion. Proves the public
+ * import/select/preview/camera flow, bounded motion, post-turn settling, the
+ * deliberate resets, the paused-output policy and replay-based timing.
+ */
+async function secondaryMotionScenario() {
+  log('\n== Scenario J: imported packaged secondary motion (schema v3) ==');
+  const motionMetadata = verifyFixtureManifest('pose-loop.json');
+  const evidence = {
+    states: {},
+    motion: {},
+    settle: {},
+    loop: {},
+    reacquisition: {},
+    ab: {},
+    paused: {},
+    timing: {},
+    negatives: [],
+  };
+  const packageDir = path.join(evidenceDir, 'secondary-motion-packages');
+  mkdirSync(packageDir, { recursive: true });
+  const env = {
+    SHYMASK_EVIDENCE_DIR: evidenceDir,
+    SHYMASK_FIXTURE_MANIFEST: 'pose-loop.json',
+    SHYMASK_PACKAGE_DIR: packageDir,
+  };
+  const { app, page, consoleErrors } = await launchApp(env);
+  try {
+    await waitFor('secondary-motion fixture diagnostics', async () => {
+      const text = await readDiagnostic(page, 'diag-fixture');
+      return text.includes(motionMetadata.id) ? text : null;
+    });
+    await waitForTrackerModelReady(page);
+    await page.locator('[data-testid="start"]').click();
+    await waitForTrackingPhase(page);
+    await waitForVirtualCamera(page);
+    const initialPackages = parseKeyValues(await readDiagnostic(page, 'diag-packages'));
+    assert.equal(initialPackages.installed, '0', 'the isolated store must start empty');
+
+    // --- Import the schema v3 sample through the public control -------------
+    const importResult = await importPackageThroughControl(
+      app,
+      page,
+      path.join(PACKAGE_FIXTURES_DIR, 'reactive-ears.zip'),
+    );
+    assert.equal(importResult.state, 'success', `reactive-ears import must succeed: ${importResult.text}`);
+    assert.match(importResult.text, /Imported "Reactive ears" v1\.0\.0/);
+    assert.match(importResult.text, /3 movable part\(s\)/);
+    const options = await effectOptionValues(page);
+    assert.ok(options.includes(REACTIVE_EARS_EFFECT_ID), 'the imported secondary-motion effect must appear in the selector');
+    const loaded = await waitForEffectLoaded(page, REACTIVE_EARS_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Reactive ears/);
+    assert.equal(await page.locator('[data-testid="effect-select"]').inputValue(), REACTIVE_EARS_EFFECT_ID);
+    assert.equal(loaded.source, 'package');
+    assert.equal(loaded.mask, 'gltf');
+    assert.equal(loaded.motion, '3');
+    assert.equal(loaded.treatment, 'no');
+    assert.equal(loaded.distortion, 'none');
+    const preview = await waitForPackageMask(page, 'imported reactive ears', REACTIVE_EARS_RGB);
+    const occlusion = parseKeyValues(await readDiagnostic(page, 'diag-occlusion'));
+    assert.equal(occlusion.enabled, 'true', 'face occlusion must stay active for the movable mask');
+    assert.equal(occlusion.vertices, '468');
+    const previewRgb = await readProcessedRgb(page, 'imported reactive ears preview');
+    const previewShot = await screenshotCanvas(page, '40-imported-reactive-ears-preview.png');
+    const materialPng = await captureOutputThroughControl(page, '40b-reactive-ears-material.png');
+    const materialPixels = pngColorCount(materialPng, REACTIVE_EARS_RGB, 28);
+    assert.ok(
+      materialPixels > 20000,
+      `preview PNG must contain the reactive-ears material, found ${materialPixels} pixels (enforced >20,000)`,
+    );
+    const cameraRun = await captureProcessedCameraState(
+      page,
+      'reactive-ears',
+      PROCESSED_CAMERA_FRAMES,
+      previewRgb,
+      'imported reactive ears',
+    );
+    const cameraPng = assertProcessedPng(cameraRun.frames, previewRgb, 'imported reactive ears');
+    const cameraMaterialPixels = pngColorCount(cameraPng.png, REACTIVE_EARS_RGB, 28);
+    assert.ok(
+      cameraMaterialPixels > 20000,
+      `camera PNG must contain the reactive-ears material, found ${cameraMaterialPixels} pixels (enforced >20,000)`,
+    );
+    const initialMotion = await readSecondaryMotion(page);
+    assertSecondaryMotionBounds(initialMotion, 'imported reactive ears');
+    assert.equal(initialMotion.parts, '3');
+    assert.equal(initialMotion.names, 'ear-left,ear-right,hair-tuft');
+    assert.equal(initialMotion.axes, 'y:yaw,y:yaw,x:pitch');
+    evidence.states.imported = {
+      importMessage: importResult.text,
+      effect: loaded,
+      mask: preview.mask,
+      probe: preview.probe,
+      occlusion,
+      preview: previewRgb,
+      previewMaterialPixels: materialPixels,
+      previewPng: materialPng,
+      screenshot: previewShot,
+      camera: {
+        rgb: averageFrameRgb(cameraRun.frames),
+        png: cameraPng.png,
+        materialPixels: cameraMaterialPixels,
+      },
+      motion: initialMotion,
+    };
+    pass(
+      'A schema v3 secondary-motion package imports through the public control and renders in preview and camera',
+      `effect=${REACTIVE_EARS_EFFECT_ID} parts=3 names=${initialMotion.names} previewMaterialPixels=${materialPixels} cameraMaterialPixels=${cameraMaterialPixels} ${previewShot} ${cameraPng.png}`,
+    );
+
+    // --- Recorded turns/nods: the parts move, bounded by their declarations --
+    await page.evaluate((startSeconds) => {
+      const video = document.querySelector('video');
+      if (!video) throw new Error('expected a replay video element');
+      video.currentTime = startSeconds;
+    }, MOTION_WINDOW_START_SECONDS);
+    await waitFor(
+      'secondary-motion window media time',
+      async () => {
+        const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+        return Number(timestamp.mediaMs ?? 0) >= MOTION_WINDOW_START_MS ? timestamp : null;
+      },
+      15000,
+      100,
+    );
+    await waitFor(
+      'rendered output before secondary-motion sampling',
+      async () => {
+        const status = await readStatus(page);
+        return status.mode === 'render' ? status : null;
+      },
+      15000,
+      40,
+    );
+    const motionSamples = [];
+    const motionShots = [];
+    let previousMotionMediaMs = null;
+    for (let index = 0; index < 18; index += 1) {
+      await page.waitForTimeout(400);
+      const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+      const mediaMs = Number(timestamp.mediaMs ?? 0);
+      if (
+        mediaMs > MOTION_WINDOW_END_MS ||
+        (previousMotionMediaMs !== null && mediaMs < previousMotionMediaMs - LOOP_SEAM_THRESHOLD_MS)
+      ) {
+        break;
+      }
+      previousMotionMediaMs = mediaMs;
+      const tracking = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
+      if (tracking.phase !== 'tracking') continue;
+      const motion = await readSecondaryMotion(page);
+      if (motion.active !== 'true') continue;
+      assertSecondaryMotionBounds(motion, `secondary-motion sample ${index}`);
+      const angles = secondaryMotionAngleList(motion, 'angles');
+      motionSamples.push({
+        mediaMs,
+        angles,
+        maxAbsAngleDeg: Number(motion.maxAbsAngleDeg),
+        headSpeedDegPerSec: Number(motion.headSpeedDegPerSec),
+        resets: Number(motion.resets),
+        lastReset: motion.lastReset,
+      });
+      if (index === 3 || index === 9 || index === 15) {
+        motionShots.push(await screenshotCanvas(page, `40c-secondary-motion-${index}.png`));
+      }
+    }
+    assert.ok(
+      motionSamples.length >= 12,
+      `expected most turn/nod window frames tracked with secondary motion, got ${motionSamples.length}/18`,
+    );
+    assert.ok(
+      motionSamples.every((sample) => sample.mediaMs >= MOTION_WINDOW_START_MS && sample.mediaMs <= MOTION_WINDOW_END_MS),
+      `secondary-motion samples must fall inside the documented window: ${motionSamples.map((sample) => sample.mediaMs).join(', ')}`,
+    );
+    const partRanges = [0, 1, 2].map((partIndex) =>
+      spread(motionSamples.map((sample) => Number(sample.angles[partIndex] ?? 0))),
+    );
+    assert.ok(
+      Math.max(...partRanges) >= 5,
+      `recorded turns/nods must move the movable parts, per-part ranges=${partRanges.join(',')} degrees`,
+    );
+    assert.ok(
+      partRanges.filter((range) => range >= 3).length >= 2,
+      `at least two parts must move over the recorded window, per-part ranges=${partRanges.join(',')} degrees`,
+    );
+    const maxObservedAngle = Math.max(...motionSamples.map((sample) => sample.maxAbsAngleDeg));
+    evidence.motion = {
+      fixture: motionMetadata.id,
+      windowStartSeconds: MOTION_WINDOW_START_SECONDS,
+      windowSeconds: MOTION_WINDOW_SECONDS,
+      windowStartMediaMs: MOTION_WINDOW_START_MS,
+      windowEndMediaMs: MOTION_WINDOW_END_MS,
+      trackedSamples: motionSamples.length,
+      partRangesDeg: partRanges,
+      maxObservedAngleDeg: maxObservedAngle,
+      screenshots: motionShots,
+      samples: motionSamples,
+    };
+    pass(
+      'Recorded head turns and nods move the declared ears and hair tuft within their bounds',
+      `tracked=${motionSamples.length}/18 part ranges=${partRanges.map((range) => range.toFixed(1)).join('/')} deg maxAngle=${maxObservedAngle.toFixed(2)} deg ${motionShots.join(' ')}`,
+    );
+
+    // --- Post-turn settling -------------------------------------------------
+    // Documented window: the recorded turn peaks around 25.9 s; head angular
+    // velocity drops after it while the underdamped spring is still moving, so
+    // the angle decays toward rest instead of stopping with the head.
+    await page.evaluate((startSeconds) => {
+      const video = document.querySelector('video');
+      if (!video) throw new Error('expected a replay video element');
+      video.currentTime = startSeconds;
+    }, POST_TURN_WINDOW_START_SECONDS);
+    await waitFor(
+      'post-turn window media time',
+      async () => {
+        const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+        return Number(timestamp.mediaMs ?? 0) >= POST_TURN_WINDOW_START_SECONDS * 1000 ? timestamp : null;
+      },
+      15000,
+      100,
+    );
+    await waitFor(
+      'rendered output before post-turn settling sampling',
+      async () => {
+        const status = await readStatus(page);
+        return status.mode === 'render' ? status : null;
+      },
+      15000,
+      40,
+    );
+    const settleSamples = [];
+    let previousSettleMediaMs = null;
+    const settleDeadline = Date.now() + POST_TURN_WINDOW_SECONDS * 1000;
+    while (Date.now() < settleDeadline && settleSamples.length < 16) {
+      await page.waitForTimeout(150);
+      const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+      const mediaMs = Number(timestamp.mediaMs ?? 0);
+      if (previousSettleMediaMs !== null && mediaMs === previousSettleMediaMs) continue;
+      if (mediaMs < POST_TURN_WINDOW_START_SECONDS * 1000 || mediaMs > (POST_TURN_WINDOW_START_SECONDS + POST_TURN_WINDOW_SECONDS) * 1000) {
+        break;
+      }
+      previousSettleMediaMs = mediaMs;
+      const tracking = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
+      if (tracking.phase !== 'tracking') continue;
+      const motion = await readSecondaryMotion(page);
+      if (motion.active !== 'true') continue;
+      assertSecondaryMotionBounds(motion, `post-turn sample at ${mediaMs}`);
+      settleSamples.push({
+        mediaMs,
+        angles: secondaryMotionAngleList(motion, 'angles'),
+        maxAbsAngleDeg: Number(motion.maxAbsAngleDeg),
+        headSpeedDegPerSec: Number(motion.headSpeedDegPerSec),
+      });
+    }
+    assert.ok(settleSamples.length >= 8, `expected a dense post-turn sample window, got ${settleSamples.length} samples`);
+    let peakIndex = 0;
+    for (const [index, sample] of settleSamples.entries()) {
+      if (sample.maxAbsAngleDeg > (settleSamples[peakIndex]?.maxAbsAngleDeg ?? 0)) peakIndex = index;
+    }
+    const peak = settleSamples[peakIndex];
+    assert.ok(
+      peak && peak.maxAbsAngleDeg >= 8,
+      `the recorded turn must drive a visible part angle, peak=${peak?.maxAbsAngleDeg}`,
+    );
+    const afterPeak = settleSamples.slice(peakIndex + 1);
+    const residual = afterPeak.find(
+      (sample) => sample.headSpeedDegPerSec <= 20 && sample.maxAbsAngleDeg >= (peak?.maxAbsAngleDeg ?? 0) * 0.2 && sample.maxAbsAngleDeg >= 3,
+    );
+    const settled = afterPeak.find(
+      (sample) => sample.headSpeedDegPerSec <= 20 && sample.maxAbsAngleDeg <= 3,
+    );
+    assert.ok(
+      residual,
+      `the spring must still be moving after the head angular velocity drops (peak=${peak?.maxAbsAngleDeg}, samples after peak=${JSON.stringify(afterPeak.map((sample) => [sample.maxAbsAngleDeg, sample.headSpeedDegPerSec]))})`,
+    );
+    assert.ok(
+      settled,
+      `the spring must reach a near-rest angle after the turn (peak=${peak?.maxAbsAngleDeg}, samples after peak=${JSON.stringify(afterPeak.map((sample) => [sample.maxAbsAngleDeg, sample.headSpeedDegPerSec]))})`,
+    );
+    // An underdamped spring oscillates around rest while it decays, and the
+    // recorded person keeps producing small head motion later in the clip, so
+    // this live window reports the residual and a near-rest sample rather than
+    // asserting a monotonic tail. The deterministic held-frame settling gate
+    // below is the strict post-turn decay evidence.
+    evidence.settle = {
+      windowStartSeconds: POST_TURN_WINDOW_START_SECONDS,
+      windowSeconds: POST_TURN_WINDOW_SECONDS,
+      peak: { mediaMs: peak?.mediaMs, maxAbsAngleDeg: peak?.maxAbsAngleDeg, headSpeedDegPerSec: peak?.headSpeedDegPerSec },
+      residual: { mediaMs: residual.mediaMs, maxAbsAngleDeg: residual.maxAbsAngleDeg, headSpeedDegPerSec: residual.headSpeedDegPerSec },
+      settled: { mediaMs: settled.mediaMs, maxAbsAngleDeg: settled.maxAbsAngleDeg, headSpeedDegPerSec: settled.headSpeedDegPerSec },
+      settlingMs: settled.mediaMs - (peak?.mediaMs ?? 0),
+      decayFraction: Number((settled.maxAbsAngleDeg / (peak?.maxAbsAngleDeg ?? 1)).toFixed(3)),
+      samples: settleSamples,
+    };
+    pass(
+      'The underdamped spring keeps moving after the recorded turn and settles toward rest',
+      `peak=${peak?.maxAbsAngleDeg}deg at ${peak?.mediaMs}ms (head ${peak?.headSpeedDegPerSec}deg/s), residual=${residual.maxAbsAngleDeg}deg after head slowed to ${residual.headSpeedDegPerSec}deg/s, settled=${settled.maxAbsAngleDeg}deg at ${settled.mediaMs}ms (${settled.mediaMs - (peak?.mediaMs ?? 0)}ms after peak, ${(100 * settled.maxAbsAngleDeg / (peak?.maxAbsAngleDeg ?? 1)).toFixed(1)}% of peak)`,
+    );
+
+    // --- Loop boundary: deliberate reset, no unbounded motion --------------
+    const seamsBefore = Number(parseKeyValues(await readDiagnostic(page, 'diag-loop')).seams ?? 0);
+    const resetsBeforeLoop = Number((await readSecondaryMotion(page)).resets ?? 0);
+    await page.evaluate(() => {
+      const video = document.querySelector('video');
+      if (!video) throw new Error('expected a replay video element');
+      video.currentTime = Math.max(0, video.duration - 1.2);
+    });
+    await waitFor(
+      'loop seam for secondary-motion reset',
+      async () => {
+        const loop = parseKeyValues(await readDiagnostic(page, 'diag-loop'));
+        return Number(loop.seams ?? 0) > seamsBefore ? loop : null;
+      },
+      20000,
+      60,
+    );
+    const afterSeamMotion = await readSecondaryMotion(page);
+    assertSecondaryMotionBounds(afterSeamMotion, 'after loop seam');
+    assert.ok(
+      Number(afterSeamMotion.resets) > resetsBeforeLoop,
+      `a loop seam must deliberately reset the spring state (resets ${resetsBeforeLoop} -> ${afterSeamMotion.resets})`,
+    );
+    // The spring must start from rest after the seam rather than integrating the
+    // pose jump as head velocity.
+    const postSeamAngles = secondaryMotionAngleList(afterSeamMotion, 'angles');
+    assert.ok(
+      Math.max(...postSeamAngles.map((angle) => Math.abs(angle)), 0) <= 5,
+      `the seam frame must start near rest, got angles ${afterSeamMotion.angles}`,
+    );
+    evidence.loop = {
+      seamsBefore,
+      seamsAfter: Number(parseKeyValues(await readDiagnostic(page, 'diag-loop')).seams ?? 0),
+      resetsBefore: resetsBeforeLoop,
+      resetsAfter: Number(afterSeamMotion.resets),
+      motion: afterSeamMotion,
+    };
+    pass(
+      'A replay loop seam resets the spring state instead of injecting a pose-jump impulse',
+      `seams ${evidence.loop.seamsBefore}->${evidence.loop.seamsAfter} resets ${evidence.loop.resetsBefore}->${evidence.loop.resetsAfter} angles=${afterSeamMotion.angles}`,
+    );
+
+    // --- Reacquisition: paused output, reset, then bounded motion ----------
+    const resetsBeforeLoss = Number((await readSecondaryMotion(page)).resets ?? 0);
+    await page.locator('[data-testid="tracking-injection"]').selectOption('lost');
+    const lossStatus = await waitFor('secondary-motion tracking loss', async () => {
+      const status = await readStatus(page);
+      return /tracking was lost/i.test(status.explanation) ? status : null;
+    });
+    assert.equal(lossStatus.mode, 'paused');
+    await page.waitForTimeout(300);
+    const lostMotion = await readSecondaryMotion(page);
+    assert.ok(
+      Number(lostMotion.resets) > resetsBeforeLoss,
+      `tracking loss must reset the spring state (resets ${resetsBeforeLoss} -> ${lostMotion.resets})`,
+    );
+    assert.ok(
+      secondaryMotionAngleList(lostMotion, 'angles').every((angle) => Math.abs(angle) < 1e-9),
+      `the reset pose must be the authored rest orientation, got ${lostMotion.angles}`,
+    );
+    const lostRgb = await readRgb(page);
+    assert.ok(rgbSum(lostRgb) < 120, `tracking loss must hide the secondary-motion effect, got ${JSON.stringify(lostRgb)}`);
+    await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
+    await waitForStatusTitle(page, /Effect active: Reactive ears/);
+    await waitForTrackingPhase(page);
+    const recoveredRgb = await readProcessedRgb(page, 'secondary-motion recovered output');
+    const recoveryMotion = await readSecondaryMotion(page);
+    assertSecondaryMotionBounds(recoveryMotion, 'reacquisition');
+    evidence.reacquisition = {
+      status: lossStatus,
+      lostRgb,
+      lostMotion,
+      recoveredRgb,
+      recoveryMotion,
+    };
+    pass(
+      'Tracking loss resets the spring and hides the effect; reacquisition resumes from rest without an impulse',
+      `paused=${JSON.stringify(lostRgb)} resets=${lostMotion.resets} recovered=${JSON.stringify(recoveredRgb)} recoveryAngle=${recoveryMotion.maxAbsAngleDeg}deg`,
+    );
+
+    // --- Published-output A/B on a held post-turn frame ---------------------
+    await holdRenderedFrameAt(page, SECONDARY_MOTION_AB_CAPTURE_SECONDS, 'secondary motion A/B');
+    const ab = await secondaryMotionAbEvidence(page, '40d-secondary-motion', { captureCamera: true });
+    evidence.ab = { captureSeconds: SECONDARY_MOTION_AB_CAPTURE_SECONDS, ...ab };
+    pass(
+      'The published preview and camera contain the simulated movable-part angle (ON vs authored rest OFF on a held frame)',
+      `held=${SECONDARY_MOTION_AB_CAPTURE_SECONDS}s angle=${ab.heldAngleDeg}deg changed=${ab.changedPixels}px onMask=${ab.changedOnMaskPixels}px self-diff ON ${ab.selfDiffPixels}px OFF ${ab.offSelfDiffPixels}px camera=${ab.camera?.changedPixels}px ${ab.on} ${ab.off} ${ab.camera?.onPng ?? ''}`,
+    );
+    // --- Deterministic held-frame settling ---------------------------------
+    // The replay stays held at the documented post-turn frame, so the accepted
+    // head pose is stationary. The diagnostic settle control then advances the
+    // same spring simulator with that constant pose: the retained post-turn
+    // angle must decay toward rest without a synthetic reset or impulse.
+    const heldBeforeSettle = await readSecondaryMotion(page);
+    assertSecondaryMotionBounds(heldBeforeSettle, 'held before settling');
+    assert.equal(heldBeforeSettle.settling, 'false');
+    const settleStartAngle = Number(heldBeforeSettle.maxAbsAngleDeg);
+    assert.ok(settleStartAngle >= 8, `the held post-turn angle must be visible before settling, got ${settleStartAngle}`);
+    await page.locator('[data-testid="secondary-motion-settle"]').check();
+    await page.waitForTimeout(100);
+    const settleRunning = await readSecondaryMotion(page);
+    assert.equal(settleRunning.settling, 'true', 'the held-frame settle control must advance the simulator');
+    const heldSettleSamples = [];
+    const settleShots = [];
+    const heldSettleStart = Date.now();
+    for (let index = 0; index < 24; index += 1) {
+      await page.waitForTimeout(100);
+      const motion = await readSecondaryMotion(page);
+      assertSecondaryMotionBounds(motion, `held settle sample ${index}`);
+      const elapsedMs = Date.now() - heldSettleStart;
+      heldSettleSamples.push({
+        elapsedMs,
+        maxAbsAngleDeg: Number(motion.maxAbsAngleDeg),
+        angles: secondaryMotionAngleList(motion, 'angles'),
+        updates: Number(motion.updates),
+      });
+      if (index === 5 || index === 17) {
+        settleShots.push(await screenshotCanvas(page, `40g-secondary-motion-settle-${index}.png`));
+      }
+    }
+    const finalSettle = heldSettleSamples[heldSettleSamples.length - 1];
+    const minAfterOneSecond = Math.min(
+      ...heldSettleSamples
+        .filter((sample) => sample.elapsedMs >= 1000)
+        .map((sample) => sample.maxAbsAngleDeg),
+    );
+    assert.ok(
+      Number(finalSettle?.updates) > Number(heldBeforeSettle.updates),
+      'the held settle window must advance the spring simulation',
+    );
+    assert.ok(
+      Number(finalSettle?.maxAbsAngleDeg) <= 2.5,
+      `the held spring must settle toward rest, final max angle=${finalSettle?.maxAbsAngleDeg} from ${settleStartAngle}`,
+    );
+    assert.ok(
+      Number(finalSettle?.maxAbsAngleDeg) <= settleStartAngle * 0.2,
+      `the held spring must decay to <=20% of its retained angle, final=${finalSettle?.maxAbsAngleDeg} start=${settleStartAngle}`,
+    );
+    assert.ok(
+      minAfterOneSecond <= 2.5,
+      `the held spring must reach a near-rest angle after one second, minimum=${minAfterOneSecond}`,
+    );
+    await page.locator('[data-testid="secondary-motion-settle"]').uncheck();
+    await page.waitForTimeout(200);
+    const settleStopped = await readSecondaryMotion(page);
+    assert.equal(settleStopped.settling, 'false', 'unchecking the settle control must stop the held simulation');
+    evidence.heldSettle = {
+      heldFrameSeconds: SECONDARY_MOTION_AB_CAPTURE_SECONDS,
+      startAngleDeg: settleStartAngle,
+      finalAngleDeg: finalSettle?.maxAbsAngleDeg,
+      minAfterOneSecondDeg: minAfterOneSecond,
+      decayFraction: Number(((finalSettle?.maxAbsAngleDeg ?? 0) / settleStartAngle).toFixed(3)),
+      screenshots: settleShots,
+      samples: heldSettleSamples,
+    };
+    pass(
+      'A held post-turn frame settles from its retained angle toward rest through the same bounded simulator',
+      `held=${SECONDARY_MOTION_AB_CAPTURE_SECONDS}s start=${settleStartAngle}deg final=${finalSettle?.maxAbsAngleDeg}deg after ${finalSettle?.elapsedMs}ms (${(100 * (finalSettle?.maxAbsAngleDeg ?? 0) / settleStartAngle).toFixed(1)}% of retained), min after 1s=${minAfterOneSecond}deg ${settleShots.join(' ')}`,
+    );
+    await restartReplayAfterHold(page, 'secondary motion A/B', motionMetadata.id);
+    await waitForStatusTitle(page, /Effect active: Reactive ears/);
+
+    // --- Paused-output policy ----------------------------------------------
+    await page.locator('[data-testid="pause-toggle"]').click();
+    const manualPause = await waitFor('secondary-motion manual pause', async () => {
+      const status = await readStatus(page);
+      return /paused manually/i.test(status.explanation) ? status : null;
+    });
+    await page.waitForTimeout(300);
+    const manualRun = await capturePausedCameraState(page, 'secondary-motion-manual-pause', 'secondary motion manual pause');
+    assertAllPausedFrames(manualRun.frames, 'secondary motion manual pause');
+    const manualPng = assertPausedPng(manualRun.frames, 'secondary motion manual pause');
+    await page.locator('[data-testid="pause-toggle"]').click();
+    await waitForStatusTitle(page, /Effect active: Reactive ears/);
+
+    await page.locator('[data-testid="tracking-injection"]').selectOption('lost');
+    const lostPaused = await waitFor('secondary-motion paused tracking loss', async () => {
+      const status = await readStatus(page);
+      return /tracking was lost/i.test(status.explanation) ? status : null;
+    });
+    await page.waitForTimeout(300);
+    const lostRun = await capturePausedCameraState(page, 'secondary-motion-tracking-lost', 'secondary motion tracking loss');
+    assertAllPausedFrames(lostRun.frames, 'secondary motion tracking loss');
+    const lostPng = assertPausedPng(lostRun.frames, 'secondary motion tracking loss');
+    await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
+    await waitForStatusTitle(page, /Effect active: Reactive ears/);
+
+    await page.locator('[data-testid="tracking-injection"]').selectOption('multiple');
+    const multiplePaused = await waitFor('secondary-motion multiple faces', async () => {
+      const status = await readStatus(page);
+      return /more than one face is visible/i.test(status.explanation) ? status : null;
+    });
+    await page.waitForTimeout(300);
+    const multipleRgb = await readRgb(page);
+    assert.ok(rgbSum(multipleRgb) < 120, `multiple faces must hide the secondary-motion effect, got ${JSON.stringify(multipleRgb)}`);
+    await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
+    await waitForStatusTitle(page, /Effect active: Reactive ears/);
+
+    await page.locator('[data-testid="simulate-failure"]').check();
+    const processingPaused = await waitFor('secondary-motion processing failure', async () => {
+      const status = await readStatus(page);
+      return /simulated by the diagnostic control/i.test(status.explanation) ? status : null;
+    });
+    await page.waitForTimeout(300);
+    const processingRun = await capturePausedCameraState(page, 'secondary-motion-processing-failure', 'secondary motion processing failure');
+    assertAllPausedFrames(processingRun.frames, 'secondary motion processing failure');
+    const processingPng = assertPausedPng(processingRun.frames, 'secondary motion processing failure');
+    await page.locator('[data-testid="simulate-failure"]').uncheck();
+    await waitForStatusTitle(page, /Effect active: Reactive ears/);
+
+    // Importing a package auto-selects it and therefore crosses the async
+    // switch: the output must be the opaque paused screen while the new mask
+    // loads. Returning to the already-loaded movable mask is then synchronous.
+    const beforeSwitch = await readEffectDiagnostic(page);
+    const guardImport = await importPackageThroughControl(app, page, path.join(PACKAGE_FIXTURES_DIR, 'guard-visor.zip'));
+    assert.equal(guardImport.state, 'success', `guard-visor import must succeed: ${guardImport.text}`);
+    await waitForEffectLoaded(page, GUARD_VISOR_EFFECT_ID);
+    const afterSwitch = await readEffectDiagnostic(page);
+    assert.ok(
+      Number(afterSwitch.switchingPausedFrames) > Number(beforeSwitch.switchingPausedFrames),
+      `an async package switch must paint the paused output first: before=${beforeSwitch.switchingPausedFrames} after=${afterSwitch.switchingPausedFrames}`,
+    );
+    await selectEffectThroughControl(page, REACTIVE_EARS_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Reactive ears/);
+
+    await page.locator('[data-testid="effect-select"]').selectOption('none');
+    await waitForStatusTitle(page, /^Tracking paused$/);
+    const noEffectStatus = await readStatus(page);
+    assert.match(noEffectStatus.explanation, /No effect is active/i);
+    await page.waitForTimeout(300);
+    const noEffectRgb = await readRgb(page);
+    assert.ok(rgbSum(noEffectRgb) < 120, `No effect must hide the secondary-motion output, got ${JSON.stringify(noEffectRgb)}`);
+    const noEffectShot = await screenshotCanvas(page, '40e-secondary-motion-no-effect.png');
+    await selectEffectThroughControl(page, REACTIVE_EARS_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Reactive ears/);
+
+    evidence.paused = {
+      manualPause: {
+        status: manualPause,
+        camera: averageFrameRgb(manualRun.frames),
+        png: manualPng.png,
+      },
+      trackingLoss: {
+        status: lostPaused,
+        camera: averageFrameRgb(lostRun.frames),
+        png: lostPng.png,
+      },
+      multipleFaces: { status: multiplePaused, preview: multipleRgb },
+      processingFailure: {
+        status: processingPaused,
+        camera: averageFrameRgb(processingRun.frames),
+        png: processingPng.png,
+      },
+      switching: { before: beforeSwitch, after: afterSwitch },
+      noEffect: { status: noEffectStatus, preview: noEffectRgb, screenshot: noEffectShot },
+    };
+    pass(
+      'Secondary motion obeys manual pause, tracking loss, multiple faces, processing failure, switching and no-effect',
+      `manual=${JSON.stringify(evidence.paused.manualPause.camera)} lost=${JSON.stringify(evidence.paused.trackingLoss.camera)} multiple=${JSON.stringify(multipleRgb)} failure=${JSON.stringify(evidence.paused.processingFailure.camera)} switchingPausedFrames=${afterSwitch.switchingPausedFrames}`,
+    );
+
+    // --- Replay-based added workload ---------------------------------------
+    await page.waitForTimeout(2200);
+    const onMotion = await readSecondaryMotion(page);
+    const onRender = parseKeyValues(await readDiagnostic(page, 'diag-render-cost'));
+    const onFrame = parseKeyValues(await readDiagnostic(page, 'diag-frame-delta'));
+    await page.locator('[data-testid="secondary-motion-toggle"]').uncheck();
+    await page.waitForTimeout(2200);
+    const offRender = parseKeyValues(await readDiagnostic(page, 'diag-render-cost'));
+    const offFrame = parseKeyValues(await readDiagnostic(page, 'diag-frame-delta'));
+    await page.locator('[data-testid="secondary-motion-toggle"]').check();
+    await page.waitForTimeout(300);
+    evidence.timing = {
+      simulationCostP95Ms: Number(onMotion.costMsP95),
+      simulationCostLastMs: Number(onMotion.costMsLast),
+      renderCostP95MsOn: Number(onRender.p95Ms ?? 0),
+      renderCostP95MsRest: Number(offRender.p95Ms ?? 0),
+      frameIntervalP95MsOn: Number(onFrame.p95Ms ?? 0),
+      frameIntervalP95MsRest: Number(offFrame.p95Ms ?? 0),
+      observedRenderCostDeltaP95Ms: Number((Number(onRender.p95Ms ?? 0) - Number(offRender.p95Ms ?? 0)).toFixed(2)),
+      observedFrameIntervalDeltaP95Ms: Number((Number(onFrame.p95Ms ?? 0) - Number(offFrame.p95Ms ?? 0)).toFixed(2)),
+      note:
+        'Replay-derived, development desktop, sequential 2.2 s windows with the same mask and playback; the diagnostic OFF state still runs the simulator but draws the authored rest pose, so the render/frame differences are observed run variation, not an isolated simulation cost. The simulation p95 is the pure spring update around the accepted pose. Not the final benchmark or a performance target.',
+    };
+    pass(
+      'Replay-based secondary-motion simulation and render workload is recorded for the later complete-effect benchmark',
+      `simulation p95=${evidence.timing.simulationCostP95Ms}ms render p95=${evidence.timing.renderCostP95MsOn}ms vs rest ${evidence.timing.renderCostP95MsRest}ms frame interval ${evidence.timing.frameIntervalP95MsOn}ms vs ${evidence.timing.frameIntervalP95MsRest}ms (sequential, not isolated)`,
+    );
+
+    // --- Negative motion declarations keep the current effect --------------
+    await selectEffectThroughControl(page, REACTIVE_EARS_EFFECT_ID);
+    const secondaryNegatives = NEGATIVE_PACKAGE_CASES.filter((entry) => entry.name.startsWith('secondary-motion-'));
+    for (const negative of secondaryNegatives) {
+      const result = await importPackageThroughControl(
+        app,
+        page,
+        path.join(PACKAGE_NEGATIVE_DIR, `${negative.name}.zip`),
+      );
+      assert.equal(result.state, 'error', `${negative.name}: negative import must be rejected`);
+      assert.ok(
+        result.text.includes(negative.code),
+        `${negative.name}: expected actionable code ${negative.code}, got: ${result.text}`,
+      );
+      assert.ok(result.text.length > 60, `${negative.name}: error feedback must be actionable`);
+      const statusAfterReject = await readStatus(page);
+      assert.equal(statusAfterReject.mode, 'render', `${negative.name}: a rejected import must not change the active output`);
+      assert.match(statusAfterReject.title, /Effect active: Reactive ears/);
+      const rejectionMask = await readMask(page);
+      assert.equal(rejectionMask.visible, 'true', `${negative.name}: the previous movable mask must stay visible`);
+      const rejectionMotion = await readSecondaryMotion(page);
+      assertSecondaryMotionBounds(rejectionMotion, `${negative.name} rejection`);
+      evidence.negatives.push({
+        name: negative.name,
+        expectedCode: negative.code,
+        message: result.text.slice(0, 400),
+        maskVisible: rejectionMask.visible,
+        motion: rejectionMotion,
+      });
+    }
+    await page.screenshot({ path: path.join(screenshotsDir, '40f-secondary-motion-import-error.png') });
+    pass(
+      'Unsupported and invalid secondary-motion declarations are rejected with actionable feedback and keep the current effect',
+      `${secondaryNegatives.length} negative fixtures: ${secondaryNegatives.map((entry) => entry.code).join(', ')}`,
+    );
+
+    // --- Removal falls back to the opaque no-effect output -----------------
+    await page.locator('[data-testid="remove-package"]').click();
+    await waitFor('secondary-motion removal result', async () => {
+      const state = await page.locator('[data-testid="package-result"]').getAttribute('data-state');
+      const text = ((await page.locator('[data-testid="package-result"]').textContent()) ?? '').trim();
+      return state === 'success' && /Removed the imported effect/.test(text) ? text : null;
+    });
+    await waitForStatusTitle(page, /^Tracking paused$/);
+    await page.waitForTimeout(300);
+    const removalRgb = await readRgb(page);
+    assert.ok(rgbSum(removalRgb) < 120, `removal must leave the opaque paused output, got ${JSON.stringify(removalRgb)}`);
+    const removalOptions = await effectOptionValues(page);
+    assert.ok(!removalOptions.includes(REACTIVE_EARS_EFFECT_ID), 'the removed secondary-motion effect must leave the selector');
+    evidence.removed = { preview: removalRgb, options: removalOptions };
+    pass(
+      'Removing the active secondary-motion package falls back to the no-effect opaque paused output',
+      `${JSON.stringify(removalRgb)} remaining=${removalOptions.filter((id) => id.startsWith('package:')).join(',')}`,
+    );
+
+    assert.deepEqual(consoleErrors, [], `renderer console errors: ${consoleErrors.join(' | ')}`);
+  } finally {
+    await closeApp(app);
+  }
+  return evidence;
+}
+
 function staticCameraGuard() {
   log('\n== Camera-safety source guard ==');
   const sourceFiles = [];
@@ -4723,6 +5581,7 @@ async function main() {
   const recordedMotion = await recordedMotionScenario();
   const trackerModel = await trackerModelScenario();
   const effectPackages = await effectPackageScenario();
+  const secondaryMotion = await secondaryMotionScenario();
   const trackerMetadata = JSON.parse(readFileSync(path.join(root, 'tracker', 'face-landmarker-model.json'), 'utf8'));
   const motionManifest = JSON.parse(readFileSync(path.join(root, 'fixtures', 'pose-loop.json'), 'utf8'));
 
@@ -4753,6 +5612,8 @@ async function main() {
         windowSeconds: MOTION_WINDOW_SECONDS,
         occlusionCaptureSeconds: OCCLUSION_CAPTURE_SECONDS,
         occlusionOppositeCaptureSeconds: OCCLUSION_CAPTURE_SECONDS_OPPOSITE,
+        postTurnWindowStartSeconds: POST_TURN_WINDOW_START_SECONDS,
+        postTurnWindowSeconds: POST_TURN_WINDOW_SECONDS,
       },
     },
     measuredBoundaries: [
@@ -4779,6 +5640,9 @@ async function main() {
       'Face distortion is a fixed radial shader (bulge/pinch) applied to the replay frame inside an ellipse computed from the tracked face box. The warp centre and radius are recalculated every processed frame; the public diag-distortion diagnostic reports the ellipse and a 64x36 identity-versus-warped comparison of the same uploaded frame texture (so the outside-ellipse delta is zero apart from GPU rounding). That warp-delta number is a diagnostic, not published-output proof. The published-output proof is a separate public A/B: a documented frame is held, the diagnostic Warp toggle keeps the effect selected but draws the same uploaded frame through the identity shader, and exact 1280x720 PNGs captured through the public Capture control must differ substantially inside the independent diag-face-derived ellipse, be ~0 outside it, be pixel-identical for same-state repeats, and the independent camera must receive the identical change. The A/B is repeated at a second documented held pose with a different face position and the changed-region centroid must move with the face (at least 40 px and at least 50% of the face-box movement). The ellipses overlap, so the centroid gate - not ellipse containment - is what excludes a fixed overlay. A dropped warp makes ON==OFF and fails; the identity pass still comes from the effect renderer canvas, so this is not raw-element passthrough. The A/B proves a localized published change and a face-relative changed-region centroid; it is not a measurement of the radial displacement kernel, and OFF provenance rests on the effect-selection assertions and code path.',
       'Face-distortion timing is replay-derived. costMsP95 is only the main-thread WebGL submission time around renderer.render() for the 1280x720 warp pass, with no GPU sync or readback, so the GPU cost lands later in the composite and is not included. diag-render-cost p95 includes the composite and diagnostic sampling; the baseline is a color-only package on the same fixture and output path. The render-cost and frame-interval deltas are sequential-window observations, not isolated distortion costs. These are observations for the later complete-effect benchmark, not a performance target.',
       'A lost WebGL context on the distortion renderer marks it non-drawable, so the processed-frame path returns false, the existing 250 ms undrawable guard hides the whole output in preview and camera, and no stale or raw frame is published. The public context-loss control injects the loss with WEBGL_lose_context and requests a browser restore; three.js re-initialises on restore and the effect resumes. Actual driver/GPU resets outside this injection are not reproduced, and a context that the browser refuses to restore stays hidden until the tracker renderer is rebuilt.',
+      'Secondary motion is a fixed, bounded spring simulation per declared GLB node: a 120 Hz fixed sub-step, dt clamped to 250 ms, angles hard-clamped to maxAngleDeg, and deliberate resets (first sample, gap, pose discontinuity, loop seam, tracking reacquisition) that start from the authored rest pose instead of injecting an impulse. It is driven by the accepted tracked head angular velocity, not a canned clip. It is not strand-level hair simulation, does not convert arbitrary Blender physics, and does not use GPU cloth/bone simulation; each part is one rigid node rotating about one local axis.',
+      'The secondary-motion A/B holds a documented post-turn frame (47.7 s on pose-loop-v1) and compares the simulated part angles with the authored rest pose through the public diagnostic toggle; the effect stays selected and every paused-output rule still applies. The held frame keeps the last simulated angle (the hold resample does not advance the spring), so the A/B is not a live-motion capture. Motion itself is evidenced by the recorded 8 s turn/nod window and the post-turn settling window on the same clip, plus saved screenshots. The independent camera receives the identical A/B change; continuous moving camera evidence is not asserted.',
+      'Post-turn settling is measured on a documented recorded window around 25.9 s where a real head turn is followed by low head angular velocity; the peak, residual motion and decay to rest are reported from the public diagnostics. It is replay-based and does not establish physical-camera or live-human behavior.',
     ],
     commands: {
       build: 'npm run build',
@@ -4862,9 +5726,9 @@ async function main() {
     },
     effectPackages: {
       contract: {
-        schemaVersion: 2,
-        supportedSchemaVersions: [1, 2],
-        shape: 'ZIP with a root manifest.json (schemaVersion 1 or 2) and declared assets under assets/; mask (self-contained GLB + face attachment), declarative color treatment and/or a bounded faceDistortion (schema v2); one complete effect selected at a time.',
+        schemaVersion: 3,
+        supportedSchemaVersions: [1, 2, 3],
+        shape: 'ZIP with a root manifest.json (schemaVersion 1, 2 or 3) and declared assets under assets/; mask (self-contained GLB + face attachment), declarative color treatment, a bounded faceDistortion (schema v2) and/or bounded secondaryMotion movable parts (schema v3); one complete effect selected at a time.',
         faceDistortion: {
           modes: ['bulge', 'pinch'],
           bounds: {
@@ -4880,6 +5744,8 @@ async function main() {
           'expression reactions and other declared behaviors (reserved; non-empty declarations rejected)',
           'glTF animations, skins, cameras, lights and external resources (rejected)',
           'faceDistortion in a schema v1 manifest (rejected; raise schemaVersion to 2)',
+          'secondaryMotion in a schema v1 or v2 manifest (rejected; raise schemaVersion to 3)',
+          'moving-part declarations with an unknown node, axis, drive, field, duplicate node, >4 parts or out-of-range spring parameters (rejected as secondary-motion-invalid)',
           'distortion modes, strengths, radii or offsets outside the documented bounds (rejected as distortion-invalid)',
           'stacking multiple complete effects (no UI)',
         ],
@@ -4894,6 +5760,42 @@ async function main() {
           'replay-derived main-thread measurements on the development desktop; the warp submission cost is performance.now() around renderer.render() only (no GPU sync/readback), the render cost includes the composite, and the baseline is a color-only package on the same fixture. The render/frame-interval deltas are sequential-window observations. Not the final benchmark or a performance target.',
       },
       evidence: effectPackages,
+    },
+    secondaryMotion: {
+      contract: {
+        schemaVersion: 3,
+        supportedSchemaVersions: [1, 2, 3],
+        shape:
+          'A schema v3 mask may declare secondaryMotion.parts (1-4): each part names exactly one mask GLB node and declares a local rotation axis, the tracked head-rotation component that drives it (yaw/pitch/roll), a spring stiffness (4-400 1/s^2), damping ratio (0.05-1.5), maxAngleDeg (1-60) and an optional restAngleDeg within that bound.',
+        runtime:
+          'Pure fixed-step spring simulation (fixed 120 Hz sub-steps, dt clamped to <=250 ms) driven by the accepted tracked head angular velocity; no canned clip, no package code, no per-frame displacement. Deliberate resets on first sample, >250 ms gap, pose discontinuity, loop seam and tracking reacquisition.',
+        bounds: {
+          maxParts: 4,
+          stiffness: [4, 400],
+          dampingRatio: [0.05, 1.5],
+          maxAngleDeg: [1, 60],
+          driveFullScaleDegPerSec: 45,
+          fixedStepMs: Number((1000 / 120).toFixed(3)),
+          maxGapMs: 250,
+          maxPoseDeltaDeg: 45,
+        },
+      },
+      sample: 'fixtures/packages/reactive-ears.zip (schema v3 mask with 2 ears + 1 hair tuft)',
+      evidence: secondaryMotion,
+      motionWindow: {
+        fixture: motionManifest.id,
+        startSeconds: MOTION_WINDOW_START_SECONDS,
+        seconds: MOTION_WINDOW_SECONDS,
+        basis: 'Recorded turns/nods; each sampled part angle is asserted inside its declared bound.',
+      },
+      settlingWindow: {
+        startSeconds: POST_TURN_WINDOW_START_SECONDS,
+        seconds: POST_TURN_WINDOW_SECONDS,
+        basis:
+          'Recorded turn around 25.9 s followed by low head angular velocity; the spring residual and its decay to rest are measured on the public diagnostics. Replay-based, not a physical-camera or human measurement.',
+      },
+      timingBasis:
+        'Replay-derived main-thread measurements on the development desktop; the simulation cost is the pure spring update per accepted pose, and the render/frame-interval differences are sequential-window observations with the authored rest pose as the OFF state. Not the final benchmark or a performance target.',
     },
     timing: {
       ...timing,
@@ -4963,6 +5865,13 @@ async function main() {
   log(`distortion A/B (poses):      centroid ${recordedMotion.distortion.faceFollowingPoses.poseDistancePx}px face move -> ${recordedMotion.distortion.faceFollowingPoses.centroidDistancePx}px centroid move (${OCCLUSION_CAPTURE_SECONDS}s and ${OCCLUSION_CAPTURE_SECONDS_OPPOSITE}s)`);
   log(`distortion context loss:     output hidden in preview and camera (${effectPackages.distortion.contextLoss.diagnostic.contextLost}), restored drawable=${effectPackages.distortion.contextLoss.recovered.diagnostic.drawable}`);
   log(`tracker model:               ${trackerMetadata.id} sha256=${trackerMetadata.sha256.slice(0, 12)}…`);
+  log('\n== Secondary motion (replay-based) ==');
+  log(`secondary-motion motion:    ${secondaryMotion.motion.trackedSamples}/18 samples, part ranges ${secondaryMotion.motion.partRangesDeg.map((range) => range.toFixed(1)).join('/')} deg, max ${secondaryMotion.motion.maxObservedAngleDeg.toFixed(2)} deg (bounded)`);
+  log(`post-turn settling:         peak ${secondaryMotion.settle.peak.maxAbsAngleDeg}deg -> residual ${secondaryMotion.settle.residual.maxAbsAngleDeg}deg after head slowed to ${secondaryMotion.settle.residual.headSpeedDegPerSec}deg/s -> settled ${secondaryMotion.settle.settled.maxAbsAngleDeg}deg in ${secondaryMotion.settle.settlingMs}ms (${(100 * secondaryMotion.settle.decayFraction).toFixed(1)}% of peak)`);
+  log(`loop/reacquisition resets:  loop seams resets ${secondaryMotion.loop.resetsBefore}->${secondaryMotion.loop.resetsAfter}; tracking loss resets ${secondaryMotion.reacquisition.lostMotion.resets} with rest angles`);
+  log(`secondary-motion A/B:       held ${SECONDARY_MOTION_AB_CAPTURE_SECONDS}s angle ${secondaryMotion.ab.heldAngleDeg}deg changed ${secondaryMotion.ab.changedPixels}px (${secondaryMotion.ab.changedOnMaskPixels}px on mask), self-diff ON ${secondaryMotion.ab.selfDiffPixels}px OFF ${secondaryMotion.ab.offSelfDiffPixels}px, camera ${secondaryMotion.ab.camera?.changedPixels}px (identical to preview)`);
+  log(`secondary-motion workload:  simulation p95=${secondaryMotion.timing.simulationCostP95Ms}ms (main-thread spring update only) render p95=${secondaryMotion.timing.renderCostP95MsOn}ms vs rest ${secondaryMotion.timing.renderCostP95MsRest}ms frame interval ${secondaryMotion.timing.frameIntervalP95MsOn}ms vs ${secondaryMotion.timing.frameIntervalP95MsRest}ms (sequential, not isolated)`);
+  log(`secondary-motion rejects:   ${secondaryMotion.negatives.map((entry) => entry.expectedCode).join(', ')}`);
   log('These numbers are replay-derived. They do not establish physical-camera tracking, laptop suitability,');
   log('or the 720p/30 FPS / 100 ms target, and the policy cannot detect every possible visual defect.');
   log('These numbers are replay-derived with a virtual camera, not a physical camera. They do not establish');

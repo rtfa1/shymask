@@ -5,6 +5,7 @@ import {
   effectOptionGroups,
   hasDistortion,
   hasMask,
+  hasSecondaryMotion,
   hasTreatment,
   packageEffectDefinition,
   resolveEffect,
@@ -20,6 +21,7 @@ function installed(overrides: Partial<InstalledEffectPackage> = {}): InstalledEf
     author: { name: 'Studio' },
     treatment: { saturation: 1.2, hueRotateDeg: -10 },
     distortion: null,
+    secondaryMotion: null,
     mask: {
       asset: 'assets/guard-visor.glb',
       assetUrl: 'shymask://app/packages/studio.guard-visor/assets/guard-visor.glb',
@@ -38,6 +40,7 @@ function installed(overrides: Partial<InstalledEffectPackage> = {}): InstalledEf
       declaredBehaviors: 0,
       colorParameters: 2,
       distortionParameters: 0,
+      movingParts: 0,
     },
     importedAt: '2026-11-13T00:00:00.000Z',
     sourceFileName: 'guard-visor.zip',
@@ -95,10 +98,25 @@ test('a face-distortion-only package is a complete effect with no mask or treatm
   assert.equal(hasDistortion(packageEffectDefinition(installed())), false);
 });
 
+test('a package with secondary motion keeps the declaration on the complete effect', () => {
+  const secondaryMotion = {
+    parts: [
+      { node: 'ear-left', axis: 'y' as const, drive: 'yaw' as const, stiffness: 80, damping: 0.3, maxAngleDeg: 22, restAngleDeg: 0 },
+      { node: 'hair-tuft', axis: 'x' as const, drive: 'pitch' as const, stiffness: 55, damping: 0.25, maxAngleDeg: 28, restAngleDeg: 0 },
+    ],
+  };
+  const effect = packageEffectDefinition(installed({ treatment: null, secondaryMotion }));
+  assert.equal(hasMask(effect), true);
+  assert.equal(hasSecondaryMotion(effect), true);
+  assert.deepEqual(effect.secondaryMotion, secondaryMotion);
+  assert.equal(hasSecondaryMotion(packageEffectDefinition(installed())), false);
+});
+
 test('the bundled effects keep their ids and one-at-a-time selectable definitions', () => {
   const ids = allEffectDefinitions([]).map((effect) => effect.id);
   assert.deepEqual(ids, ['none', 'mask', 'warm', 'cool', 'mono']);
   assert.ok(allEffectDefinitions([]).every((effect) => effect.distortion === null));
+  assert.ok(allEffectDefinitions([]).every((effect) => effect.secondaryMotion === null));
   assert.equal(resolveEffect('none', [])?.label, 'No effect');
   assert.equal(resolveEffect('mask', [])?.mask?.kind, 'bundled');
   assert.equal(resolveEffect('warm', [])?.treatment?.cssFilter, 'sepia(0.55) saturate(1.6) contrast(1.05) brightness(1.02)');

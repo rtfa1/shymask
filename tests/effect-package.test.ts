@@ -82,7 +82,6 @@ test('the schema v2 face-distortion sample validates without a mask or treatment
   assert.equal(result.ok, true);
   if (!result.ok) return;
   const pkg = result.package;
-  assert.equal(pkg.manifest.schemaVersion, EFFECT_PACKAGE_SCHEMA_VERSION);
   assert.equal(pkg.manifest.schemaVersion, 2);
   assert.equal(pkg.manifest.id, 'shymask.face-distortion');
   assert.equal(pkg.manifest.mask, undefined);
@@ -179,12 +178,12 @@ test('the valid sample color-only package validates without a mask', () => {
 });
 
 test('an unsupported schemaVersion is rejected with the supported versions named', () => {
-  const result = validateEffectPackage(negativeBytes('schema-version-3'));
+  const result = validateEffectPackage(negativeBytes('schema-version-4'));
   assert.equal(result.ok, false);
   if (result.ok) return;
   const issue = result.errors.find((entry) => entry.code === 'schema-version-unsupported');
   assert.ok(issue);
-  assert.match(issue.message, /schema versions 1 and 2/);
+  assert.match(issue.message, /schema versions 1, 2 and 3/);
 });
 
 test('malformed manifest JSON is rejected as actionable JSON feedback', () => {
@@ -270,6 +269,99 @@ test('a GLB camera is rejected as an unsupported feature at import', () => {
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.ok(result.errors.some((entry) => entry.code === 'glb-unsupported-feature'));
+});
+
+test('the schema v3 secondary-motion sample validates its named moving parts', () => {
+  const result = validateEffectPackage(fixtureBytes('reactive-ears.zip'));
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  const pkg = result.package;
+  assert.equal(pkg.manifest.schemaVersion, EFFECT_PACKAGE_SCHEMA_VERSION);
+  assert.equal(pkg.manifest.schemaVersion, 3);
+  assert.equal(pkg.manifest.id, 'shymask.reactive-ears');
+  assert.ok(pkg.manifest.mask);
+  assert.equal(pkg.manifest.mask?.asset, 'assets/reactive-ears.glb');
+  assert.equal(pkg.manifest.secondaryMotion?.parts.length, 3);
+  assert.deepEqual(
+    pkg.manifest.secondaryMotion?.parts.map((part) => `${part.node}:${part.axis}:${part.drive}:${part.maxAngleDeg}`),
+    ['ear-left:y:yaw:32', 'ear-right:y:yaw:32', 'hair-tuft:x:pitch:35'],
+  );
+  assert.equal(pkg.complexity.movingParts, 3);
+  assert.equal(pkg.complexity.triangles, 204);
+  assert.equal(pkg.complexity.meshes, 4);
+  assert.equal(pkg.complexity.nodes, 4);
+});
+
+test('secondaryMotion is rejected in a lower schema version instead of silently rendering a rigid mask', () => {
+  const bytes = mutateManifest(fixtureBytes('reactive-ears.zip'), (manifest) => {
+    manifest.schemaVersion = 2;
+  });
+  const result = validateEffectPackage(bytes);
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  const issue = result.errors.find((entry) => entry.code === 'schema-version-unsupported');
+  assert.ok(issue, `expected schema-version-unsupported, got ${result.errors.map((entry) => entry.code).join(', ')}`);
+  assert.equal(issue.path, 'secondaryMotion');
+  assert.match(issue.message, /requires schemaVersion 3/);
+});
+
+test('schema v3 accepts a mask without secondaryMotion, keeping v1/v2 effects forward-compatible', () => {
+  const bytes = mutateManifest(fixtureBytes('guard-visor.zip'), (manifest) => {
+    manifest.schemaVersion = 3;
+  });
+  const result = validateEffectPackage(bytes);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.package.manifest.schemaVersion, 3);
+  assert.equal(result.package.manifest.secondaryMotion, undefined);
+  assert.equal(result.package.complexity.movingParts, 0);
+});
+
+test('invalid secondary-motion declarations are rejected with secondary-motion-invalid', () => {
+  const cases: Array<{ name: string; mutate: (parts: Array<Record<string, unknown>>, manifest: Record<string, unknown>) => void }> = [
+    { name: 'unsupported axis', mutate: (parts) => { parts[0]!.axis = 'w'; } },
+    { name: 'unsupported drive', mutate: (parts) => { parts[0]!.drive = 'tilt'; } },
+    { name: 'stiffness out of range', mutate: (parts) => { parts[0]!.stiffness = 4000; } },
+    { name: 'damping out of range', mutate: (parts) => { parts[0]!.damping = 9; } },
+    { name: 'maxAngleDeg out of range', mutate: (parts) => { parts[0]!.maxAngleDeg = 90; } },
+    { name: 'restAngleDeg beyond maxAngleDeg', mutate: (parts) => { parts[0]!.restAngleDeg = 40; } },
+    { name: 'unknown node', mutate: (parts) => { parts[0]!.node = 'left-ear'; } },
+    { name: 'duplicate node', mutate: (parts) => { parts[1]!.node = parts[0]!.node; } },
+    { name: 'unknown field', mutate: (parts) => { parts[0]!.gravity = 1; } },
+    { name: 'too many parts', mutate: (parts) => { parts.push(...parts.slice(0, 2).map((part, index) => ({ ...part, node: `extra-${index}` }))); } },
+    { name: 'no mask', mutate: (_parts, manifest) => { delete manifest.mask; } },
+    { name: 'empty parts', mutate: (_parts, manifest) => { manifest.secondaryMotion = { parts: [] }; } },
+  ];
+  for (const entry of cases) {
+    const bytes = mutateManifest(fixtureBytes('reactive-ears.zip'), (manifest) => {
+      const declaration = manifest.secondaryMotion as { parts: Array<Record<string, unknown>> };
+      entry.mutate(declaration.parts, manifest);
+    });
+    const result = validateEffectPackage(bytes);
+    assert.equal(result.ok, false, `${entry.name} must be rejected`);
+    if (result.ok) continue;
+    const issue = result.errors.find((candidate) => candidate.code === 'secondary-motion-invalid');
+    assert.ok(
+      issue,
+      `${entry.name} must report secondary-motion-invalid, got ${result.errors.map((candidate) => candidate.code).join(', ')}`,
+    );
+    assert.ok(issue.message.length > 20, `${entry.name}: message must be actionable: ${issue.message}`);
+    assert.ok(issue.path?.startsWith('secondaryMotion'), `${entry.name}: issue path must name the field, got ${issue.path}`);
+  }
+});
+
+test('the committed secondary-motion negative fixtures are rejected with actionable codes', () => {
+  expectError(negativeBytes('secondary-motion-schema-v2'), 'schema-version-unsupported');
+  for (const name of [
+    'secondary-motion-invalid-axis',
+    'secondary-motion-unknown-node',
+    'secondary-motion-out-of-range',
+    'secondary-motion-unknown-field',
+    'secondary-motion-rest-beyond-max',
+    'secondary-motion-without-mask',
+  ]) {
+    expectError(negativeBytes(name), 'secondary-motion-invalid');
+  }
 });
 
 test('nonzero mask attachment position, rotation and scale survive validation', () => {

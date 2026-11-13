@@ -13,12 +13,18 @@ import {
   effectOptionGroups,
   hasDistortion as effectHasDistortion,
   hasMask as effectHasMask,
+  hasSecondaryMotion as effectHasSecondaryMotion,
   hasTreatment as effectHasTreatment,
   resolveEffect,
   type EffectDefinition,
 } from '../core/effects';
 import { faceDistortionGeometry, type FrameDeltaStats } from '../core/face-distortion';
 import { DECODE_STALL_THRESHOLD_MS, FrameWatchdog } from '../core/frame-watchdog';
+import {
+  SecondaryMotionSimulator,
+  secondaryMotionAnglesRadians,
+  type SecondaryMotionFrame,
+} from '../core/secondary-motion';
 import {
   PAUSED_TITLE,
   resolveOutput,
@@ -104,6 +110,8 @@ const poseSmoothingSelect = mustGet<HTMLSelectElement>('pose-smoothing');
 const occlusionToggle = mustGet<HTMLInputElement>('occlusion-toggle');
 const distortionWarpToggle = mustGet<HTMLInputElement>('distortion-warp-toggle');
 const distortionContextToggle = mustGet<HTMLInputElement>('distortion-context-loss');
+const secondaryMotionToggle = mustGet<HTMLInputElement>('secondary-motion-toggle');
+const secondarySettleToggle = mustGet<HTMLInputElement>('secondary-motion-settle');
 const recheckButton = mustGet<HTMLButtonElement>('recheck');
 const captureButton = mustGet<HTMLButtonElement>('capture');
 const failureToggle = mustGet<HTMLInputElement>('simulate-failure');
@@ -143,6 +151,7 @@ const state: PreviewState = {
   effectHasMask: effectHasMask(DEFAULT_ACTIVE_EFFECT),
   effectHasTreatment: effectHasTreatment(DEFAULT_ACTIVE_EFFECT),
   effectHasDistortion: effectHasDistortion(DEFAULT_ACTIVE_EFFECT),
+  effectHasSecondaryMotion: effectHasSecondaryMotion(DEFAULT_ACTIVE_EFFECT),
   effectValid: true,
   effectError: null,
   switching: false,
@@ -200,6 +209,20 @@ let lastRawPoseMatrix: number[] | null = null;
 let lastPoseMatrix: number[] | null = null;
 let poseSmoothingEnabled = true;
 const poseSmoother = new PoseSmoother();
+
+// Secondary motion: the pure spring simulator feeds part angles to the mask
+// renderer. The diagnostic A/B toggle keeps the effect selected and simply
+// draws the same mask with the parts at their authored rest orientation.
+let secondarySimulator: SecondaryMotionSimulator | null = null;
+let secondaryParametersKey = '';
+let secondaryMotionEnabled = true;
+let secondaryMotionTracking = false;
+let lastSecondaryFrame: SecondaryMotionFrame | null = null;
+let lastSecondaryAnglesRad: number[] = [];
+let secondaryMotionCosts: number[] = [];
+/** Last accepted tracked head pose, reused by the held-frame settling diagnostic. */
+let lastAcceptedPose: { yawDeg: number; pitchDeg: number; rollDeg: number } | null = null;
+let secondarySettleTimer: number | null = null;
 
 /**
  * Rolling per-presented-frame pose stability evidence. Second differences of
@@ -357,6 +380,7 @@ function syncEffectState(): void {
   state.effectHasMask = effectHasMask(activeEffect);
   state.effectHasTreatment = effectHasTreatment(activeEffect);
   state.effectHasDistortion = effectHasDistortion(activeEffect);
+  state.effectHasSecondaryMotion = effectHasSecondaryMotion(activeEffect);
   // Selection is normalized before it reaches this state: `selectEffect` and
   // `applyPackageList` fall back to an explicit no-effect paused output when an
   // id no longer resolves. The output policy keeps its `effect-invalid` branch
@@ -446,6 +470,12 @@ function bindControls(): void {
   distortionContextToggle.addEventListener('change', () => {
     setDistortionContextLost(distortionContextToggle.checked);
   });
+  secondaryMotionToggle.addEventListener('change', () => {
+    setSecondaryMotionEnabled(secondaryMotionToggle.checked);
+  });
+  secondarySettleToggle.addEventListener('change', () => {
+    setSecondarySettleEnabled(secondarySettleToggle.checked);
+  });
   vcamRestart.addEventListener('click', () => {
     if (!window.shymask) return;
     vcamRestart.disabled = true;
@@ -486,6 +516,7 @@ async function selectEffect(id: string): Promise<void> {
   switchingActive = false;
   syncEffectState();
   buildEffectOptions();
+  resetSecondaryMotion('explicit');
   // Do not render before ensureMaskContent: if the new effect's mask content is
   // not loaded yet, that would briefly draw the previous mask. ensureMaskContent
   // paints the opaque paused screen for the switch instead.
@@ -515,6 +546,7 @@ async function ensureMaskContent(token: number): Promise<void> {
     // generation is discarded, so the switch state must not stay paused.
     switchingActive = false;
     effectError = null;
+    resetSecondaryMotion('explicit');
     // Keep the last loaded package summary cached: diagnostics hide it while a
     // no-mask effect is active, and returning to an already-loaded package mask
     // should still report its mesh/probe summary without reloading.
@@ -569,7 +601,7 @@ async function ensureMaskContent(token: number): Promise<void> {
       // re-checked. This closes the window where an older load could resolve
       // after a newer selection and publish the wrong effect.
       const renderer = maskRenderer;
-      const parsed = await renderer.parseGltfModel(data, mask.attachment);
+      const parsed = await renderer.parseGltfModel(data, mask.attachment, activeEffect.secondaryMotion);
       const committed = switchGeneration.settle(
         token,
         parsed,
@@ -577,6 +609,7 @@ async function ensureMaskContent(token: number): Promise<void> {
           renderer.commitGltfModel(value);
           maskSummary = value.summary;
           loadedMaskKey = desiredKey;
+          resetSecondaryMotion('explicit');
         },
         (value) => renderer.discardGltfModel(value),
       );
@@ -715,6 +748,7 @@ async function initializeTracker(info: TrackerInfo): Promise<void> {
       distortionRenderer = null;
     }
     resetPoseTrackingState();
+    resetSecondaryMotion('explicit');
     trackerReady = true;
     tracking.reset(performance.now());
     state.tracking = tracking.snapshot(performance.now());
@@ -870,6 +904,9 @@ function applyFixture(fixture: FixtureInfo): void {
   distortionWarpEnabled = true;
   distortionWarpToggle.checked = true;
   distortionContextToggle.checked = false;
+  secondaryMotionEnabled = true;
+  secondaryMotionToggle.checked = true;
+  resetSecondaryMotion('explicit');
   timeline.reset();
   latestTimestamp = null;
   latestStats = null;
@@ -945,8 +982,140 @@ function resetPoseTrackingState(): void {
   lastRawPoseMatrix = null;
   lastPoseMatrix = null;
   lastAcceptedFaceBbox = null;
+  lastAcceptedPose = null;
   poseSmoother.reset();
   resetPoseMetrics();
+}
+
+/**
+ * Creates (or reuses) the pure simulator for the active effect's declaration.
+ * A new declaration starts from the authored rest pose; the simulator then
+ * integrates accepted tracked head samples. Returns null when the selected
+ * effect declares no movable parts.
+ */
+function ensureSecondarySimulator(): SecondaryMotionSimulator | null {
+  const parameters = activeEffect.secondaryMotion;
+  if (!parameters || parameters.parts.length === 0) {
+    secondarySimulator = null;
+    secondaryParametersKey = '';
+    lastSecondaryAnglesRad = [];
+    return null;
+  }
+  const key = JSON.stringify(parameters.parts);
+  if (!secondarySimulator || secondaryParametersKey !== key) {
+    secondarySimulator = new SecondaryMotionSimulator(parameters);
+    secondaryParametersKey = key;
+    lastSecondaryFrame = null;
+    lastSecondaryAnglesRad = parameters.parts.map((part) => (part.restAngleDeg * Math.PI) / 180);
+    secondaryMotionCosts = [];
+  }
+  return secondarySimulator;
+}
+
+/**
+ * Deliberately drops spring state. Called on effect switches, tracking
+ * reacquisition, loop seams, rechecks and window teardown so the animation
+ * restarts from the authored rest pose instead of injecting an impulse.
+ */
+function resetSecondaryMotion(reason: 'explicit' | 'reacquisition' | 'loop-seam'): void {
+  stopSecondarySettle();
+  const simulator = ensureSecondarySimulator();
+  if (simulator) {
+    simulator.reset(reason);
+    lastSecondaryFrame = simulator.last;
+    lastSecondaryAnglesRad = secondaryMotionAnglesRadians(simulator.last.anglesDeg);
+  } else {
+    lastSecondaryFrame = null;
+    lastSecondaryAnglesRad = [];
+  }
+  secondaryMotionTracking = false;
+  applySecondaryMotionAngles();
+}
+
+/** Applies the current simulated (or rest, for the diagnostic A/B) angles. */
+function applySecondaryMotionAngles(): void {
+  if (!maskRenderer) return;
+  maskRenderer.setSecondaryMotionAngles(
+    secondaryMotionEnabled ? lastSecondaryAnglesRad : lastSecondaryAnglesRad.map(() => 0),
+  );
+}
+
+/**
+ * Feeds one accepted tracked pose to the spring simulation. The pure module
+ * derives head angular velocity from consecutive accepted poses; this function
+ * only owns the renderer-side state and metrics.
+ */
+function updateSecondaryMotion(pose: { yawDeg: number; pitchDeg: number; rollDeg: number }, nowMs: number): void {
+  const simulator = ensureSecondarySimulator();
+  if (!simulator) return;
+  const frame = simulator.update(
+    { yawDeg: pose.yawDeg, pitchDeg: pose.pitchDeg, rollDeg: pose.rollDeg, timeMs: nowMs },
+    nowMs,
+  );
+  lastSecondaryFrame = frame;
+  lastSecondaryAnglesRad = secondaryMotionAnglesRadians(frame.anglesDeg);
+  secondaryMotionCosts = pushRolling(secondaryMotionCosts, frame.costMs);
+  applySecondaryMotionAngles();
+}
+
+/**
+ * Tracks the policy phase so leaving `tracking` clears the spring state once.
+ * Reacquisition then starts from rest instead of stepping from a stale pose.
+ */
+function syncSecondaryMotionTrackingState(): void {
+  const trackingNow = state.tracking.phase === 'tracking';
+  if (!trackingNow && secondaryMotionTracking) resetSecondaryMotion('reacquisition');
+  secondaryMotionTracking = trackingNow;
+}
+
+/** Public diagnostic A/B: keep the effect active and draw the parts at rest. */
+function setSecondaryMotionEnabled(enabled: boolean): void {
+  if (secondaryMotionEnabled === enabled) return;
+  secondaryMotionEnabled = enabled;
+  secondaryMotionToggle.checked = enabled;
+  applySecondaryMotionAngles();
+  renderNow();
+  updateDiagnostics(performance.now());
+}
+
+/** Stops the held-frame settling diagnostic and clears its control. */
+function stopSecondarySettle(): void {
+  if (secondarySettleTimer !== null) {
+    window.clearInterval(secondarySettleTimer);
+    secondarySettleTimer = null;
+  }
+  secondarySettleToggle.checked = false;
+}
+
+/**
+ * Diagnostic-only held-frame settling: with the replay held, the accepted head
+ * pose is stationary, so advancing the same spring simulator shows the
+ * post-turn residual decaying toward rest. This is a controlled evidence path
+ * (the hold control is already diagnostic-only); normal playback never uses it.
+ */
+function setSecondarySettleEnabled(enabled: boolean): void {
+  if (!enabled) {
+    stopSecondarySettle();
+    renderNow();
+    updateDiagnostics(performance.now());
+    return;
+  }
+  const simulator = ensureSecondarySimulator();
+  if (!simulator || !replayFrameHeld || !lastAcceptedPose) {
+    secondarySettleToggle.checked = false;
+    return;
+  }
+  const now = performance.now();
+  // Preserve the retained angle/velocity but reset the sample clock: the hold
+  // lasted longer than the simulator's normal gap reset.
+  simulator.resumeAt({ ...lastAcceptedPose, timeMs: now }, now);
+  if (secondarySettleTimer !== null) window.clearInterval(secondarySettleTimer);
+  secondarySettleTimer = window.setInterval(() => {
+    if (secondarySettleTimer === null || !replayFrameHeld || !lastAcceptedPose) return;
+    updateSecondaryMotion(lastAcceptedPose, performance.now());
+    renderNow();
+  }, 50);
+  updateDiagnostics(now);
 }
 
 /**
@@ -962,6 +1131,7 @@ function disposeMaskRenderer(): void {
   maskSummary = null;
   lastMaskProjection = EMPTY_MASK_PROJECTION;
   resetPoseTrackingState();
+  resetSecondaryMotion('explicit');
 }
 
 /**
@@ -1016,6 +1186,9 @@ async function startPreview(): Promise<void> {
   distortionWarpEnabled = true;
   distortionWarpToggle.checked = true;
   distortionContextToggle.checked = false;
+  secondaryMotionEnabled = true;
+  secondaryMotionToggle.checked = true;
+  resetSecondaryMotion('explicit');
   timeline.reset();
   frameIntervals = [];
   renderCosts = [];
@@ -1073,6 +1246,9 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
   if (timestamp.frameDeltaMs > 0) {
     frameIntervals = pushRolling(frameIntervals, timestamp.frameDeltaMs);
   }
+  // A loop seam is a deliberate media-time and pose reset. Clear the spring
+  // state instead of integrating the seam's pose jump as head velocity.
+  if (timestamp.loopSeam && activeEffect.secondaryMotion) resetSecondaryMotion('loop-seam');
 
   if (!timestamp.valid) {
     state.processingHealthy = false;
@@ -1089,6 +1265,7 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
   }
 
   updateTracking(element, now);
+  syncSecondaryMotionTrackingState();
   const decision = resolveOutput(state);
 
   if (decision.mode === 'render') {
@@ -1197,6 +1374,15 @@ function updateTracking(element: HTMLVideoElement, nowMs: number): void {
       const smoothedMatrix = poseSmoother.push(lastRawPoseMatrix, nowMs);
       const renderedMatrix = poseSmoothingEnabled ? smoothedMatrix : lastRawPoseMatrix;
       lastPoseMatrix = renderedMatrix;
+      // Secondary motion consumes the same accepted pose the mask is attached
+      // to. A held diagnostic frame keeps the last simulated part angles so the
+      // public A/B compares the same held pose; the hold resample would
+      // otherwise look like a >250 ms tracking gap and reset the spring.
+      const renderedPose = poseFromColumnMajorMatrix(renderedMatrix);
+      if (renderedPose) lastAcceptedPose = renderedPose;
+      if (renderedPose && activeEffect.secondaryMotion && !replayFrameHeld) {
+        updateSecondaryMotion(renderedPose, nowMs);
+      }
       lastMaskProjection = maskRenderer.setPose(renderedMatrix);
       recordPoseMetrics(lastRawPoseMatrix, smoothedMatrix, nowMs);
     }
@@ -1442,6 +1628,7 @@ function checkDecodeStall(): void {
 function renderNow(): void {
   const now = performance.now();
   state.tracking = tracking.snapshot(now);
+  syncSecondaryMotionTrackingState();
   const decision = resolveOutput(state);
 
   if (decision.mode === 'render' && video && video.readyState >= 2) {
@@ -1569,6 +1756,7 @@ function setReplayFrameHeld(held: boolean): void {
     renderNow();
     return;
   }
+  stopSecondarySettle();
   if (state.started && !state.manualPaused) {
     watchdog.arm(performance.now());
     subscribeFrameLoop();
@@ -1643,6 +1831,10 @@ function updateControls(): void {
   occlusionToggle.disabled = !trackerReady;
   distortionWarpToggle.disabled = !trackerReady || !activeEffect.distortion;
   distortionContextToggle.disabled = !trackerReady || !activeEffect.distortion;
+  secondaryMotionToggle.disabled =
+    !trackerReady || !activeEffect.secondaryMotion || activeEffect.mask?.kind !== 'gltf';
+  secondarySettleToggle.disabled =
+    !trackerReady || !replayFrameHeld || !activeEffect.secondaryMotion || activeEffect.mask?.kind !== 'gltf';
   holdFrameToggle.disabled = !state.started;
   recheckButton.disabled = false;
   importPackageButton.disabled = importInFlight;
@@ -1659,7 +1851,7 @@ function updateDiagnostics(now: number): void {
   setDiag('diag-loop', `loops=${timeline.loops} seams=${timeline.seams}`);
   setDiag(
     'diag-effect',
-    `id=${activeEffect.id} source=${activeEffect.source} mask=${activeEffect.mask ? activeEffect.mask.kind : 'none'} attachment=${activeEffect.mask?.kind === 'gltf' ? `${activeEffect.mask.attachment.position.join(',')}/${activeEffect.mask.attachment.rotationDeg.join(',')}/${activeEffect.mask.attachment.scale}` : 'default'} treatment=${activeEffect.treatment ? 'yes' : 'no'} distortion=${activeEffect.distortion ? `${activeEffect.distortion.mode}:${activeEffect.distortion.strength}:${activeEffect.distortion.radiusScale}:${activeEffect.distortion.centerOffset.join(',')}` : 'none'} switching=${switchingActive} switchingPausedFrames=${switchingPausedFrames} switchCount=${switchCount} error=${effectError ? 'yes' : 'no'} package=${activeEffect.source === 'package' ? `${activeEffect.packageVersion ?? '?'} loaded=${activeEffect.mask ? (loadedMaskKey !== null ? 'yes' : 'no') : 'n/a'}` : 'n/a'} maskProbe=${activeEffect.mask && maskSummary?.probeColor ? `${maskSummary.probeColor.r},${maskSummary.probeColor.g},${maskSummary.probeColor.b}` : 'none'} meshes=${activeEffect.mask ? (maskSummary?.meshes ?? 0) : 0}`,
+    `id=${activeEffect.id} source=${activeEffect.source} mask=${activeEffect.mask ? activeEffect.mask.kind : 'none'} attachment=${activeEffect.mask?.kind === 'gltf' ? `${activeEffect.mask.attachment.position.join(',')}/${activeEffect.mask.attachment.rotationDeg.join(',')}/${activeEffect.mask.attachment.scale}` : 'default'} treatment=${activeEffect.treatment ? 'yes' : 'no'} distortion=${activeEffect.distortion ? `${activeEffect.distortion.mode}:${activeEffect.distortion.strength}:${activeEffect.distortion.radiusScale}:${activeEffect.distortion.centerOffset.join(',')}` : 'none'} motion=${activeEffect.secondaryMotion?.parts.length ?? 0} switching=${switchingActive} switchingPausedFrames=${switchingPausedFrames} switchCount=${switchCount} error=${effectError ? 'yes' : 'no'} package=${activeEffect.source === 'package' ? `${activeEffect.packageVersion ?? '?'} loaded=${activeEffect.mask ? (loadedMaskKey !== null ? 'yes' : 'no') : 'n/a'}` : 'n/a'} maskProbe=${activeEffect.mask && maskSummary?.probeColor ? `${maskSummary.probeColor.r},${maskSummary.probeColor.g},${maskSummary.probeColor.b}` : 'none'} meshes=${activeEffect.mask ? (maskSummary?.meshes ?? 0) : 0}`,
   );
   setDiag(
     'diag-packages',
@@ -1746,6 +1938,7 @@ function updateTrackingDiagnostics(): void {
   }
   updateOcclusionDiagnostics();
   updateDistortionDiagnostics();
+  updateSecondaryMotionDiagnostics();
   updateSmoothingDiagnostics();
 }
 
@@ -1784,6 +1977,27 @@ function updateDistortionDiagnostics(): void {
   setDiag(
     'diag-distortion',
     `active=true mode=${distortion.mode} strength=${distortion.strength} radiusScale=${distortion.radiusScale} centerOffset=${distortion.centerOffset.join(',')} warpEnabled=${warpEnabled} drawable=${drawable} contextLost=${contextLost} ${geometryFields} costMsLast=${distortionRenderCostMs.toFixed(2)} costMsP95=${percentile95(distortionRenderCosts).toFixed(2)} warpDelta=${(delta?.meanAbsDiff ?? 0).toFixed(2)} changedInsidePct=${(delta?.changedInsidePct ?? 0).toFixed(1)} changedOutsidePct=${(delta?.changedOutsidePct ?? 0).toFixed(1)} insidePixels=${delta?.insidePixels ?? 0}`,
+  );
+}
+
+function updateSecondaryMotionDiagnostics(): void {
+  const declaration = activeEffect.secondaryMotion;
+  const snapshot = secondarySimulator?.snapshot ?? null;
+  const frame = lastSecondaryFrame;
+  if (!declaration) {
+    setDiag(
+      'diag-secondary-motion',
+      `active=false parts=0 enabled=${secondaryMotionEnabled} updates=0 resets=0 lastReset=none dtMs=0.0 headSpeedDegPerSec=0.0 maxAbsAngleDeg=0.00 maxAngleDeg= angles= names= costMsLast=0.000 costMsP95=0.000 applied=none settling=${secondarySettleTimer !== null}`,
+    );
+    return;
+  }
+  const names = declaration.parts.map((part) => part.node).join(',');
+  const axes = declaration.parts.map((part) => `${part.axis}:${part.drive}`).join(',');
+  const maxAngles = declaration.parts.map((part) => part.maxAngleDeg).join(',');
+  const angles = (snapshot?.anglesDeg ?? []).map((angle) => angle.toFixed(2)).join(',');
+  setDiag(
+    'diag-secondary-motion',
+    `active=true parts=${declaration.parts.length} enabled=${secondaryMotionEnabled} updates=${snapshot?.updates ?? 0} resets=${snapshot?.resets ?? 0} lastReset=${snapshot?.lastResetReason ?? 'none'} dtMs=${(frame?.dtMs ?? 0).toFixed(1)} headSpeedDegPerSec=${(snapshot?.headSpeedDegPerSec ?? 0).toFixed(1)} maxAbsAngleDeg=${(snapshot?.maxAbsAngleDeg ?? 0).toFixed(2)} maxAngleDeg=${maxAngles} angles=${angles} names=${names} axes=${axes} costMsLast=${(frame?.costMs ?? 0).toFixed(3)} costMsP95=${percentile95(secondaryMotionCosts).toFixed(3)} applied=${secondaryMotionEnabled ? 'simulated' : 'rest'} settling=${secondarySettleTimer !== null} drawable=${Boolean(maskRenderer)}`,
   );
 }
 
