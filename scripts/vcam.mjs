@@ -16,7 +16,7 @@
  *   node scripts/vcam.mjs consumer --frames 5 --out <dir> --prefix <name>
  */
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -47,18 +47,85 @@ function stage() {
   for (const binary of binaries) {
     const source = path.join(builtDir, binary);
     if (!existsSync(source)) fail(`missing ${binary}; run npm run build:native first`);
-    copyFileSync(source, path.join(installDir, binary));
+    const destination = path.join(installDir, binary);
+    try {
+      copyFileSync(source, destination);
+    } catch (error) {
+      // A loaded media source DLL cannot be overwritten, but Windows allows a
+      // mapped image to be renamed. Move the old copy aside and stage the new
+      // one at the registered path; the frame server picks it up on the next
+      // activation.
+      if (error.code === 'EBUSY' || error.code === 'EPERM' || error.code === 'EACCES') {
+        try {
+          renameSync(destination, `${destination}.stale-${Date.now()}`);
+          copyFileSync(source, destination);
+          continue;
+        } catch (renameError) {
+          fail(
+            `could not stage ${binary}: ${renameError.code ?? renameError.message}\n` +
+              'Run `npm run vcam:install` once from an elevated prompt to refresh the staged files.',
+          );
+        }
+      }
+      fail(
+        `could not stage ${binary}: ${error.code ?? error.message}\n` +
+          'The staged files are owned by the elevated installer. Run `npm run vcam:install` once\n' +
+          'from an elevated prompt to refresh permissions and binaries, then retry.',
+      );
+    }
   }
   return installDir;
 }
 
+/**
+ * True when the current shell can write machine-wide state. `net session`
+ * requires an elevated token on Windows.
+ */
+function isElevated() {
+  const result = spawnSync('net', ['session'], { stdio: 'ignore' });
+  return result.status === 0;
+}
+
+/**
+ * The elevated installer owns %ProgramData%\Shymask, so a later non-elevated
+ * `npm run vcam:install` could not refresh the staged DLL. Grant the installing
+ * user modify access (inherited by children) while we have the elevated token.
+ */
+function grantInstallerAccess(directory) {
+  if (!isElevated()) return false;
+  const user = `${process.env.USERDOMAIN ?? ''}\\${process.env.USERNAME ?? ''}`;
+  const result = spawnSync('icacls', [directory, '/grant', `${user}:(OI)(CI)M`, '/T'], {
+    encoding: 'utf8',
+  });
+  const ok = result.status === 0;
+  console.log(
+    ok
+      ? `granted ${user} modify access to ${directory} (so non-elevated restaging works)`
+      : `could not grant ${user} access to ${directory}: ${(result.stderr ?? '').trim()}`,
+  );
+  return ok;
+}
+
 const command = process.argv[2] ?? 'status';
 if (command === 'install') {
+  grantInstallerAccess(dataRoot);
   const directory = stage();
   const result = run(hostPath, ['install']);
   console.log(`\nstaged native components in ${directory}`);
-  if (/\"machine\":true/.test(result.stdout ?? '')) {
-    console.log('Machine-wide (HKLM) registration is in place; the frame server can activate the source.');
+  const machineRegistered = spawnSync(
+    'reg',
+    [
+      'query',
+      'HKLM\\Software\\Classes\\CLSID\\{5E1D3A6B-2C4F-4A7E-9B8D-0C1F2A3B4C5D}\\InprocServer32',
+      '/ve',
+    ],
+    { encoding: 'utf8' },
+  ).status === 0;
+  if (machineRegistered) {
+    console.log('Machine-wide (HKLM) registration is present; the frame server can load this build.');
+    console.log('Binaries refreshed for the standard user; no further elevation is needed to restage.');
+  } else if (/\"machine\":true/.test(result.stdout ?? '')) {
+    console.log('Machine-wide (HKLM) registration was just written; the frame server can load the source.');
   } else {
     console.log('');
     console.log('BLOCKED for a standard (non-elevated) account:');
@@ -92,3 +159,4 @@ if (command === 'install') {
 } else {
   fail(`unknown command: ${command}`);
 }
+

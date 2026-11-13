@@ -1,4 +1,4 @@
-﻿// Media Foundation media source for the Shymask virtual camera.
+// Media Foundation media source for the Shymask virtual camera.
 //
 // The source is a single-stream live source. It is activated by an IMFActivate
 // object (see activator.h) whose CLSID is the sourceId passed to
@@ -21,7 +21,7 @@ class MediaSource final
     : public Microsoft::WRL::RuntimeClass<
           Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
           Microsoft::WRL::ChainInterfaces<IMFMediaSourceEx, IMFMediaSource, IMFMediaEventGenerator>,
-          IMFGetService> {
+          IMFGetService, IMFSampleAllocatorControl> {
  public:
   HRESULT Initialize(IMFAttributes* activatorAttributes);
 
@@ -45,6 +45,11 @@ class MediaSource final
   STDMETHODIMP GetSourceAttributes(IMFAttributes** attributes) override;
   STDMETHODIMP GetStreamAttributes(DWORD streamIdentifier, IMFAttributes** attributes) override;
   STDMETHODIMP SetD3DManager(IUnknown* manager) override;
+
+  // IMFSampleAllocatorControl
+  STDMETHODIMP SetDefaultAllocator(DWORD outputStreamId, IUnknown* allocator) override;
+  STDMETHODIMP GetAllocatorUsage(DWORD outputStreamId, DWORD* inputStreamId,
+                                 MFSampleAllocatorUsage* usage) override;
 
   // IMFGetService
   STDMETHODIMP GetService(REFGUID service, REFIID interfaceId, LPVOID* object) override;

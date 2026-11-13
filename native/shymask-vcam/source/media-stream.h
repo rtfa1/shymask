@@ -1,13 +1,19 @@
-﻿// Media Foundation stream for the Shymask virtual camera.
+// Media Foundation stream for the Shymask virtual camera.
 //
-// One RGB32 1280x720 stream. Sample delivery is pull-driven (IMFMediaStream::
+// One 1280x720 RGB32 stream. Sample delivery is pull-driven (IMFMediaStream::
 // RequestSample) and paced at 30 Hz. Each delivered sample is the newest frame
 // produced by the app; when the app has not connected yet, the opaque paused
 // fallback frame is delivered instead. No raw input is ever available on this
 // path.
+//
+// The frame server shares stream samples with the consumer process, so samples
+// are allocated from the IMFVideoSampleAllocatorEx it provides through
+// IMFSampleAllocatorControl. A private CPU allocator is only used when no
+// allocator is provided (for example an in-process host).
 #pragma once
 
 #include <windows.h>
+#include <mfapi.h>
 #include <mfidl.h>
 #include <wrl/client.h>
 #include <wrl/implements.h>
@@ -24,9 +30,10 @@
 namespace shymask {
 
 class MediaStream final
-    : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<
-                                              Microsoft::WRL::ClassicCom>,
-                                          Microsoft::WRL::ChainInterfaces<IMFMediaStream, IMFMediaEventGenerator>, IMFGetService> {
+    : public Microsoft::WRL::RuntimeClass<
+          Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+          Microsoft::WRL::ChainInterfaces<IMFMediaStream2, IMFMediaStream, IMFMediaEventGenerator>,
+          IMFGetService> {
  public:
   MediaStream();
 
@@ -36,6 +43,9 @@ class MediaStream final
   void Shutdown();
   HRESULT GetStreamAttributes(IMFAttributes** attributes);
   MF_STREAM_STATE GetState() const;
+  HRESULT SetAllocator(IUnknown* allocator);
+  HRESULT SetD3DManager(IUnknown* manager);
+  MFSampleAllocatorUsage GetAllocatorUsage() const;
 
   // IMFMediaEventGenerator
   STDMETHODIMP BeginGetEvent(IMFAsyncCallback* callback, IUnknown* state) override;
@@ -49,18 +59,23 @@ class MediaStream final
   STDMETHODIMP GetStreamDescriptor(IMFStreamDescriptor** descriptor) override;
   STDMETHODIMP RequestSample(IUnknown* token) override;
 
+  // IMFMediaStream2
+  STDMETHODIMP SetStreamState(MF_STREAM_STATE state) override;
+  STDMETHODIMP GetStreamState(MF_STREAM_STATE* state) override;
+
   // IMFGetService
   STDMETHODIMP GetService(REFGUID service, REFIID interfaceId, LPVOID* object) override;
 
   ~MediaStream() override;
 
  private:
-
   void RunWorker();
   void StopWorker();
   HRESULT DeliverSample(IUnknown* token);
   HRESULT CreateSample(const std::vector<uint8_t>& rgba, uint64_t captureUnixMs,
                        uint64_t sequence, IUnknown* token, IMFSample** sample);
+  HRESULT FillSampleBuffer(IMFSample* sample, const std::vector<uint8_t>& rgba);
+  HRESULT EnsureAllocator(IMFMediaType* type);
 
   mutable std::mutex lock_;
   Microsoft::WRL::ComPtr<IMFMediaSource> source_;
@@ -68,6 +83,8 @@ class MediaStream final
   Microsoft::WRL::ComPtr<IMFMediaEventQueue> queue_;
   Microsoft::WRL::ComPtr<IMFAttributes> attributes_;
   Microsoft::WRL::ComPtr<IMFMediaType> currentType_;
+  Microsoft::WRL::ComPtr<IMFVideoSampleAllocatorEx> allocator_;
+  Microsoft::WRL::ComPtr<IUnknown> d3dManager_;
   GUID subtype_ = GUID_NULL;
 
   std::condition_variable requestsAvailable_;
@@ -75,15 +92,15 @@ class MediaStream final
   std::thread worker_;
   bool running_ = false;
   bool stopWorker_ = false;
+  bool allocatorInitialized_ = false;
 
   FrameTransport transport_;
-  std::vector<uint8_t> scratchFrame_;
   uint64_t streamStartMs_ = 0;
   uint64_t nextTickMs_ = 0;
   uint64_t deliveredSamples_ = 0;
   uint64_t fallbackSamples_ = 0;
+  uint64_t allocatorFailures_ = 0;
   bool loggedConnected_ = false;
 };
 
 }  // namespace shymask
-

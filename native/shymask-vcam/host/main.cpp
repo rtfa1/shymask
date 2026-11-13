@@ -56,6 +56,35 @@ std::string ToUtf8(const std::wstring& text) {
   return result;
 }
 
+/** Escapes a UTF-8 string for inclusion in a JSON string literal. */
+std::string JsonEscape(const std::string& text) {
+  std::string out;
+  out.reserve(text.size() + 8);
+  for (const char character : text) {
+    switch (character) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += character;
+        break;
+    }
+  }
+  return out;
+}
+
 void EmitJson(const std::string& json) {
   std::cout << json << std::endl;
 }
@@ -64,7 +93,7 @@ void EmitError(const char* code, const std::string& message, HRESULT hr = S_OK) 
   std::string json = "{\"event\":\"error\",\"code\":\"";
   json += code;
   json += "\",\"message\":\"";
-  json += message;
+  json += JsonEscape(message);
   json += "\",\"hresult\":\"";
   json += HrText(hr);
   json += "\"}";
@@ -169,8 +198,9 @@ int Install() {
   }
 
   std::string aclDetail;
-  const bool aclOk = EnsureDataDirectoryAcl(&aclDetail);
   const bool elevated = IsElevated();
+  const bool aclOk = elevated ? EnsureDataDirectoryAcl(&aclDetail) : true;
+  if (!elevated) aclDetail = "not elevated; sharing ACL unchanged";
 
   std::string userDetail;
   const bool userRegistered = WriteComRegistration(HKEY_CURRENT_USER, 0, L"per-user", &userDetail);
@@ -190,15 +220,15 @@ int Install() {
   json += ",\"elevated\":";
   json += elevated ? "true" : "false";
   json += ",\"clsid\":\"{5E1D3A6B-2C4F-4A7E-9B8D-0C1F2A3B4C5D}\",\"dll\":\"";
-  json += ToUtf8(dllPath);
+  json += JsonEscape(ToUtf8(dllPath));
   json += "\",\"dataDirectory\":\"";
-  json += ToUtf8(DataDirectory());
+  json += JsonEscape(ToUtf8(DataDirectory()));
   json += "\",\"acl\":\"";
   json += aclOk ? "ok" : "failed";
   json += "\",\"aclDetail\":\"";
-  json += aclDetail;
+  json += JsonEscape(aclDetail);
   json += "\",\"machineDetail\":\"";
-  json += machineDetail;
+  json += JsonEscape(machineDetail);
   json += "\"}";
   EmitJson(json);
   return 0;
@@ -268,9 +298,9 @@ int List() {
   EmitJson("{\"event\":\"devices\"}");
   for (const DeviceInfo& device : EnumerateCameras()) {
     std::string json = "{\"event\":\"device\",\"name\":\"";
-    json += ToUtf8(device.name);
+    json += JsonEscape(ToUtf8(device.name));
     json += "\",\"symbolicLink\":\"";
-    json += ToUtf8(device.symbolicLink);
+    json += JsonEscape(ToUtf8(device.symbolicLink));
     json += "\",\"shymask\":";
     json += IsShymaskCamera(device.name) ? "true" : "false";
     json += "}";
@@ -325,7 +355,7 @@ int RunCamera() {
 
   {
     std::string json = "{\"event\":\"camera-started\",\"friendlyName\":\"";
-    json += ToUtf8(kShymaskCameraFriendlyName);
+    json += JsonEscape(ToUtf8(kShymaskCameraFriendlyName));
     json += "\",\"sourceId\":\"{5E1D3A6B-2C4F-4A7E-9B8D-0C1F2A3B4C5D}\",\"lifetime\":\"session\",\"scope\":\"current-user\",\"enumerable\":";
     json += enumerable ? "true" : "false";
     json += "}";
@@ -380,6 +410,7 @@ int wmain(int argc, wchar_t** argv) {
   std::printf("usage: shymask-vcam-host.exe <install|uninstall|list|run>\n");
   return 1;
 }
+
 
 
 

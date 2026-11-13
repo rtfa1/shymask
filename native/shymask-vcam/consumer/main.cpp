@@ -1,4 +1,4 @@
-﻿// Independent camera consumer harness for the Shymask virtual camera.
+// Independent camera consumer harness for the Shymask virtual camera.
 //
 // This process is deliberately separate from the Shymask app: it enumerates the
 // public Windows camera device list through Media Foundation, activates the
@@ -13,11 +13,15 @@
 #include <wincodec.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "protocol.h"
@@ -43,6 +47,8 @@ struct Options {
   int timeoutMs = 8000;
   int maxPngs = 3;
   bool listOnly = false;
+  bool probe = false;
+  bool nativeType = false;
 };
 
 std::string ToUtf8(const std::wstring& text) {
@@ -55,7 +61,42 @@ std::string ToUtf8(const std::wstring& text) {
   return result;
 }
 
-void Emit(const std::string& json) { std::printf("%s\n", json.c_str()); std::fflush(stdout); }
+/** Escapes a UTF-8 string for inclusion in a JSON string literal. */
+std::string JsonEscape(const std::string& text) {
+  std::string out;
+  out.reserve(text.size() + 8);
+  for (const char character : text) {
+    switch (character) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += character;
+        break;
+    }
+  }
+  return out;
+}
+
+std::mutex g_emitMutex;
+
+void Emit(const std::string& json) {
+  std::lock_guard<std::mutex> guard(g_emitMutex);
+  std::printf("%s\n", json.c_str());
+  std::fflush(stdout);
+}
 
 void EmitDeviceList() {
   IMFAttributes* attributes = nullptr;
@@ -81,9 +122,9 @@ void EmitDeviceList() {
     devices[index]->GetString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, link,
                               ARRAYSIZE(link), &linkLength);
     std::string json = "{\"event\":\"device\",\"name\":\"";
-    json += ToUtf8(name);
+    json += JsonEscape(ToUtf8(name));
     json += "\",\"symbolicLink\":\"";
-    json += ToUtf8(link);
+    json += JsonEscape(ToUtf8(link));
     json += "\"}";
     Emit(json);
     devices[index]->Release();
@@ -183,6 +224,8 @@ Options ParseOptions(int argc, wchar_t** argv) {
     else if (argument == L"--timeout-ms") ParseInt(next(L"--timeout-ms"), &options.timeoutMs);
     else if (argument == L"--max-pngs") ParseInt(next(L"--max-pngs"), &options.maxPngs);
     else if (argument == L"--list") options.listOnly = true;
+    else if (argument == L"--probe") options.probe = true;
+    else if (argument == L"--native") options.nativeType = true;
   }
   return options;
 }
@@ -226,7 +269,7 @@ int Capture(const Options& options) {
       selected = devices[index];
       selected->AddRef();
       std::string json = "{\"event\":\"selected\",\"name\":\"";
-      json += ToUtf8(deviceName);
+      json += JsonEscape(ToUtf8(deviceName));
       json += "\"}";
       Emit(json);
     }
@@ -236,7 +279,7 @@ int Capture(const Options& options) {
 
   if (!selected) {
     Emit("{\"event\":\"error\",\"code\":\"device-not-found\",\"prefix\":\"" +
-         ToUtf8(options.devicePrefix) + "\"}");
+         JsonEscape(ToUtf8(options.devicePrefix)) + "\"}");
     return 2;
   }
 
@@ -263,24 +306,64 @@ int Capture(const Options& options) {
     return 4;
   }
 
+  if (options.probe) {
+    ComPtr<IMFPresentationDescriptor> descriptor;
+    if (SUCCEEDED(source->CreatePresentationDescriptor(&descriptor))) {
+      DWORD streamCount = 0;
+      descriptor->GetStreamDescriptorCount(&streamCount);
+      BOOL selected = FALSE;
+      ComPtr<IMFStreamDescriptor> streamDescriptor;
+      descriptor->GetStreamDescriptorByIndex(0, &selected, &streamDescriptor);
+      Emit("{\"event\":\"probe-presentation\",\"streams\":" + std::to_string(streamCount) +
+           ",\"selected\":" + (selected ? "true" : "false") + "}");
+      ComPtr<IMFMediaTypeHandler> handler;
+      if (streamDescriptor && SUCCEEDED(streamDescriptor->GetMediaTypeHandler(&handler))) {
+        DWORD typeCount = 0;
+        handler->GetMediaTypeCount(&typeCount);
+        for (DWORD index = 0; index < typeCount; ++index) {
+          ComPtr<IMFMediaType> type;
+          if (FAILED(handler->GetMediaTypeByIndex(index, &type))) continue;
+          GUID subtype = GUID_NULL;
+          type->GetGUID(MF_MT_SUBTYPE, &subtype);
+          UINT32 typeWidth = 0;
+          UINT32 typeHeight = 0;
+          MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &typeWidth, &typeHeight);
+          wchar_t subtypeText[64] = L"";
+          StringFromGUID2(subtype, subtypeText, ARRAYSIZE(subtypeText));
+          Emit("{\"event\":\"probe-type\",\"index\":" + std::to_string(index) +
+               ",\"subtype\":\"" + ToUtf8(subtypeText) + "\",\"width\":" +
+               std::to_string(typeWidth) + ",\"height\":" + std::to_string(typeHeight) + "}");
+        }
+      }
+    }
+  }
+
   ComPtr<IMFMediaType> requested = CreateRgb32Type(kShymaskFrameWidth, kShymaskFrameHeight);
-  hr = reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, requested.Get());
-  if (FAILED(hr)) {
-    char buffer[160];
-    std::snprintf(buffer, sizeof(buffer),
-                  "{\"event\":\"error\",\"code\":\"set-media-type-failed\",\"hresult\":\"0x%08X\"}",
-                  static_cast<unsigned>(hr));
-    Emit(buffer);
-    return 4;
+  if (!options.nativeType) {
+    hr = reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, requested.Get());
+    if (FAILED(hr)) {
+      char buffer[160];
+      std::snprintf(buffer, sizeof(buffer),
+                    "{\"event\":\"error\",\"code\":\"set-media-type-failed\",\"hresult\":\"0x%08X\"}",
+                    static_cast<unsigned>(hr));
+      Emit(buffer);
+      return 4;
+    }
   }
 
   ComPtr<IMFMediaType> currentType;
   reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &currentType);
   UINT32 width = kShymaskFrameWidth;
   UINT32 height = kShymaskFrameHeight;
-  if (currentType) MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &width, &height);
+  GUID currentSubtype = GUID_NULL;
+  if (currentType) {
+    MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &width, &height);
+    currentType->GetGUID(MF_MT_SUBTYPE, &currentSubtype);
+  }
+  const bool isNv12 = currentSubtype == MFVideoFormat_NV12;
   Emit("{\"event\":\"media-type\",\"width\":" + std::to_string(width) +
-       ",\"height\":" + std::to_string(height) + ",\"format\":\"RGB32\"}");
+       ",\"height\":" + std::to_string(height) + ",\"format\":\"" +
+       (isNv12 ? "NV12" : currentSubtype == MFVideoFormat_RGB32 ? "RGB32" : "other") + "\"}");
 
   const uint64_t startedAtMs = NowUnixMs();
   std::vector<double> intervals;
@@ -289,6 +372,23 @@ int Capture(const Options& options) {
   int64_t previousCaptureMs = -1;
   uint64_t lastSampleTime = 0;
   HRESULT lastError = S_OK;
+
+  // IMFSourceReader::ReadSample can block forever when the frame server never
+  // delivers a sample, so the harness enforces a hard wall-clock budget and
+  // exits with a machine-readable timeout event instead of hanging.
+  std::atomic<int> framesObserved{0};
+  std::atomic<bool> finished{false};
+  std::thread watchdog([&] {
+    const uint64_t watchdogStart = NowUnixMs();
+    while (!finished.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      if (NowUnixMs() - watchdogStart > static_cast<uint64_t>(options.timeoutMs)) {
+        Emit("{\"event\":\"timeout\",\"phase\":\"read-sample\",\"frames\":" +
+             std::to_string(framesObserved.load()) + "}");
+        std::_Exit(3);
+      }
+    }
+  });
 
   while (frames < options.frames) {
     DWORD streamIndex = 0;
@@ -373,12 +473,16 @@ int Capture(const Options& options) {
                   static_cast<unsigned long long>(receivedUnixMs),
                   static_cast<unsigned long long>(captureUnixMs),
                   static_cast<long long>(latencyMs), width, height, meanR, meanG, meanB,
-                  pngPath.c_str());
+                  JsonEscape(pngPath).c_str());
     Emit(frameJson);
     lastSampleTime = static_cast<uint64_t>(timestamp);
     ++frames;
+    framesObserved.store(frames);
     buffer->Unlock();
   }
+
+  finished.store(true);
+  watchdog.join();
 
   if (intervals.empty()) {
     Emit("{\"event\":\"summary\",\"frames\":" + std::to_string(frames) + ",\"intervalsMs\":[]}");
@@ -402,8 +506,6 @@ int Capture(const Options& options) {
     Emit(json);
   }
 
-  reader->Release();
-  source->Release();
   if (lastError != S_OK) return 3;
   return frames >= options.frames ? 0 : 3;
 }
@@ -430,5 +532,8 @@ int wmain(int argc, wchar_t** argv) {
   CoUninitialize();
   return result;
 }
+
+
+
 
 

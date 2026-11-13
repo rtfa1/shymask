@@ -1,4 +1,4 @@
-﻿#include "media-source.h"
+#include "media-source.h"
 
 #include "logging.h"
 #include "protocol.h"
@@ -217,10 +217,31 @@ STDMETHODIMP MediaSource::GetStreamAttributes(DWORD streamIdentifier, IMFAttribu
 }
 
 STDMETHODIMP MediaSource::SetD3DManager(IUnknown* manager) {
-  Log(L"MediaSource::SetD3DManager");
+  Log(L"MediaSource::SetD3DManager manager=%p", manager);
   // The Shymask camera is deliberately CPU-only: the app produces canvas frames
   // and the media source converts them to RGB32 samples without a D3D device.
-  (void)manager;
+  std::lock_guard<std::mutex> guard(lock_);
+  if (stream_) stream_->SetD3DManager(manager);
+  return S_OK;
+}
+
+// IMFSampleAllocatorControl
+
+STDMETHODIMP MediaSource::SetDefaultAllocator(DWORD outputStreamId, IUnknown* allocator) {
+  Log(L"MediaSource::SetDefaultAllocator stream=%u allocator=%p", outputStreamId, allocator);
+  if (!allocator) return E_POINTER;
+  std::lock_guard<std::mutex> guard(lock_);
+  if (!stream_) return MF_E_SHUTDOWN;
+  return stream_->SetAllocator(allocator);
+}
+
+STDMETHODIMP MediaSource::GetAllocatorUsage(DWORD outputStreamId, DWORD* inputStreamId,
+                                            MFSampleAllocatorUsage* usage) {
+  if (!inputStreamId || !usage) return E_POINTER;
+  std::lock_guard<std::mutex> guard(lock_);
+  if (!stream_) return MF_E_SHUTDOWN;
+  *inputStreamId = outputStreamId;
+  *usage = stream_->GetAllocatorUsage();
   return S_OK;
 }
 

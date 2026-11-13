@@ -214,8 +214,16 @@ async function main() {
       cameraStarted = true;
       record('Virtual camera registered and started', 'pass', outcome.started.symbolicLink ?? outcome.started.friendlyName ?? '');
       const devices = spawnSync(hostPath, ['list'], { cwd: root, encoding: 'utf8' });
-      const deviceLines = readJsonLines((devices.stdout ?? '').split(/\r?\n/), 'device');
-      const shymask = deviceLines.filter((device) => /^Shymask Camera/.test(device.name ?? ''));
+      let shymask = readJsonLines((devices.stdout ?? '').split(/\r?\n/), 'device').filter((device) =>
+        /^Shymask Camera/.test(device.name ?? ''),
+      );
+      for (let attempt = 0; attempt < 10 && shymask.length === 0; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const retry = spawnSync(hostPath, ['list'], { cwd: root, encoding: 'utf8' });
+        shymask = readJsonLines((retry.stdout ?? '').split(/\r?\n/), 'device').filter((device) =>
+          /^Shymask Camera/.test(device.name ?? ''),
+        );
+      }
       record('External enumeration sees Shymask Camera', shymask.length > 0 ? 'pass' : 'fail', shymask[0]?.name ?? 'not listed');
 
       const consumer = runProcess('consumer', consumerPath, [
@@ -229,21 +237,34 @@ async function main() {
         'test-pattern',
         '--max-pngs',
         '2',
+        '--timeout-ms',
+        '20000',
       ]);
-      const consumerCode = await consumer.exit;
+      const consumerCode = await Promise.race([
+        consumer.exit,
+        new Promise((resolve) => setTimeout(() => resolve('timeout'), 25000)),
+      ]);
+      if (consumerCode === 'timeout') consumer.child.kill();
       consumerOutput = consumer.lines;
       const frames = readJsonLines(consumer.lines, 'frame');
+      const pngs = frames.filter((frame) => frame.png);
       record(
         'Independent Media Foundation consumer received frames',
-        frames.length >= 6 ? 'pass' : 'fail',
-        `${frames.length} frames, exit ${consumerCode}`,
+        frames.length >= 6 && consumerCode === 0 ? 'pass' : 'fail',
+        `${frames.length} frames, exit ${consumerCode}, ${pngs.length} PNG(s)`,
       );
       if (frames.length > 0) {
-        const first = frames[0];
+        const near = (frame, r, g, b) =>
+          Math.abs((frame.meanR ?? 0) - r) < 30 &&
+          Math.abs((frame.meanG ?? 0) - g) < 30 &&
+          Math.abs((frame.meanB ?? 0) - b) < 30;
+        const warmFrames = frames.filter((frame) => near(frame, 210, 150, 90));
+        const coolFrames = frames.filter((frame) => near(frame, 70, 120, 200));
+        const pausedFrames = frames.filter((frame) => (frame.meanR ?? 0) + (frame.meanG ?? 0) + (frame.meanB ?? 0) < 120);
         record(
           'Consumer frame pixels match the source',
-          Math.abs((first.meanR ?? 0) - 210) < 30 || Math.abs((first.meanR ?? 0) - 70) < 30 ? 'pass' : 'fail',
-          `mean RGB ${first.meanR},${first.meanG},${first.meanB}`,
+          warmFrames.length > 0 && coolFrames.length > 0 ? 'pass' : 'fail',
+          `warm=${warmFrames.length} cool=${coolFrames.length} pausedFallback=${pausedFrames.length}`,
         );
       }
     } else if (outcome.error) {
@@ -329,7 +350,7 @@ async function main() {
       ],
     });
     log(`\nEvidence: ${evidenceDir}`);
-    process.exitCode = 0;
+    process.exitCode = results.some((result) => result.status === 'fail') ? 1 : 0;
   } else if (process.exitCode === undefined) {
     process.exitCode = 1;
   }
@@ -339,3 +360,4 @@ main().catch((error) => {
   log(`\nFAIL  virtual camera check - ${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = 1;
 });
+

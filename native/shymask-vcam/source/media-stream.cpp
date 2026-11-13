@@ -110,9 +110,17 @@ HRESULT MediaStream::Start(IMFMediaType* type) {
     subtype_ = subtype;
   }
 
+  HRESULT hr = EnsureAllocator(currentType_.Get());
+  if (FAILED(hr)) {
+    Log(L"MediaStream::Start could not initialize a sample allocator, hr=0x%08X",
+        static_cast<unsigned>(hr));
+    return hr;
+  }
+
   transport_.Reset();
   deliveredSamples_ = 0;
   fallbackSamples_ = 0;
+  allocatorFailures_ = 0;
   loggedConnected_ = false;
   stopWorker_ = false;
   running_ = true;
@@ -120,8 +128,30 @@ HRESULT MediaStream::Start(IMFMediaType* type) {
   nextTickMs_ = streamStartMs_;
   worker_ = std::thread([this] { RunWorker(); });
 
-  const HRESULT hr = queue_->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr);
-  Log(L"MediaStream started, hr=0x%08X", static_cast<unsigned>(hr));
+  hr = queue_->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr);
+  Log(L"MediaStream started (providedAllocator=%d), hr=0x%08X",
+      allocatorInitialized_ ? 1 : 0, static_cast<unsigned>(hr));
+  return hr;
+}
+
+HRESULT MediaStream::EnsureAllocator(IMFMediaType* type) {
+  if (!type) return E_INVALIDARG;
+  if (!allocator_) {
+    // No allocator was provided (for example an in-process host): fall back to
+    // a private CPU allocator so the stream can still produce samples.
+    ComPtr<IMFVideoSampleAllocatorEx> allocator;
+    HRESULT hr = MFCreateVideoSampleAllocatorEx(IID_PPV_ARGS(&allocator));
+    if (FAILED(hr)) return hr;
+    allocator_ = allocator;
+    Log(L"MediaStream created a private video sample allocator");
+  }
+
+  allocatorInitialized_ = false;
+  const HRESULT hr = allocator_->InitializeSampleAllocator(10, type);
+  if (SUCCEEDED(hr)) {
+    allocatorInitialized_ = true;
+    Log(L"MediaStream initialized the video sample allocator");
+  }
   return hr;
 }
 
@@ -131,6 +161,10 @@ HRESULT MediaStream::Stop() {
   if (!queue_) return MF_E_SHUTDOWN;
   running_ = false;
   pendingRequests_.clear();
+  if (allocatorInitialized_ && allocator_) {
+    allocator_->UninitializeSampleAllocator();
+    allocatorInitialized_ = false;
+  }
   const HRESULT hr = queue_->QueueEventParamVar(MEStreamStopped, GUID_NULL, S_OK, nullptr);
   Log(L"MediaStream stopped, hr=0x%08X", static_cast<unsigned>(hr));
   return hr;
@@ -171,6 +205,62 @@ HRESULT MediaStream::GetStreamAttributes(IMFAttributes** attributes) {
 MF_STREAM_STATE MediaStream::GetState() const {
   std::lock_guard<std::mutex> guard(lock_);
   return running_ ? MF_STREAM_STATE_RUNNING : MF_STREAM_STATE_STOPPED;
+}
+
+HRESULT MediaStream::SetAllocator(IUnknown* allocator) {
+  if (!allocator) return E_POINTER;
+  ComPtr<IMFVideoSampleAllocatorEx> videoAllocator;
+  const HRESULT hr = allocator->QueryInterface(IID_PPV_ARGS(&videoAllocator));
+  Log(L"MediaStream::SetAllocator requested, hr=0x%08X", static_cast<unsigned>(hr));
+  if (FAILED(hr)) return hr;
+  std::lock_guard<std::mutex> guard(lock_);
+  allocator_ = videoAllocator;
+  return S_OK;
+}
+
+HRESULT MediaStream::SetD3DManager(IUnknown* manager) {
+  Log(L"MediaStream::SetD3DManager manager=%p", manager);
+  std::lock_guard<std::mutex> guard(lock_);
+  d3dManager_ = manager;
+  // The Shymask pipeline produces CPU canvas frames, so the stream writes into
+  // CPU-accessible samples. The manager is retained for diagnostics only.
+  return S_OK;
+}
+
+MFSampleAllocatorUsage MediaStream::GetAllocatorUsage() const {
+  return MFSampleAllocatorUsage_UsesProvidedAllocator;
+}
+
+// IMFMediaStream2
+
+STDMETHODIMP MediaStream::SetStreamState(MF_STREAM_STATE state) {
+  Log(L"MediaStream::SetStreamState %u", static_cast<unsigned>(state));
+  switch (state) {
+    case MF_STREAM_STATE_RUNNING: {
+      ComPtr<IMFMediaType> type;
+      {
+        std::lock_guard<std::mutex> guard(lock_);
+        if (running_) return S_OK;
+        type = currentType_;
+      }
+      return Start(type.Get());
+    }
+    case MF_STREAM_STATE_STOPPED:
+      return Stop();
+    case MF_STREAM_STATE_PAUSED: {
+      std::lock_guard<std::mutex> guard(lock_);
+      if (!running_) return MF_E_INVALID_STATE_TRANSITION;
+      return S_OK;
+    }
+    default:
+      return MF_E_INVALID_STATE_TRANSITION;
+  }
+}
+
+STDMETHODIMP MediaStream::GetStreamState(MF_STREAM_STATE* state) {
+  if (!state) return E_POINTER;
+  *state = GetState();
+  return S_OK;
 }
 
 // IMFMediaEventGenerator
@@ -312,29 +402,42 @@ HRESULT MediaStream::CreateSample(const std::vector<uint8_t>& rgba, uint64_t cap
   const DWORD payloadBytes = kShymaskFrameWidth * kShymaskFrameHeight * 4;
   if (rgba.size() != payloadBytes) return E_INVALIDARG;
 
-  ComPtr<IMFMediaBuffer> buffer;
-  HRESULT hr = MFCreateMemoryBuffer(payloadBytes, &buffer);
-  if (FAILED(hr)) return hr;
-
-  BYTE* destination = nullptr;
-  DWORD maxLength = 0;
-  DWORD currentLength = 0;
-  hr = buffer->Lock(&destination, &maxLength, &currentLength);
-  if (FAILED(hr)) return hr;
-  ConvertRgbaToRgb32(rgba.data(), destination, static_cast<size_t>(kShymaskFrameWidth) *
-                                                    kShymaskFrameHeight);
-  buffer->Unlock();
-  hr = buffer->SetCurrentLength(payloadBytes);
-  if (FAILED(hr)) return hr;
-
   ComPtr<IMFSample> created;
-  hr = MFCreateSample(&created);
-  if (FAILED(hr)) return hr;
-  hr = created->AddBuffer(buffer.Get());
+  ComPtr<IMFVideoSampleAllocatorEx> allocator;
+  bool allocatorReady = false;
+  {
+    std::lock_guard<std::mutex> guard(lock_);
+    allocator = allocator_;
+    allocatorReady = allocatorInitialized_;
+  }
+  if (allocator && allocatorReady) {
+    const HRESULT allocateHr = allocator->AllocateSample(&created);
+    if (FAILED(allocateHr) || !created) {
+      allocatorFailures_++;
+      if (allocatorFailures_ <= 3) {
+        Log(L"MediaStream allocated sample from the provided allocator failed, hr=0x%08X",
+            static_cast<unsigned>(allocateHr));
+      }
+      created.Reset();
+    }
+  }
+
+  if (!created) {
+    // Fallback: a private memory sample. This works for in-process hosts but the
+    // frame server needs its shared allocator for cross-process delivery.
+    ComPtr<IMFMediaBuffer> buffer;
+    HRESULT hr = MFCreateMemoryBuffer(payloadBytes, &buffer);
+    if (FAILED(hr)) return hr;
+    hr = MFCreateSample(&created);
+    if (FAILED(hr)) return hr;
+    hr = created->AddBuffer(buffer.Get());
+    if (FAILED(hr)) return hr;
+  }
+
+  HRESULT hr = FillSampleBuffer(created.Get(), rgba);
   if (FAILED(hr)) return hr;
 
-  const LONGLONG sampleTime = static_cast<LONGLONG>(GetTickCount64() - streamStartMs_) * 10000;
-  created->SetSampleTime(sampleTime);
+  created->SetSampleTime(MFGetSystemTime());
   created->SetSampleDuration(kShymaskFrameDuration100ns);
   created->SetUINT32(MFSampleExtension_CleanPoint, 1);
   if (captureUnixMs != 0) {
@@ -348,7 +451,42 @@ HRESULT MediaStream::CreateSample(const std::vector<uint8_t>& rgba, uint64_t cap
   return S_OK;
 }
 
+HRESULT MediaStream::FillSampleBuffer(IMFSample* sample, const std::vector<uint8_t>& rgba) {
+  ComPtr<IMFMediaBuffer> buffer;
+  HRESULT hr = sample->GetBufferByIndex(0, &buffer);
+  if (FAILED(hr)) return hr;
+
+  BYTE* destination = nullptr;
+  DWORD maxLength = 0;
+  DWORD currentLength = 0;
+  hr = buffer->Lock(&destination, &maxLength, &currentLength);
+  if (FAILED(hr)) {
+    // Some frame-server allocator buffers are 2D (DXGI/staging) surfaces and
+    // must be written through IMF2DBuffer.
+    ComPtr<IMF2DBuffer> buffer2d;
+    hr = buffer.As(&buffer2d);
+    if (FAILED(hr)) return hr;
+    BYTE* scanline0 = nullptr;
+    LONG pitch = 0;
+    hr = buffer2d->Lock2D(&scanline0, &pitch);
+    if (FAILED(hr)) return hr;
+    for (uint32_t y = 0; y < kShymaskFrameHeight; ++y) {
+      const uint8_t* source = rgba.data() + static_cast<size_t>(y) * kShymaskFrameWidth * 4;
+      uint8_t* row = scanline0 + static_cast<ptrdiff_t>(y) * pitch;
+      ConvertRgbaToRgb32(source, row, kShymaskFrameWidth);
+    }
+    buffer2d->Unlock2D();
+    return S_OK;
+  }
+
+  ConvertRgbaToRgb32(rgba.data(), destination, static_cast<size_t>(kShymaskFrameWidth) *
+                                                    kShymaskFrameHeight);
+  buffer->Unlock();
+  return buffer->SetCurrentLength(kShymaskFrameWidth * kShymaskFrameHeight * 4);
+}
+
 }  // namespace shymask
+
 
 
 
