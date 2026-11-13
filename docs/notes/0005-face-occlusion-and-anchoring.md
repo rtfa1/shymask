@@ -88,17 +88,21 @@ control is on; this holds the last valid replay frame and is not a passthrough o
 a paused-output bypass.
 
 The evidence captures are not single-shot. A processed camera state is captured
-with up to three bounded attempts of eight consumer frames each, because a new
-Media Foundation consumer starts with an empty native frame cache and can see
-the opaque fallback until the app publishes to its client; `holdRenderedFrameAt`
-also retries up to three times if a hold lands on a transient pause, and the hold
-helper waits 1 s before capture. The attempt count and the app-published vs
-native-fallback frame count of every attempt are written to `summary.json`
-(`virtualCamera.captureAttempts`) and the check log, and the final attempt still
-fails on a persistent fallback. Before each processed capture, the expected
-preview mean is read only once the public status reports `render` and the
-throttled mean-RGB diagnostic has caught up, so a camera frame is never compared
-against the previous paused mean after an effect switch.
+with up to three bounded attempts of eight consumer frames each (ten for the
+motion-window camera capture), because a new Media Foundation consumer starts with
+an empty native frame cache and can see the opaque fallback until the app
+publishes to its client; `holdRenderedFrameAt` also retries up to three times if a
+hold lands on a transient pause, and the hold helper waits 1 s before capture. The
+attempt count and the app-published vs native-fallback frame count of every
+attempt are written to `summary.json` (`virtualCamera.captureAttempts`) and the
+check log, and the final attempt still fails on a persistent fallback. Before each
+processed capture, the expected preview mean is read only once the public status
+reports `render` and the throttled mean-RGB diagnostic is non-dark (sum > 60; the
+paused canvas is about 47). That gate proves render mode plus a non-dark mean, not
+freshness: a stale same-brightness mean would also pass, and the camera comparison
+allows a summed-channel difference of 25. For the held occlusion A/B the mean is
+read once before the ON capture and reused for the OFF capture, because both
+captures come from the same held canvas.
 
 ## Measured behavior (replay-based)
 
@@ -146,9 +150,11 @@ must therefore also pass a plausible-video floor — mean luminance ≥30, lumin
 standard deviation ≥6, at most 10% near-black pixels and at least 16 distinct
 colours — and for the untreated bundled mask and `rose-visor` at least 90% of the
 sampled ON pixels must match the underlying held replay frame drawn at the
-pipeline's 0,0,1280,720 scale. Observed ON pixels had mean luminance 128–140 and
-luminance standard deviation 33–34 (floors 30 and 6), with a held-replay match of
-0.94–0.97 for the bundled and `rose-visor` masks (floor 0.90). The check therefore
+pipeline's 0,0,1280,720 scale. Observed ON pixels across recent runs (floors 30
+and 6): bundled about 125–128 mean luminance / 33–36 luminance standard deviation,
+`rose-visor` about 150 / 13–14, and the opposite-view bundled frame about
+102–105 / 40–41; the held-replay match was 0.94–0.97 for the bundled and
+`rose-visor` masks (floor 0.90). The check therefore
 proves that mask material is removed and plausible video is revealed; the saved
 PNGs show the face. It is not an exact-colour proof of identity, and for a treated
 package the treatment rules out a pixel-for-pixel comparison with the raw replay.
@@ -156,7 +162,8 @@ package the treatment rules out a pixel-for-pixel comparison with the raw replay
 The independent Media Foundation consumer received exactly the same change (same
 total and same inside-bbox pixel count) from the same held frame for the bundled
 mask and `guard-visor`; that equality is asserted, not just recorded. There is no
-`rose-visor` camera A/B.
+`rose-visor` camera A/B: camera/preview equality is asserted for the bundled mask
+and `guard-visor`, and all masks share the single output canvas.
 
 Because face occlusion can legitimately hide the packaged mask's
 bounding-box-centre probe, the preview probe is asserted only when the public
@@ -165,24 +172,25 @@ condition. The assertion reads the actual saved ON PNG pixel at the diagnostic
 coordinates; the diagnostic value itself is metadata and is no longer compared
 with itself. Composition is proved independently by counting the package's exact
 unlit material colour in exact 1280×720 preview and camera PNGs (enforced
->20,000 for guard and >25,000 for rose; observed about 31,000–33,000 and
-38,000–40,000 across recent runs, 40,025 at the reviewed head run).
+>20,000 for guard and >25,000 for rose; observed about 31k–33k and 39k–41k across
+recent runs, with some rose runs measuring 40,025 and 40,943).
 
-The separate motion-window camera capture is taken on the same held 47.7 s frame
-as the bundled occlusion A/B, not on live playback. The moving behavior is
-evidenced by the sampled window and the three saved motion screenshots; the held
-frame keeps the camera evidence stable and reproducible. In the automated
-Electron/Playwright session, resuming live playback after the long held A/B and
-crossing a loop seam occasionally stopped the video frame-callback timestamps
-(the output then correctly entered the paused policy), so the camera check
-deliberately does not depend on that resume. This is a diagnostic-path
-limitation, not evidence about physical-camera or live-playback behavior.
+The separate motion-window camera capture deliberately uses the held 47.7 s frame
+from the bundled occlusion A/B, not live playback. In the automated
+Electron/Playwright session, a long hold/seek followed by a loop seam can
+intermittently stall the video frame-callback timestamps (the output then correctly
+enters the paused policy), so the camera check does not depend on that resume.
+Moving behavior is evidenced in the preview diagnostics plus the three saved motion
+screenshots, and the camera path by the held-frame capture and the occlusion camera
+A/Bs; the held frame keeps the camera evidence stable and reproducible. This is a
+diagnostic-path limitation, not evidence about physical-camera or live-playback
+behavior.
 
 ### Jitter and added lag (recorded turns/nods/leaning)
 
 The initial segment of the documented 41.6 s window is a slow segment, not a
 stationary one. The check measures it rather than assuming it: over the ~2 s
-segment the mask pose spanned about 5.8–8.5° yaw, 5–9° pitch and ~2° roll with
+segment the mask pose spanned about 5.6–8.5° yaw, 6–9° pitch and ~2° roll with
 11–14 px origin movement, and the filter p50 gain stayed at ~0.33–0.34 (near the
 base gain at the observed frame interval). The bounds enforced for calling it a
 slow jitter segment are 10° yaw, 10° pitch, 5° roll, 30 px origin and p50
@@ -195,52 +203,57 @@ alpha ≤ 0.4. Raw and smoothed poses were measured over the same frames.
 | Slow-segment origin jitter reduction | — | 40–66% (gate ≤0.80× raw) |
 | Slow-segment rotation jitter reduction | — | 43–58% (gate ≤0.85× raw) |
 
-Recent runs measured smoothed origin 1.72–2.23 px (41.6–55.3% lower) and
+Recent runs measured smoothed origin 1.72–2.24 px (41.6–55.3% lower) and
 smoothed rotation 1.09–1.36 deg (43.8–57.9% lower), and the ranges above cover
 all of them.
 
 Across the full motion window, the adaptive gain prioritizes responsiveness.
 The measured added offset was p95 **3.6–4.3 px** origin and **1.7–1.9 deg**
 rotation, with an implied constant-velocity delay p95 of **60.2–61.6 ms** and a
-filter cost p95 of **0.1 ms**. The 8 s window tracked 17–18 of 18 sampled frames
-and produced yaw 26–30°, pitch 22–36°, roll 12–19° and 94–100 × 44–77 px
-mask-origin movement. The mask origin stayed inside the tracked face
-bounding box expanded by 35% of its width/height at every sample.
+filter cost p95 of **0.1 ms**. The 8 s window tracked 17–18 of 18 sampled frames.
+It enforces at least 12° yaw and pitch, 4° roll and 40 px of origin movement;
+observed across recent runs were roughly 24–29° yaw, 23–35° pitch, 12–19° roll and
+91–99 × 44–77 px of mask-origin movement (a representative run 27.0° / 28.9° / 17.8°
+and 98 × 60 px). The mask origin stayed inside the tracked face bounding box expanded
+by 35% of its width/height at every sample.
 
-Sliding is quantified over the same motion window: the p95 deviation of the
-rendered (smoothed) projected mask origin from its median offset to the tracked
-face-box centre was about **12–20 px** (about 5–9% of face width). That is a
+**Acceptance-criterion-2 disposition:** the criterion asks to identify and correct
+visible sliding, jitter and clipping. Jitter is reduced (the slow-segment table
+above) and clipping is addressed by the face occluder (the A/B above), but sliding
+is **bounded, not corrected**. Sliding is quantified over the same motion window:
+the p95 deviation of the rendered (smoothed) projected mask origin from its median
+offset to the tracked face-box centre was about **12–16 px** (about 5–7% of
+face width) across recent runs, with earlier runs up to about 20 px. That is a
 bounded measured claim — p95 sliding stays under the self-chosen 24 px bound — not
-a claim that the mask does not slide. The check samples the same documented
-window a second time through the public **Pose smoothing** raw mode (the shadow
-smoother still runs), so the raw-mode p95 is measured over comparable recorded
-motion; the check reports it without asserting it, because only the rendered
-output is the user-visible path. Observed runs measured **raw-mode 8.6–11.5 px**
-and rendered 12.5–18 px, so smoothing did **not** reduce this proxy metric (the
-rendered pass was about 9–77% higher across runs, consistent with filter lag and
-with frame-timing differences between the two passes); the smoother's measured
-benefit is the slow-segment jitter reduction above, not sliding. The face-box
-centre itself shifts under yaw, so this is a proxy metric, not a ground-truth
-surface distance, and no correction is claimed. The raw origin-to-face-centre
-offset p95 in the rendered pass was about **30–34 px** (enforced bound 60 px). The
-clipping metric is the mask pixels removed inside the face bounding box by the
-occluder in each A/B (at least 1,500 px; observed 2.3k–17.3k depending on mask and
-angle).
+a claim that the mask does not slide. The check samples the same documented window
+a second time through the public **Pose smoothing** raw mode (the shadow smoother
+still runs), so the raw-mode p95 is measured over comparable recorded motion; the
+check reports it without asserting it, because only the rendered output is the
+user-visible path. Observed runs measured **raw-mode ~9–12 px** and rendered
+~12–16 px, so smoothing did **not** reduce this proxy metric (the rendered pass
+was about 3–77% higher across runs, consistent with filter lag and with
+frame-timing differences between the two passes); the smoother's measured benefit
+is the slow-segment jitter reduction above, not sliding. The face-box centre itself
+shifts under yaw, so this is a proxy metric, not a ground-truth surface distance,
+and no correction is claimed. The raw origin-to-face-centre offset p95 in the
+rendered pass was about **29–34 px** (enforced bound 60 px). The clipping metric is
+the mask pixels removed inside the face bounding box by the occluder in each A/B
+(at least 1,500 px; observed 2.3k–17.3k depending on mask and angle).
 
 ## Supported motion limits and remaining limitations
 
-- **Recorded coverage:** the pinned motion window contains turns/nods/leaning up
-  to about 29° yaw, 31° pitch and 19° roll at this framing, and the occlusion A/B
-  adds a held side view in the opposite yaw direction (about +9° to +14°). Faster, more
-  extreme or intermediate poses are handled by the adaptive gain and hard caps
-  but are not evidenced by this clip.
+- **Recorded coverage:** the pinned motion window contains turns/nods/leaning
+  spanning about 24–29° yaw, 23–35° pitch and 12–19° roll at this framing, and the
+  occlusion A/B adds a held side view in the opposite yaw direction (about +9° to
+  +14°). Faster, more extreme or intermediate poses are handled by the adaptive
+  gain and hard caps but are not evidenced by this clip.
 - **Replay only:** no physical-camera or live-human evidence exists in this
   slice. Camera-sensor, call-network and real Zoom/Meet/OBS behavior remain for
   final live acceptance.
-- **Automated diagnostic path:** the motion-window camera capture uses the held
-  47.7 s frame, and a long held A/B followed by live resume plus a loop seam
-  occasionally stops the video frame-callback timestamps in the automated
-  session (the output correctly hides under the paused policy). The check
+- **Automated diagnostic path:** the motion-window camera capture deliberately
+  uses the held 47.7 s frame; in the automated session a long held A/B followed by
+  live resume plus a loop seam can intermittently stop the video frame-callback
+  timestamps (the output correctly hides under the paused policy). The check
   therefore does not use that resume for evidence; normal continuous looping is
   still exercised elsewhere in `npm run check`.
 - **Desktop only:** measured on the RTX 3070 Ti development desktop; laptop

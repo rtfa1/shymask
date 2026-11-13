@@ -125,11 +125,11 @@ async function readRgb(page) {
 }
 
 /**
- * Reads the mean output colour only once the public status says the processed
- * frame is being rendered and the throttled mean-RGB diagnostic has caught up
- * with it (the paused canvas is ~{12,15,20}, sum 47). A package switch can leave
- * `diag-rgb` one throttle tick behind the status, so a bare read can compare a
- * camera frame against the previous paused mean.
+ * Reads the mean output colour only once the public status reports `render` mode
+ * and the throttled mean-RGB diagnostic is non-dark (sum > 60; the paused canvas
+ * is ~{12,15,20}, sum 47). This gate proves render mode plus a non-dark mean; it
+ * does not prove the mean is fresh, because a stale same-brightness mean would
+ * also pass.
  */
 async function readProcessedRgb(page, label, timeoutMs = 15000) {
   return waitFor(
@@ -1148,8 +1148,9 @@ async function captureProcessedCameraState(
 ) {
   // The app must already be drawing a processed output before the consumer
   // starts; this removes a paused/switch transition from the measured window.
-  // The threshold only has to exclude the opaque paused canvas (sum ~47), not to
-  // act as a brightness assertion, so a dark-but-processed replay frame passes.
+  // The gate is: status mode is `render` and the mean-RGB sum is > 60 (the
+  // paused canvas sums ~47). It proves a non-dark rendered mean, not that the
+  // mean is fresh; a stale same-brightness mean would also pass.
   try {
     await waitFor(
       `${label} processed preview before camera capture`,
@@ -3849,8 +3850,8 @@ async function main() {
       'Occlusion A/B evidence holds two documented recorded side-view frames (47.7 s, yaw about -22 deg, and 16.0 s, yaw in the opposite direction) via the diagnostic Hold replay frame control and captures exact 1280x720 output PNGs through the public Capture control. The held canvas is deterministic: ON and OFF are each captured twice and the two same-state captures must be pixel-identical. Each A/B requires at least 88% of changed pixels inside the tracked face axis-aligned bounding box and at least 1,500 removed mask pixels inside it.',
       'The occlusion ON frame is also proved to reveal non-mask content where the OFF frame drew mask material: for an imported package the changed face-box pixels are at least 97% the exact unlit material colour in OFF and at most 3% that colour in ON; for the bundled lit mask the dominant exact OFF-frame mask colours (top 64 shades, at least 90% of changed pixels) must not reappear in the ON frame at those pixels (at most 1%). The ON changed pixels must also pass a plausible-video floor (mean luminance >= 30, luminance stddev >= 6, <= 10% near-black, >= 16 distinct colours), and for the untreated bundled mask and rose package at least 90% of sampled ON pixels must match the held replay frame drawn at the pipeline scale. This proves mask material is removed and plausible video is revealed; it is not an exact-colour proof of identity.',
       'Raw and smoothed pose jitter are measured over the same presented frames in the initial slow segment of the recorded window. The segment\'s motion is measured, not assumed: its pose span and the filter p50 gain are reported, and it is required to stay within 10 deg yaw/pitch, 5 deg roll, 30 px origin and p50 alpha <= 0.4. Across the full turn/nod/lean window the reported p95 raw-vs-smoothed offset and the filter\'s implied constant-velocity delay measure the added lag.',
-      'Camera capture attempts and their app-published/native-fallback frame counts are recorded in virtualCamera.captureAttempts. Processed captures request 8 frames because the native source starts each consumer stream with an empty frame cache; captureProcessedCameraState retries up to 3 times and the final attempt still fails on a persistent fallback.',
-      'Sliding is quantified over the motion window as the p95 deviation of the projected mask origin from its median offset to the tracked face-box centre (bound 24 px, reported as a fraction of face width), plus the raw origin-to-face-centre offset p95 (bound 60 px). The same documented window is sampled again through the public Pose smoothing raw mode; the raw-mode sliding value is reported without asserting it. Observed rendered 12.5-18 px vs raw-mode 8.6-11.5 px, so smoothing did not reduce this proxy metric. The face-box centre shifts under yaw, so this bounded proxy metric is not a ground-truth surface-distance measurement. Clipping is quantified as the mask pixels removed inside the face bounding box by the occluder in each A/B (at least 1,500 px).',
+      'Camera capture attempts and their app-published/native-fallback frame counts are recorded in virtualCamera.captureAttempts. Processed captures request 8 consumer frames (10 for the motion-window capture) because the native source starts each consumer stream with an empty frame cache; captureProcessedCameraState retries up to 3 times and the final attempt still fails on a persistent fallback.',
+      'Sliding is bounded, not corrected: it is quantified over the motion window as the p95 deviation of the projected mask origin from its median offset to the tracked face-box centre (bound 24 px, reported as a fraction of face width), plus the raw origin-to-face-centre offset p95 (bound 60 px). The same documented window is sampled again through the public Pose smoothing raw mode; the raw-mode sliding value is reported without asserting it. Observed rendered ~12-16 px vs raw-mode ~9-12 px (earlier runs up to ~20 px rendered), so smoothing did not reduce this proxy metric. The face-box centre shifts under yaw, so this bounded proxy metric is not a ground-truth surface-distance measurement and no correction is claimed. Clipping is quantified as the mask pixels removed inside the face bounding box by the occluder in each A/B (at least 1,500 px).',
       'Smoothing is a bounded exponential filter (base gain 0.45 at rest, rising toward 1 as measured face speed approaches 360 deg/s or 60 cm/s) with hard 4 cm / 8 degree lag caps. The 0.45 gain is normalized to the 41.67 ms reference interval, so the effective alpha at the observed ~35 ms interval is about 0.34 and the measured ramp lag is about 61 ms; the 50.9 ms reference-interval figure is not a global maximum. It is not a prediction filter and the recorded frames are replay input.',
       'Tracking-loss, multiple-face and unreliable-tracking policy states in Scenario F are produced by the labelled diagnostic injection control; the real detector path is used for the normal tracking and recorded-motion states. The recorded-motion clip is real recorded video from a second CC0 fixture, positioned by seeking to a documented window.',
       'Effect-package evidence uses an isolated SHYMASK_PACKAGE_DIR and stubs only the Electron OS file picker in the main process; validation, archive safety checks, storage, asset protocol loading and GLTFLoader parsing are the real paths. A rejected dialog cancellation is not exercised.',
