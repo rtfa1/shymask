@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src data:; media-src 'self' file:;"
+    />
+    <title>Shymask - development preview</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body data-output-mode="paused">
+    <header class="app-header">
+      <div>
+        <h1>Shymask</h1>
+        <p class="tagline">Development preview &middot; recorded replay input</p>
+      </div>
+      <p class="build-tag">Preview / color-treatment spike</p>
+    </header>
+
+    <main class="layout">
+      <section class="preview-column" aria-label="Preview output">
+        <div class="preview-surface">
+          <canvas id="output" width="1280" height="720" data-testid="output-canvas"></canvas>
+        </div>
+        <p class="preview-note">
+          This canvas is the complete output. The processed frames and the paused screen are
+          produced here; later slices publish the same frames to the virtual webcam.
+        </p>
+      </section>
+
+      <aside class="control-column">
+        <section class="panel status-panel" id="status-panel" aria-live="polite">
+          <h2>Status</h2>
+          <p class="status-title" id="status-title" data-testid="status-title">Tracking paused</p>
+          <p class="status-detail" id="status-explanation" data-testid="status-explanation"></p>
+          <p class="status-action" id="status-action" data-testid="status-action"></p>
+        </section>
+
+        <section class="panel">
+          <h2>Controls</h2>
+          <div class="button-row">
+            <button id="start" data-testid="start" type="button">Start</button>
+            <button id="pause-toggle" data-testid="pause-toggle" type="button" disabled>Pause</button>
+          </div>
+          <label class="field" for="effect-select">
+            <span>Color treatment</span>
+            <select id="effect-select" data-testid="effect-select"></select>
+          </label>
+          <div class="button-row secondary">
+            <button id="recheck" data-testid="recheck" type="button">Recheck input</button>
+            <button id="capture" data-testid="capture" type="button">Capture evidence frame</button>
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" id="simulate-failure" data-testid="simulate-failure" />
+            Simulate effect-processing failure (diagnostic)
+          </label>
+          <p class="capture-result" id="capture-result" data-testid="capture-result"></p>
+        </section>
+
+        <section class="panel diagnostics">
+          <h2>Diagnostics</h2>
+          <dl>
+            <div><dt>Input</dt><dd id="diag-input"></dd></div>
+            <div><dt>Output</dt><dd id="diag-output"></dd></div>
+            <div><dt>Fixture</dt><dd id="diag-fixture"></dd></div>
+            <div><dt>Loops</dt><dd id="diag-loop"></dd></div>
+            <div><dt>Processing timestamp</dt><dd id="diag-timestamp"></dd></div>
+            <div><dt>Frame interval</dt><dd id="diag-frame-delta"></dd></div>
+            <div><dt>Render cost</dt><dd id="diag-render-cost"></dd></div>
+            <div><dt>Output mean RGB</dt><dd id="diag-rgb"></dd></div>
+          </dl>
+        </section>
+      </aside>
+    </main>
+
+    <footer class="app-footer">
+      Replay-based preview only. No physical webcam is opened, and no virtual webcam output is
+      published in this slice.
+    </footer>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>

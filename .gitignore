@@ -1,2 +1,6 @@
 .issue-delivery/
 .worktrees/
+node_modules/
+dist/
+evidence/
+fixtures/cache/
