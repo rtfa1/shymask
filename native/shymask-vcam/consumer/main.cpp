@@ -461,6 +461,8 @@ int Capture(const Options& options) {
 
     uint64_t captureUnixMs = 0;
     sample->GetUINT64(kShymaskSampleAttributeCaptureUnixMs, &captureUnixMs);
+    uint64_t sequence = 0;
+    sample->GetUINT64(kShymaskSampleAttributeSequence, &sequence);
     const uint64_t receivedUnixMs = NowUnixMs();
     const int64_t latencyMs = captureUnixMs != 0 ? static_cast<int64_t>(receivedUnixMs) -
                                                        static_cast<int64_t>(captureUnixMs)
@@ -498,11 +500,12 @@ int Capture(const Options& options) {
     char frameJson[1024];
     std::snprintf(frameJson, sizeof(frameJson),
                   "{\"event\":\"frame\",\"index\":%d,\"sampleTimeMs\":%.1f,\"receivedUnixMs\":%llu,"
-                  "\"captureUnixMs\":%llu,\"latencyMs\":%lld,\"width\":%u,\"height\":%u,"
-                  "\"meanR\":%d,\"meanG\":%d,\"meanB\":%d}",
+                  "\"captureUnixMs\":%llu,\"sequence\":%llu,\"latencyMs\":%lld,\"width\":%u,"
+                  "\"height\":%u,\"meanR\":%d,\"meanG\":%d,\"meanB\":%d}",
                   frames, static_cast<double>(timestamp) / 10000.0,
                   static_cast<unsigned long long>(receivedUnixMs),
                   static_cast<unsigned long long>(captureUnixMs),
+                  static_cast<unsigned long long>(sequence),
                   static_cast<long long>(latencyMs), width, height, meanR, meanG, meanB);
     Emit(frameJson);
     lastSampleTime = static_cast<uint64_t>(timestamp);

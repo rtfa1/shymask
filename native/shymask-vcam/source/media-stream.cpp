@@ -3,6 +3,7 @@
 #include "protocol.h"
 #include "paused-frame.h"
 #include "logging.h"
+#include "module-lock.h"
 
 #include <mfapi.h>
 #include <mferror.h>
@@ -48,8 +49,12 @@ void ConvertRgbaToRgb32(const uint8_t* source, uint8_t* destination, size_t pixe
 
 }  // namespace
 
-MediaStream::MediaStream() = default;
-MediaStream::~MediaStream() { Shutdown(); }
+MediaStream::MediaStream() { ModuleAddLiveObject(); }
+
+MediaStream::~MediaStream() {
+  Shutdown();
+  ModuleRemoveLiveObject();
+}
 
 HRESULT MediaStream::Initialize(IMFMediaSource* source, DWORD streamId) {
   if (!source) return E_POINTER;
@@ -248,11 +253,15 @@ STDMETHODIMP MediaStream::SetStreamState(MF_STREAM_STATE state) {
     }
     case MF_STREAM_STATE_STOPPED:
       return Stop();
-    case MF_STREAM_STATE_PAUSED: {
-      std::lock_guard<std::mutex> guard(lock_);
-      if (!running_) return MF_E_INVALID_STATE_TRANSITION;
-      return S_OK;
-    }
+    case MF_STREAM_STATE_PAUSED:
+      // This live camera source has no paused delivery state: samples are
+      // produced on RequestSample and GetStreamState reports only RUNNING or
+      // STOPPED. Acknowledging PAUSED while delivery continued (the previous
+      // behavior) made GetStreamState lie, so the unsupported transition is
+      // rejected explicitly. The frame server starts and stops the stream and
+      // does not pause it.
+      Log(L"MediaStream::SetStreamState(PAUSED) is not supported");
+      return E_NOTIMPL;
     default:
       return MF_E_INVALID_STATE_TRANSITION;
   }
@@ -445,7 +454,10 @@ HRESULT MediaStream::CreateSample(const std::vector<uint8_t>& rgba, uint64_t cap
   }
   if (token) created->SetUnknown(MFSampleExtension_Token, token);
   created->SetUINT32(MFSampleExtension_Interlaced, 0);
-  (void)sequence;
+  // Diagnostic: expose the producer's frame sequence so a consumer can tell
+  // which app frame a sample came from (several 30 Hz samples reuse one
+  // ~21-24 Hz app frame). Native paused fallback samples carry sequence 0.
+  created->SetUINT64(kShymaskSampleAttributeSequence, sequence);
 
   *sample = created.Detach();
   return S_OK;
@@ -509,13 +521,14 @@ HRESULT MediaStream::FillSampleBuffer(IMFSample* sample, const std::vector<uint8
 
   for (uint32_t y = 0; y < kShymaskFrameHeight; ++y) {
     const uint8_t* source = rgba.data() + static_cast<size_t>(y) * kShymaskFrameWidth * 4;
-    // A negative pitch means the surface is bottom-up; write the logical
-    // top-down row into its mirrored position instead of running off the end.
-    uint8_t* row = pitch >= 0
-                       ? scanline0 + static_cast<ptrdiff_t>(y) * pitch
-                       : scanline0 +
-                             static_cast<ptrdiff_t>(kShymaskFrameHeight - 1 - y) *
-                                 static_cast<ptrdiff_t>(-pitch);
+    // Lock2D documents pbScanline0 as the first byte of the top row of the
+    // image as presented (which "might not be the first row in memory") and
+    // plPitch as the byte stride to the next presented row, negative for a
+    // bottom-up surface. scanline0 + y*pitch is therefore the correct address
+    // for row y under both signs, and the pitch-magnitude check above keeps
+    // the last row inside the surface. Mirroring a negative pitch (the
+    // previous behavior) wrote up to (h-1)*|pitch| beyond the buffer.
+    uint8_t* row = scanline0 + static_cast<ptrdiff_t>(y) * static_cast<ptrdiff_t>(pitch);
     ConvertRgbaToRgb32(source, row, kShymaskFrameWidth);
   }
   buffer2d->Unlock2D();

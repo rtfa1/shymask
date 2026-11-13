@@ -45,9 +45,13 @@ export interface CaptureResult {
 }
 
 /**
- * One RGBA output frame leaving the renderer. The buffer is transferred (not
- * copied) to the main process, which forwards it to the native virtual camera
- * media source over the loopback frame transport.
+ * One RGBA output frame leaving the renderer. The buffer is copied per frame by
+ * the structured-clone IPC send (`ipcRenderer.send`; a transfer would detach
+ * the renderer's buffer): 1280×720 RGBA is 3.7 MB, ~110 MB/s at the 30 Hz
+ * publish cap. The copy is part of the measured replay-to-camera latency in the
+ * README baseline; it is not separately instrumented. The main process forwards
+ * the frame to the native virtual camera media source over the loopback frame
+ * transport.
  */
 export interface CameraFrame {
   /** Wall-clock time (Date.now) when the canvas produced this frame. */

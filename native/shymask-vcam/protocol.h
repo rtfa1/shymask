@@ -69,6 +69,14 @@ inline constexpr uint32_t kShymaskFrameHeaderBytes = 40;
 inline constexpr GUID kShymaskSampleAttributeCaptureUnixMs = {
     0x6b0a2f1c, 0x9d34, 0x4e58, {0x8a, 0x7b, 0x1c, 0x2d, 0x3e, 0x4f, 0x5a, 0x60}};
 
+// Custom per-sample attribute carrying the producer's frame sequence from the
+// wire header (0 for native paused fallback samples). Several 30 Hz samples can
+// reuse one app frame, so the sequence identifies the source frame a sample was
+// made from without assuming one new frame per sample.
+// {7C4E1B2A-5D6F-4A83-9E0C-2B4D6F8A1C35}
+inline constexpr GUID kShymaskSampleAttributeSequence = {
+    0x7c4e1b2a, 0x5d6f, 0x4a83, {0x9e, 0x0c, 0x2b, 0x4d, 0x6f, 0x8a, 0x1c, 0x35}};
+
 // File names of the native binaries.
 inline constexpr wchar_t kShymaskSourceDllName[] = L"ShymaskVirtualCamera.dll";
 inline constexpr wchar_t kShymaskHostExeName[] = L"shymask-vcam-host.exe";

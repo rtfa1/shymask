@@ -82,10 +82,13 @@ the virtual camera. Closing Shymask stops its camera output.
 - **Virtual camera publication.** While the app runs, `src/main/virtual-camera.ts` serves the output
   canvas to the native Windows virtual camera over a loopback frame transport, and
   `src/renderer/renderer.ts` pushes every drawn output frame plus a 100 ms heartbeat (only while a
-  camera consumer is connected). Startup, no effect, manual pause, processing errors, missing input
-  and effect switches therefore all appear in the camera as the same opaque "Tracking paused"
-  canvas; the native opaque fallback covers only the pre-connection window. The camera uses
-  `MFVirtualCameraLifetime_Session`, so closing Shymask stops the stream and removes the device.
+  camera consumer is connected). Startup, no effect, manual pause, processing errors and missing
+  input therefore all appear in the camera as the same opaque "Tracking paused" canvas, and an
+  interrupted switch would pause the same way; a treatment change itself is synchronous and renders
+  the new treatment in the camera immediately (the async switching-interruption sub-case is
+  deferred; see Scope boundaries). The native opaque fallback covers only the pre-connection
+  window. The camera uses `MFVirtualCameraLifetime_Session`, so closing Shymask stops the stream and
+  removes the device.
 
 ## Windows virtual camera (issue #3)
 

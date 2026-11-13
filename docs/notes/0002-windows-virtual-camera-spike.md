@@ -121,7 +121,11 @@ and never reach the client. The fix:
 - initialize that allocator with the RGB32 media type on stream start and allocate every sample
   from it (with an `IMF2DBuffer::Lock2D` fallback for 2-D buffers and a private allocator only when
   none is provided),
-- implement `IMFMediaStream2` (`SetStreamState`/`GetStreamState`),
+- implement `IMFMediaStream2` (`SetStreamState`/`GetStreamState`): RUNNING and
+  STOPPED are supported, while PAUSED returns `E_NOTIMPL` instead of being
+  acknowledged while sample delivery continues, so `GetStreamState` reports the
+  real state and the frame server (which does not pause a live camera stream)
+  sees an explicit rejection rather than a false success,
 - use absolute sample timestamps (`MFGetSystemTime()`), matching the working reference
   implementation.
 

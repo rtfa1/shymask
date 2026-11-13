@@ -6,6 +6,11 @@
 // fallback frame is delivered instead. No raw input is ever available on this
 // path.
 //
+// SetStreamState supports RUNNING and STOPPED. PAUSED returns E_NOTIMPL rather
+// than acknowledging a pause while samples keep flowing, so GetStreamState
+// reports RUNNING or STOPPED truthfully; the frame server does not pause a
+// live camera stream.
+//
 // The frame server shares stream samples with the consumer process, so samples
 // are allocated from the IMFVideoSampleAllocatorEx it provides through
 // IMFSampleAllocatorControl. A private CPU allocator is only used when no
