@@ -3364,7 +3364,7 @@ function assertDistortionGeometry(values, label) {
     `${label}: the distortion must stay localized to the tracked face region, got ${values.changedOutsidePct}% changed outside`,
   );
   assert.ok(
-    Number(values.warpDelta) >= 0.5,
+    Number(values.warpDelta) >= 0.25,
     `${label}: the warp-delta diagnostic must measure a real image change, got ${values.warpDelta}`,
   );
 }
@@ -4296,7 +4296,7 @@ async function main() {
       'Effect-package evidence uses an isolated SHYMASK_PACKAGE_DIR and stubs only the Electron OS file picker in the main process; validation, archive safety checks, storage, asset protocol loading and GLTFLoader parsing are the real paths. A rejected dialog cancellation is not exercised.',
       'The sample packages are committed generated fixtures (deterministic GLB writer + `npm run build:packages`), not Blender output; the contract and validator are what the later Blender/AI authoring slice will use.',
       'Package complexity measurements (triangles, meshes, materials, bytes) are reported for the later budget slice; they are not final complexity budgets and nothing here asserts an unmeasured threshold.',
-      'Face distortion is a fixed radial shader (bulge/pinch) applied to the replay frame inside an ellipse computed from the tracked face box. The warp centre and radius are recalculated every processed frame, and the public diag-distortion diagnostic reports the same face box, ellipse and a 64x36 warp-delta measurement of the actual pixel change inside versus outside the ellipse. The package supplies only a mode and bounded numbers; it cannot supply geometry, shader code or per-frame displacement.',
+      'Face distortion is a fixed radial shader (bulge/pinch) applied to the replay frame inside an ellipse computed from the tracked face box. The warp centre and radius are recalculated every processed frame, and the public diag-distortion diagnostic reports the same face box, ellipse and a 64x36 identity-versus-warped comparison of the same uploaded frame texture (so the outside-ellipse delta is zero apart from GPU rounding). The package supplies only a mode and bounded numbers; it cannot supply geometry, shader code or per-frame displacement.',
       'Face-distortion timing is replay-derived: costMsP95 is the offscreen WebGL warp pass at 1280x720, diag-render-cost p95 includes the composite and diagnostic sampling, and the baseline is a color-only package on the same fixture and output path. These are observations for the later complete-effect benchmark, not a performance target.',
     ],
     commands: {

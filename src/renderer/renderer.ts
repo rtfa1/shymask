@@ -17,7 +17,7 @@ import {
   resolveEffect,
   type EffectDefinition,
 } from '../core/effects';
-import { faceDistortionGeometry } from '../core/face-distortion';
+import { faceDistortionGeometry, type FrameDeltaStats } from '../core/face-distortion';
 import { DECODE_STALL_THRESHOLD_MS, FrameWatchdog } from '../core/frame-watchdog';
 import {
   PAUSED_TITLE,
@@ -25,7 +25,7 @@ import {
   type OutputDecision,
   type PreviewState,
 } from '../core/output-policy';
-import { PreviewPipeline, type FrameDeltaStats, type FrameStats } from '../core/pipeline';
+import { PreviewPipeline, type FrameStats } from '../core/pipeline';
 import {
   POSE_SMOOTHING_LIMITS,
   PoseSmoother,
@@ -1355,7 +1355,11 @@ function drawProcessedFrame(element: HTMLVideoElement): boolean {
     distortionRenderCostMs = distortionCostMs;
     distortionRenderCosts = pushRolling(distortionRenderCosts, distortionCostMs);
     frameSource = distortionRenderer.canvas;
-    maybeMeasureWarpDelta(element, geometry, treatment);
+    const metricNow = performance.now();
+    if (metricNow - lastWarpMetricAt >= 200) {
+      lastWarpMetricAt = metricNow;
+      lastWarpDelta = distortionRenderer.measureWarpDelta(geometry);
+    }
   }
 
   if (activeEffect.mask) {
@@ -1383,24 +1387,6 @@ function currentDistortionGeometry(): ReturnType<typeof faceDistortionGeometry> 
   const face = lastAcceptedFaceBbox;
   if (!distortion || !face || state.tracking.phase !== 'tracking') return null;
   return faceDistortionGeometry(face, distortion);
-}
-
-/**
- * Refreshes the public warp-delta diagnostic at most every 200 ms. Both images
- * come from the same presented frame, so a nonzero inside-ellipse delta is real
- * pixel change produced by the distortion path, and a near-zero outside delta
- * shows it stays localized to the tracked face region.
- */
-function maybeMeasureWarpDelta(
-  element: HTMLVideoElement,
-  geometry: ReturnType<typeof faceDistortionGeometry>,
-  treatment: EffectDefinition['treatment'],
-): void {
-  if (!distortionRenderer) return;
-  const now = performance.now();
-  if (now - lastWarpMetricAt < 200) return;
-  lastWarpMetricAt = now;
-  lastWarpDelta = pipeline.measureFrameDelta(element, distortionRenderer.canvas, treatment, geometry);
 }
 
 /**

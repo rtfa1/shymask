@@ -107,11 +107,13 @@ costMsLast=... costMsP95=...
 warpDelta=... changedInsidePct=... changedOutsidePct=...
 ```
 
-`warpDelta`, `changedInsidePct` and `changedOutsidePct` come from a 64×36
-comparison between the source frame and the distorted frame of the **same**
-presented frame, split by the same ellipse. They prove the pipeline really
-changed output pixels and that the change is localized to the tracked face
-region; they are a diagnostic, not a per-pixel quality metric.
+`warpDelta`, `changedInsidePct` and `changedOutsidePct` come from two 64×36
+passes over the **same uploaded frame texture**: one identity blit and one
+warped pass. Because both use the same texture and resolution, the
+outside-ellipse difference is zero apart from GPU rounding and the inside
+difference is the warp itself. They prove the pipeline really changed output
+pixels and that the change is localized to the tracked face region; they are a
+diagnostic, not a per-pixel quality metric.
 
 ## Evidence (replay-based, this development desktop)
 
@@ -154,7 +156,7 @@ manifest, no mask asset). The public check's run recorded:
 
 | Measurement | Value |
 | --- | --- |
-| Default-clip warp change | about 70% of inside-ellipse samples changed, about 0.2% outside, warp delta about 1.4 (0-255 mean absolute) |
+| Default-clip warp change | about 70% of inside-ellipse samples changed, 0.0% outside, warp delta about 0.9-1.1 (0-255 mean absolute) |
 | Distortion preview PNG | exact 1280×720 captured output, non-paused (mean RGB about 139,51,43 on the run's frame) |
 | Distortion camera PNG | independent Media Foundation consumer mean matched the preview within the check's tolerance |
 | Offscreen warp pass, p95 | 0.4 ms at 1280×720 (rolling p95 after warm-up) |

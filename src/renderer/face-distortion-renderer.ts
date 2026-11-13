@@ -1,5 +1,9 @@
 import * as THREE from 'three';
-import type { FaceDistortionGeometry } from '../core/face-distortion';
+import {
+  faceDistortionContains,
+  type FaceDistortionGeometry,
+  type FrameDeltaStats,
+} from '../core/face-distortion';
 
 /**
  * Fixed-shader renderer for the declarative face-distortion effect.
@@ -53,13 +57,32 @@ const FRAGMENT_SHADER = `
   }
 `;
 
+/** Identity blit used only for the deterministic warp-delta diagnostic. */
+const IDENTITY_FRAGMENT_SHADER = `
+  uniform sampler2D uFrame;
+  varying vec2 vUv;
+
+  void main() {
+    gl_FragColor = texture2D(uFrame, vUv);
+  }
+`;
+
+const METRIC_WIDTH = 64;
+const METRIC_HEIGHT = 36;
+
 export class FaceDistortionRenderer {
   readonly canvas: HTMLCanvasElement;
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene: THREE.Scene;
   private readonly camera: THREE.OrthographicCamera;
   private readonly material: THREE.ShaderMaterial;
+  private readonly identityMaterial: THREE.ShaderMaterial;
   private readonly plane: THREE.Mesh;
+  private readonly frameUniform: { value: THREE.Texture | null };
+  private readonly warpTarget: THREE.WebGLRenderTarget;
+  private readonly identityTarget: THREE.WebGLRenderTarget;
+  private readonly warpPixels = new Uint8Array(METRIC_WIDTH * METRIC_HEIGHT * 4);
+  private readonly identityPixels = new Uint8Array(METRIC_WIDTH * METRIC_HEIGHT * 4);
   private frameTexture: THREE.Texture | null = null;
   private frameSource: HTMLVideoElement | null = null;
   private disposed = false;
@@ -84,9 +107,10 @@ export class FaceDistortionRenderer {
 
     this.scene = new THREE.Scene();
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    this.frameUniform = { value: null };
     this.material = new THREE.ShaderMaterial({
       uniforms: {
-        uFrame: { value: null },
+        uFrame: this.frameUniform,
         uCenter: { value: new THREE.Vector2(0.5, 0.5) },
         uRadius: { value: new THREE.Vector2(0.25, 0.25) },
         uWarpFactor: { value: 0 },
@@ -96,9 +120,23 @@ export class FaceDistortionRenderer {
       depthTest: false,
       depthWrite: false,
     });
+    this.identityMaterial = new THREE.ShaderMaterial({
+      uniforms: { uFrame: this.frameUniform },
+      vertexShader: VERTEX_SHADER,
+      fragmentShader: IDENTITY_FRAGMENT_SHADER,
+      depthTest: false,
+      depthWrite: false,
+    });
     this.plane = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.material);
     this.plane.frustumCulled = false;
     this.scene.add(this.plane);
+    const targetOptions = {
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      depthBuffer: false,
+    };
+    this.warpTarget = new THREE.WebGLRenderTarget(METRIC_WIDTH, METRIC_HEIGHT, targetOptions);
+    this.identityTarget = new THREE.WebGLRenderTarget(METRIC_WIDTH, METRIC_HEIGHT, targetOptions);
   }
 
   /** Uploads the per-frame warp ellipse and bounded strength. */
@@ -120,8 +158,72 @@ export class FaceDistortionRenderer {
     // callback fires; forcing the upload keeps the texture on the exact frame
     // the mask pose and the pipeline composite were sampled from.
     if (this.frameTexture) this.frameTexture.needsUpdate = true;
+    this.renderer.setRenderTarget(null);
     this.renderer.render(this.scene, this.camera);
     return performance.now() - startedAt;
+  }
+
+  /**
+   * Deterministic warp-delta diagnostic: renders the same uploaded frame
+   * texture once through the identity shader and once through the warp shader
+   * into two 64x36 targets, then compares them. Because both passes share the
+   * texture and resolution, the outside-ellipse difference is zero apart from
+   * GPU rounding and the inside difference is the warp itself; this avoids
+   * comparing an HTML video frame with a WebGL canvas through different
+   * resamplers. Called at most every 200 ms, after `render()` uploaded the frame.
+   */
+  measureWarpDelta(geometry: FaceDistortionGeometry): FrameDeltaStats {
+    if (this.disposed) {
+      return {
+        sampledPixels: 0,
+        insidePixels: 0,
+        meanAbsDiff: 0,
+        changedInsidePct: 0,
+        changedOutsidePct: 0,
+      };
+    }
+    this.plane.material = this.material;
+    this.renderer.setRenderTarget(this.warpTarget);
+    this.renderer.render(this.scene, this.camera);
+    this.plane.material = this.identityMaterial;
+    this.renderer.setRenderTarget(this.identityTarget);
+    this.renderer.render(this.scene, this.camera);
+    this.plane.material = this.material;
+    this.renderer.setRenderTarget(null);
+    this.renderer.readRenderTargetPixels(this.warpTarget, 0, 0, METRIC_WIDTH, METRIC_HEIGHT, this.warpPixels);
+    this.renderer.readRenderTargetPixels(this.identityTarget, 0, 0, METRIC_WIDTH, METRIC_HEIGHT, this.identityPixels);
+
+    const sampledPixels = METRIC_WIDTH * METRIC_HEIGHT;
+    let totalDiff = 0;
+    let insidePixels = 0;
+    let insideChanged = 0;
+    let outsideChanged = 0;
+    for (let index = 0; index < sampledPixels; index += 1) {
+      const offset = index * 4;
+      const redDiff = Math.abs((this.warpPixels[offset] ?? 0) - (this.identityPixels[offset] ?? 0));
+      const greenDiff = Math.abs((this.warpPixels[offset + 1] ?? 0) - (this.identityPixels[offset + 1] ?? 0));
+      const blueDiff = Math.abs((this.warpPixels[offset + 2] ?? 0) - (this.identityPixels[offset + 2] ?? 0));
+      totalDiff += redDiff + greenDiff + blueDiff;
+      const x = (index % METRIC_WIDTH + 0.5) / METRIC_WIDTH;
+      // Render-target row 0 is the bottom of the frame; the ellipse uses the
+      // top-down normalized coordinates of the tracked face box.
+      const y = 1 - (Math.floor(index / METRIC_WIDTH) + 0.5) / METRIC_HEIGHT;
+      const changed = Math.max(redDiff, greenDiff, blueDiff) > 8;
+      if (faceDistortionContains(geometry, x, y)) {
+        insidePixels += 1;
+        if (changed) insideChanged += 1;
+      } else if (changed) {
+        outsideChanged += 1;
+      }
+    }
+    const outsidePixels = sampledPixels - insidePixels;
+    return {
+      sampledPixels,
+      insidePixels,
+      meanAbsDiff: totalDiff / (sampledPixels * 3),
+      changedInsidePct: insidePixels > 0 ? (insideChanged / insidePixels) * 100 : 0,
+      changedOutsidePct: outsidePixels > 0 ? (outsideChanged / outsidePixels) * 100 : 0,
+    };
   }
 
   dispose(): void {
@@ -130,8 +232,11 @@ export class FaceDistortionRenderer {
     this.frameTexture?.dispose();
     this.frameTexture = null;
     this.frameSource = null;
+    this.warpTarget.dispose();
+    this.identityTarget.dispose();
     this.plane.geometry.dispose();
     this.material.dispose();
+    this.identityMaterial.dispose();
     this.scene.clear();
     this.renderer.dispose();
   }
@@ -153,6 +258,6 @@ export class FaceDistortionRenderer {
     texture.needsUpdate = true;
     this.frameTexture = texture;
     this.frameSource = video;
-    this.material.uniforms.uFrame!.value = texture;
+    this.frameUniform.value = texture;
   }
 }

@@ -44,6 +44,25 @@ export interface FaceDistortionGeometry {
   warpFactor: number;
 }
 
+/**
+ * Diagnostic comparison between an identity and a warped render of the same
+ * uploaded frame texture. Both passes use the same shader resolution and
+ * texture, so a nonzero inside-ellipse delta is the warp itself and the outside
+ * delta is exactly zero apart from GPU rounding.
+ */
+export interface FrameDeltaStats {
+  /** Number of low-resolution samples compared. */
+  sampledPixels: number;
+  /** Samples whose normalized coordinates fall inside the warp ellipse. */
+  insidePixels: number;
+  /** Mean absolute per-channel difference over all samples (0-255). */
+  meanAbsDiff: number;
+  /** Percentage of inside-ellipse samples whose max channel diff exceeds 8. */
+  changedInsidePct: number;
+  /** Percentage of outside-ellipse samples whose max channel diff exceeds 8. */
+  changedOutsidePct: number;
+}
+
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
 }
