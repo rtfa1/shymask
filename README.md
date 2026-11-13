@@ -226,7 +226,7 @@ paused fallback within the 1200 ms staleness bound (1268 ms observed in the vali
 
 ### Measured baseline (replay-based, virtual camera)
 
-From a passing `npm run check` run on 2026-11-13 at validated head `@VALIDATED_HEAD@` (the check
+From a passing `npm run check` run on 2026-11-13 at validated head `30c014bc6722a4f8cb9d080fd0b698e5cd6c788e` (the check
 summary records the same SHA), source clip 3.379 s:
 
 - **Hardware:** 11th Gen Intel Core i7-11700K (8 cores / 16 logical), NVIDIA GeForce RTX 3070 Ti,
@@ -240,16 +240,16 @@ summary records the same SHA), source clip 3.379 s:
 | Measurement | Value |
 | --- | --- |
 | Camera media type | RGB32 1280×720 @ 30/1 |
-| Camera frames observed | 212 over 6.68 s (30.4 Hz sample rate) |
+| Camera frames observed | 212 over 6.92 s (30.5 Hz sample rate) |
 | Camera frame interval, p95 | 47 ms |
-| Replay-to-camera latency, p50 / p95 | 32 ms / 56 ms (canvas capture time → consumer receive time) |
+| Replay-to-camera latency, p50 / p95 | 31 ms / 50 ms (canvas capture time → consumer receive time) |
 | Camera mean-RGB spread across the window | 19 (replay content changes across loops) |
 | Replay loops crossed during the camera window | 2 |
-| Source frame interval, p95 | 42 ms in this run; ~42–49 ms across passing runs (the clip presents at ~21–24 Hz here; no 30 FPS forcing) |
+| Source frame interval, p95 | 41.9 ms in this run; ~42–49 ms across passing runs (the clip presents at ~21–24 Hz here; no 30 FPS forcing) |
 | Render + filter cost, p95 | 0.40 ms (main-thread draw/filter submission with no camera consumer; a connected camera adds canvas readback) |
-| Loop cycles observed | 3 seam crossings inside a 9.29 s sampling window |
+| Loop cycles observed | 3 seam crossings inside a 9.27 s sampling window |
 | Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
-| Replay pacing ratio | 0.979 processing time / wall time in this run |
+| Replay pacing ratio | 0.981 processing time / wall time in this run |
 
 Run-to-run variation is expected under desktop load; these are observations, not benchmarks. The
 numbers are replay-derived. They do **not** establish the parent spec's 720p/30 FPS / ≤100 ms

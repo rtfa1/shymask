@@ -10,7 +10,7 @@
   parent spec [#1](https://github.com/rtfa1/shymask/issues/1).
 - **Related decisions:** [ADR-0003](../adr/0003-conceal-the-face-on-tracking-failure.md) (opaque
   paused output in every output path), [ADR-0004](../adr/0004-declarative-effect-packages.md).
-- **Validated head:** `@VALIDATED_HEAD@` (full `npm run check` plus `npm run vcam:check` at that
+- **Validated head:** `30c014bc6722a4f8cb9d080fd0b698e5cd6c788e` (full `npm run check` plus `npm run vcam:check` at that
   commit). The check summary records the same head SHA, hardware, workload, timing, camera evidence
   and tested commands in `evidence/check-<timestamp>/summary.json`; the matching logs are
   `evidence/logs/check-final.log` and `evidence/logs/vcam-final.log`. Local validation is the gate
@@ -182,12 +182,13 @@ controls and an independent Media Foundation consumer process:
   app-published frame (`captureUnixMs > 0`) and decodes the saved PNG, so the native pre-connection
   paused fallback cannot pass a paused state on its own.
 - Start produces processed replay frames in the consumer that match the preview's treatment
-  (warm preview 143,66,41 vs camera 144,67,42 in the validated run; switching to cool changes the
-  camera output as well). The saved PNG is decoded from disk and must match the asserted processed
-  colour, so a native fallback PNG cannot evidence a processed state.
+  (warm preview 146,67,42 vs camera 144,67,41 in the validated run; the saved PNG decodes to
+  144,67,42; switching to cool changes the camera output as well). The saved PNG is decoded from
+  disk and must match the asserted processed colour, so a native fallback PNG cannot evidence a
+  processed state.
 - Resume, effect re-selection and failure recovery restore processed camera output automatically.
 - The camera consumer receives a continuous stream across at least two replay loops
-  (212 frames over 6.75 s, 30.5 Hz) with strictly increasing sample times and visible content
+  (212 frames over 6.92 s, 30.5 Hz) with strictly increasing sample times and visible content
   changes.
 - Closing the app stops the camera stream (no frames after close), exits the camera host process
   within a bounded wait, and removes the device from camera enumeration. A consumer timeout is
@@ -201,19 +202,19 @@ controls and an independent Media Foundation consumer process:
 
 ### Measured baseline (replay-based, virtual camera)
 
-From a passing `npm run check` run on 2026-11-13 at validated head `@VALIDATED_HEAD@` (run-to-run
+From a passing `npm run check` run on 2026-11-13 at validated head `30c014bc6722a4f8cb9d080fd0b698e5cd6c788e` (run-to-run
 variation is expected; the check summary records the same head SHA), source clip 3.379 s, Windows 11
 Pro 26100, i7-11700K / RTX 3070 Ti / 31.8 GiB, Electron 45.3.1:
 
 | Measurement | Value |
 | --- | --- |
 | Camera media type | RGB32 1280×720 @ 30/1 |
-| Camera frames observed | 212 over 6.68 s (30.4 Hz sample rate) |
+| Camera frames observed | 212 over 6.92 s (30.5 Hz sample rate) |
 | Camera frame interval, p95 | 47 ms |
-| Replay-to-camera latency, p50 / p95 | 32 ms / 56 ms (canvas capture time → consumer receive time) |
+| Replay-to-camera latency, p50 / p95 | 31 ms / 50 ms (canvas capture time → consumer receive time) |
 | Camera mean-RGB spread across the window | 19 (replay content changes across loops) |
 | Replay loops crossed during the camera window | 2 |
-| Preview source frame interval, p95 | ~42–49 ms across passing runs (~21–24 Hz replay) |
+| Preview source frame interval, p95 | ~42 ms in this run (~21–24 Hz replay; ~42–49 ms across passing runs) |
 | Preview render + filter cost, p95 | 0.40 ms without a camera consumer; a connected consumer adds a 1280×720 canvas readback |
 | Camera transport | canvas readback → IPC → loopback TCP → RGB32 sample → frame server → consumer |
 
