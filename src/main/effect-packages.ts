@@ -201,7 +201,10 @@ export class EffectPackageStore {
   private describeComplexity(installed: InstalledEffectPackage): string {
     const complexity = installed.complexity;
     const distortion = installed.distortion ? `face distortion ${installed.distortion.mode}` : 'no face distortion';
-    return `Mask: ${complexity.triangles} triangles, ${complexity.meshes} mesh(es), ${complexity.materials} material(s); ${distortion}; archive ${complexity.archiveBytes} bytes.`;
+    const motion = installed.secondaryMotion
+      ? `${installed.secondaryMotion.parts.length} movable part(s)`
+      : 'no movable parts';
+    return `Mask: ${complexity.triangles} triangles, ${complexity.meshes} mesh(es), ${complexity.materials} material(s); ${distortion}; ${motion}; archive ${complexity.archiveBytes} bytes.`;
   }
 
   private describe(directory: string, validated: ValidatedEffectPackage): InstalledEffectPackage {
@@ -215,6 +218,7 @@ export class EffectPackageStore {
       author: manifest.author,
       treatment: manifest.colorTreatment ?? null,
       distortion: manifest.faceDistortion ?? null,
+      secondaryMotion: manifest.secondaryMotion ?? null,
       mask: manifest.mask
         ? {
             asset: manifest.mask.asset,

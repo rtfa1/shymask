@@ -82,6 +82,15 @@ ellipse must move with the tracked face box (see
 the motion coverage the default clip lacks; it does not imply the distortion
 was validated on a physical camera.
 
+The clip also supplies the **secondary-motion settling evidence** (issue #8). A
+separate documented window starts at **25.0 s** for 1.9 s: the recorded head turn
+around 25.9 s is followed by roughly a second of low head angular velocity. The
+imported `reactive-ears` package is sampled there and the reported spring angle
+must peak during the turn, keep moving after the head slows, and decay toward
+rest (see [`docs/notes/0007-secondary-motion.md`](notes/0007-secondary-motion.md)).
+The 41.6 s turn/nod/lean window is still used for the moving-part range evidence.
+Neither window proves physical-camera or live-human behavior.
+
 Gaps still relevant to later slices:
 
 - No second person (multiple-face policy uses the labelled diagnostic injection).

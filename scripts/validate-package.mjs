@@ -50,6 +50,7 @@ if (result.ok) {
           effect: {
             mask: pkg.manifest.mask ?? null,
             faceDistortion: pkg.manifest.faceDistortion ?? null,
+            secondaryMotion: pkg.manifest.secondaryMotion ?? null,
             colorTreatment: pkg.manifest.colorTreatment ?? null,
           },
           assets: [...pkg.assets.keys()],

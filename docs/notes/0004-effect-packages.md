@@ -141,7 +141,9 @@ packages are generated fixtures, not Blender output (#9).
 ## Known limitations
 
 - v1 masks are rigid: no occlusion refinement, moving parts, secondary motion,
-  expression reactions or skinning. Those require later runtime support.
+  expression reactions or skinning. Those require later runtime support. Schema
+  v3 adds bounded declarative `secondaryMotion` for named mask nodes; see
+  [note 0007](0007-secondary-motion.md).
 - Embedded textures are permitted by the GLB validator (self-contained), but the
   committed samples do not exercise them; texture handling is GLTFLoader's
   standard path.

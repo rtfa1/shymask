@@ -4,10 +4,12 @@ Shymask applies visual effects to a webcam feed and publishes the result as a vi
 repository currently delivers a **recorded-replay preview** (issue #2), the **Windows 11 virtual
 camera** (issue #3), **one-face tracking with a basic rigid 3D mask** (issue #4), **imported,
 validated effect packages** (issue #5), **face-based occlusion with bounded face anchoring**
-(issue #6), and a **packaged face-distortion effect** (issue #7): a desktop
+(issue #6), a **packaged face-distortion effect** (issue #7), and **bounded reactive ears/hair on
+packaged masks** (issue #8): a desktop
 preview loops a recorded webcam-style clip at real-time pacing, tracks exactly one face, attaches a
 procedural low-poly mask to that face, hides mask geometry behind the face, applies bounded
-declarative color treatments and an optional bounded face-following distortion, displays a selectable
+declarative color treatments and an optional bounded face-following distortion, drives a small
+number of declared mask parts with a fixed spring simulation, displays a selectable
 effect, and publishes its 1280×720 output canvas as **Shymask Camera** so other applications can
 select it. The camera publishes the app's output canvas; a native opaque paused fallback covers the
 short window before the app connects and is used when app frames stop arriving. No physical webcam,
@@ -15,20 +17,23 @@ account, cloud service, or live test subject is used.
 
 An effect package is a ZIP containing a versioned `manifest.json` plus declared assets only —
 never executable effect code. A package is **one complete effect** that may combine a rigid GLB
-mask and/or a declarative color treatment (schema v1) with an optional bounded face distortion
-(schema v2). Imported effects use the same tracking, rendering and camera path as the bundled mask.
+mask, bounded spring-driven movable mask parts, and/or a declarative color treatment (schema v1)
+with an optional bounded face distortion (schema v2) and bounded `secondaryMotion` parts (schema
+v3). Imported effects use the same tracking, rendering and camera path as the bundled mask.
 The versioned contract, limits, error codes and authoring guidance are in
 [`docs/effect-packages.md`](docs/effect-packages.md); the distortion design and evidence are in
-[`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md).
+[`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md), and the secondary-motion
+design and evidence are in [`docs/notes/0007-secondary-motion.md`](docs/notes/0007-secondary-motion.md).
 
 Tracking readiness and loss gate every effect: zero faces, multiple faces, unreliable tracking, a
 missing tracker model, no effect, manual pause and processing failures all replace the whole output
 with the exact opaque "Tracking paused" screen in both the preview and the virtual camera. There is
 no raw-passthrough branch.
 
-Secondary motion, real call-application compatibility (issue #10), the Blender/AI authoring flow
-(issue #9), complexity budgets (issue #11), and the final 720p/30 FPS / 100 ms target are later child
-tickets of the parent spec. Hand-over-mask occlusion remains out of scope.
+Real call-application compatibility (issue #10), the Blender/AI authoring flow (issue #9),
+complexity budgets (issue #11), and the final 720p/30 FPS / 100 ms target are later child
+tickets of the parent spec. Hand-over-mask occlusion and full strand-level hair simulation remain
+out of scope.
 ## Quick start (Windows 11)
 
 Prerequisites: Node.js 22.12+ (tested with 24.19.0) and npm 11+. The Windows virtual camera also
@@ -65,19 +70,23 @@ If `npm install` blocks install scripts (newer npm releases gate them), run
 | --- | --- |
 | **Start** | Begins real-time playback of the fixture already validated at launch. Disabled while the fixture is missing or corrupt, the face tracker is unavailable, playback has already started, or manual pause is active. |
 | **Pause / Resume** | Manual pause replaces the whole output with the opaque "Tracking paused" screen and freezes processing. It persists until Resume is pressed, including across automatic tracking recovery. |
-| **Effect** | One complete effect at a time: `Rigid mask`, `Warm tint`, `Cool tint`, `Monochrome`, explicit `No effect`, or any imported package. Bundled options are followed by an **Imported packages** group. A package may combine its own mask, bounded face distortion and color treatment; components from different packages are never stacked. Choosing `No effect` hides the output; choosing an effect restores it automatically once one face is tracked. Tracking loss pauses every effect, including color treatments and the face distortion. |
-| **Import package…** | Opens the OS file picker and validates the selected ZIP (schema v1 or v2, declared assets only, bounded declarations, no executable content). A valid package is stored under the app's `userData` directory, appears in the Effect selector and is selected. An invalid package is rejected with its actionable code, message and field/path; the current output is unchanged. |
+| **Effect** | One complete effect at a time: `Rigid mask`, `Warm tint`, `Cool tint`, `Monochrome`, explicit `No effect`, or any imported package. Bundled options are followed by an **Imported packages** group. A package may combine its own mask, bounded spring-driven movable parts, bounded face distortion and color treatment; components from different packages are never stacked. Choosing `No effect` hides the output; choosing an effect restores it automatically once one face is tracked. Tracking loss pauses every effect, including color treatments, the face distortion and secondary motion. |
+| **Import package…** | Opens the OS file picker and validates the selected ZIP (schema v1, v2 or v3, declared assets only, bounded declarations, no executable content). A valid package is stored under the app's `userData` directory, appears in the Effect selector and is selected. An invalid package is rejected with its actionable code, message and field/path; the current output is unchanged. |
 | **Remove imported effect** | Removes the selected imported package from the persistent store. If it was active, the selector falls back to `No effect` and the opaque paused output; other imported packages remain. |
 | **Tracking state (diagnostic)** | `Use detected face (normal)`, or inject `tracking lost`, `multiple faces`, or `unreliable tracking` to exercise the output policy. Injected states are labelled in the diagnostics; the real detector is authoritative when set back to normal. |
 | **Recheck input** | Re-runs fixture size/checksum validation. Use after fetching a fixture that was missing at launch. |
 | **Capture evidence frame** | Writes the current output canvas (1280×720 PNG) to `evidence/` and shows the path in the app. |
+| **Apply face-distortion warp (diagnostic A/B)** | Keeps the distortion effect selected but draws the same uploaded frame through the identity shader, so a held-frame ON/OFF capture proves the warp reaches the published output. |
+| **Apply secondary motion (diagnostic A/B)** | Keeps the selected effect active but draws movable parts at their declared rest pose (authored GLB orientation plus `restAngleDeg`), so a held-frame ON/OFF capture proves the simulated angles reach the published output. |
+| **Settle held frame (diagnostic)** | With the replay held, advances the same spring simulator with the stationary accepted head pose so the retained post-turn angle can be observed decaying to rest. Diagnostic evidence only. |
+| **Simulate distortion WebGL context loss (diagnostic)** | Injects a WebGL context loss on the distortion renderer; the output hides after the existing undrawable guard and resumes after a browser restore. |
 | **Simulate effect-processing failure** | Diagnostic-only toggle that forces the failure policy to demonstrate the opaque paused output and automatic recovery. |
 | **Restart virtual camera** | Re-runs the native camera host (for example after an elevated install or a camera error). |
 
 The app never opens a physical camera in this slice. There is no passthrough mode: the output is
-either a processed replay frame (with a mask, a color treatment, a bounded face distortion, or an
-imported complete effect) or the opaque "Tracking paused" screen, in the preview **and** in the
-virtual camera. While an imported
+either a processed replay frame (with a mask, a color treatment, a bounded face distortion, bounded
+spring-driven movable parts, or an imported complete effect) or the opaque "Tracking paused" screen,
+in the preview **and** in the virtual camera. While an imported
 mask loads, the whole output stays on the opaque paused screen; a failed load leaves it hidden with
 an explanation. Closing Shymask stops its camera output.
 
@@ -140,9 +149,24 @@ an explanation. Closing Shymask stops its camera output.
   face box, ellipse, main-thread warp submission time and a measured inside/outside change ratio;
   the published-output proof is a held-frame warp ON/OFF A/B in preview and camera. See
   [`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md).
+- **Bounded secondary motion.** A schema-v3 package may declare 1-4 named mask GLB nodes as movable
+  parts. `src/core/secondary-motion.ts` is a pure spring simulation with equal sub-steps of at most
+  1/120 s, driven by the accepted tracked head angular velocity (yaw/pitch/roll);
+  `src/renderer/mask-renderer.ts` composes each part's absolute simulated angle (which already
+  includes `restAngleDeg`) about the declared axis on the node's authored orientation; the declared
+  rest pose is that authored orientation plus `restAngleDeg`. Every part is bounded by
+  `maxAngleDeg`; `dt` is clamped, and a long gap, pose discontinuity, loop seam or tracking
+  reacquisition deliberately resets to the declared rest pose instead of injecting an impulse. The
+  public **Secondary motion** diagnostic reports the per-part angles, bounds, head speed, reset reason
+  and simulation cost; a held-frame diagnostic toggle proves preview and camera contain the simulated
+  angle, and live camera sequences during the turn/nod window and the post-turn residual show the
+  packaged mask while the diagnostic reports nonzero bounded part angles. There is no canned movement
+  clip, package code, skeleton, strand-level hair, collision or Blender-physics conversion. The
+  bundled procedural mask stays rigid; the demonstration and the contract are package-only. See
+  [`docs/notes/0007-secondary-motion.md`](docs/notes/0007-secondary-motion.md).
 - **Declarative effects.** Color treatments, the bundled rigid mask and the bounded face distortion
-  are data/ids (`src/core/treatments.ts`, `src/core/effect-package-contract.ts`); an imported effect
-  is a validated package descriptor
+  and secondary-motion parameters are data/ids (`src/core/treatments.ts`,
+  `src/core/effect-package-contract.ts`); an imported effect is a validated package descriptor
   (`src/core/effects.ts`, `src/core/effect-package-contract.ts`) whose mask is a declared GLB and
   whose treatment is a fixed filter built from bounded parameters. No arbitrary executable effect
   code is loaded, and the renderer never receives archive bytes. The package contract, validation,
@@ -152,12 +176,15 @@ an explanation. Closing Shymask stops its camera output.
   validated archive and declared asset under `userData`, and serves only that asset from the local
   `shymask://app/packages/...` route. Validation rejects zip-slip, absolute paths, symlinks,
   oversized entries, executable/script content, unsupported schema versions, unknown behaviors,
-  missing assets, out-of-range color or distortion parameters and unsupported glTF features with
-  structured, actionable codes. Imported effects persist across restarts and can be removed in the
-  app. The spike choices and replay-based package evidence are in
+  missing assets, out-of-range color/distortion/secondary-motion parameters, unknown or ambiguous
+  movable-part nodes and unsupported glTF features with structured, actionable codes. Imported
+  effects persist across restarts and can be removed in the app. The spike choices and replay-based
+  package evidence are in
   [`docs/notes/0004-effect-packages.md`](docs/notes/0004-effect-packages.md); the face-distortion
   contract and evidence are in
-  [`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md).
+  [`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md), and the
+  secondary-motion contract and evidence are in
+  [`docs/notes/0007-secondary-motion.md`](docs/notes/0007-secondary-motion.md).
 - **Virtual camera publication.** While the app runs, `src/main/virtual-camera.ts` serves the output
   canvas to the native Windows virtual camera over a loopback frame transport, and
   `src/renderer/renderer.ts` pushes every drawn output frame plus a 100 ms heartbeat (only while a
@@ -250,8 +277,9 @@ for the architecture, the registration failure that was investigated, and the me
 npm run typecheck        # strict TypeScript across src and tests
 npm test                 # unit tests for the output policy, tracking state machine, bounded pose
                          # smoothing, replay clock, frame watchdog, treatments, package schema/ZIP
-                         # safety/GLB validation, face-distortion geometry/validation and the effect
-                         # registry (129 tests)
+                         # safety/GLB validation, face-distortion geometry/validation,
+                         # secondary-motion spring bounds/resets/settling and the effect
+                         # registry (148 tests)
 npm run build:face-occluder # regenerate the committed canonical face-occluder table (fetches once)
 npm run build:packages   # regenerate the committed sample + negative effect-package fixtures
 npm run validate:package -- <file.zip>  # validate one package with the app's pure validator
@@ -273,7 +301,7 @@ npm run fetch:motion-fixture
 ```
 
 The public-workflow check asserts, through the app's visible controls, its diagnostics and the
-independent camera consumer (83/83 checks passed in the latest run at this head):
+independent camera consumer (the run cited in the measured baseline below):
 
 1. Startup is the opaque "Tracking paused" screen; no raw feed.
 2. Start renders a processed replay frame through the treatment control.
@@ -428,13 +456,61 @@ independent camera consumer (83/83 checks passed in the latest run at this head)
     makes it non-drawable; the 250 ms undrawable guard shows the opaque paused screen in preview and
     camera (never a stale or raw frame). The diagnostic reports `drawable=false`/`contextLost=true`,
     and a browser restore returns `drawable=true` and resumes the effect.
+41. The schema v3 `reactive-ears` sample imports through **Import package…**, appears in the Effect
+    selector, is selected, and renders its packaged mask in preview and the independent camera (the
+    exact unlit material colour appears in both; face occlusion stays active). The public
+    **Secondary motion** diagnostic reports `parts=3`, the three node names, `axes=y:yaw,y:yaw,x:pitch`
+    and per-part bounds.
+42. On the recorded turn/nod/lean window, the two ears (yaw) and hair tuft (pitch) move within their
+    declared bounds: 17/18 frames tracked, per-part angle ranges around 42–60°, maximum observed
+    ~29–31° against 32/32/35° bounds. Three moving screenshots are saved. A live camera sequence over
+    the same window contains the package material in every app-published PNG while the diagnostic
+    reports nonzero, bounded angles; it does not isolate the part-pixel change from the moving video
+    and can cross the loop seam. The held 47.7 s A/B is the camera-side proof of the simulated angle;
+    the coordinator accepted the presence sequences plus that A/B and the shared 1280×720 canvas as
+    the AC2 virtual-webcam evidence, with this limitation stated.
+43. A separate documented 25.0 s post-turn window reports a live **residual/near-rest observation**:
+    the recorded turn drives a peak angle, the spring is still deflected above the declared rest pose
+    after head angular speed drops, and a near-rest sample follows (the recorded person does not
+    actually stop, so this is not a monotonic-stop claim). The strict post-turn settling gate holds
+    that frame and uses the diagnostic **Settle held frame** control to advance the same simulator
+    with the stationary pose: the retained angle must decay to ≤20% of its initial value and ≤2.5°
+    with a near-rest minimum after one second. A second camera sequence covers the same window and
+    contains the package material.
+44. Crossing a replay loop seam deliberately resets the spring (reset count increases, near-rest
+    seam-frame angles, bounded), and injected tracking loss resets to exactly rest while hiding the
+    effect; reacquisition resumes from rest and the recovered angle stays bounded.
+45. A held 47.7 s post-turn frame compares simulated part angles with the declared rest pose
+    through the public diagnostic A/B: exact 1280×720 ON/OFF captures changed 1,864 pixels in the
+    cited run, all on the packaged mask, with 0 same-state self-diff, and the independent camera
+    receives the identical change.
+46. Manual pause, injected tracking loss, injected multiple faces, simulated processing failure, an
+    async package switch and explicit `No effect` all keep the whole output hidden; manual pause,
+    tracking loss and processing failure are camera-captured as the opaque paused canvas. Removing
+    the active package falls back to no-effect and leaves other packages installed.
+47. The secondary-motion negative fixtures (`schema v2` declaration, invalid axis, unknown node,
+    out-of-range stiffness, unknown field, rest beyond max angle and no mask) are rejected with
+    `schema-version-unsupported`/`secondary-motion-invalid`, keep the current movable effect
+    rendering, and produce no renderer console error.
+48. Replay-based workload for the secondary-motion path is recorded: the pure spring update p95
+    (main-thread only), full render cost and presented-frame interval with the simulated pose versus
+    the declared rest pose in sequential windows, and the same-effect mask/camera output. These are
+    observations for the later complete-effect benchmark, not a performance target.
+49. The check's `summary.json` records the secondary-motion contract, motion/settling windows,
+    reset evidence, A/B and workload under `secondaryMotion`, with the replay/desktop boundary
+    stated explicitly.
+50. The schema v3 package contract and creator parameters are documented in
+    [`docs/effect-packages.md`](docs/effect-packages.md) and
+    [`docs/notes/0007-secondary-motion.md`](docs/notes/0007-secondary-motion.md), including what is
+    not simulated (strand hair, arbitrary Blender physics).
 
 Artifacts are written to the gitignored `evidence/check-<timestamp>/` directory: per-state canvas
 screenshots, the full app window (including import-error feedback), captured output frames,
 camera-consumer PNGs under `camera-frames/`, and `summary.json` with the derived base SHA, timing
 baseline, tracking/model evidence, effect-package import/negative/rapid-switch/attachment evidence
 (including the displayed complexity subset in each import message), face-distortion preview/camera,
-motion-following and replay-based timing evidence, hardware, workload, measured
+secondary-motion motion/settling/A-B/reset/timing evidence, motion-following and replay-based timing
+evidence, hardware, workload, measured
 boundaries, commands, validation-gate facts and the tested head SHA. It also records
 `virtualCamera.captureAttempts`: every processed camera capture's attempt count and its
 app-published/native-fallback frame counts, so the bounded retries and the consumer-frame capture
@@ -524,6 +600,39 @@ distortion path is recorded for the later complete-effect benchmark (see the tab
 [`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md)).
 Package complexity is reported, not budgeted; no triangle/mesh threshold is asserted.
 
+The schema v3 `reactive-ears` sample is a mask with two ears driven by tracked yaw and a hair tuft
+driven by tracked pitch. Its motion is computed by the pure spring simulator from the accepted
+tracked pose every processed frame, not replayed from a clip; the check measures the recorded
+turn/nod window, a live post-turn residual, a deterministic held-frame settle, loop-seam and
+reacquisition resets, and a held-frame simulated-vs-rest A/B in preview and camera. The sample and
+its seven negative fixtures are generated by `npm run build:packages`; the contract, bounds, reset
+rules and measured values are in
+[`docs/effect-packages.md`](docs/effect-packages.md#secondarymotion-schema-v3) and
+[`docs/notes/0007-secondary-motion.md`](docs/notes/0007-secondary-motion.md).
+
+### Measured secondary-motion baseline (replay-based)
+
+From the full `npm run check` runs at code head `7a087d7d` (`evidence/check-2026-11-13T22-22-14-119Z/summary.json`,
+94/94) and the head-matched `evidence/check-2026-11-13T23-12-32-374Z/summary.json` (96/96, head
+`a8b0789`; an equivalent `23-06-36-331Z` run also passed). The numeric table below is the 22-22 run;
+the live camera sequences and the media-time residual gate exist only in the head-matched 23-12/23-06
+runs, and the 2b4c532 fix round changed the A/B OFF state to the declared rest pose (no effect for the
+sample's zero `restAngleDeg`) and equal-sub-step bookkeeping; it did not change the integrator formula.
+These are observations for the later complete-effect benchmark,
+not performance targets.
+
+| Measurement | Value |
+| --- | --- |
+| Secondary-motion package output | schema v3 `reactive-ears` imports through the public control; its exact unlit material colour (RGB 150,90,240) covers 78,546 preview and 107,615 camera pixels in exact 1280×720 PNGs (enforced >20,000) |
+| Recorded-motion window (41.6–49.6 s) | 17/18 sampled frames tracked; per-part angle ranges 59.7°/59.7°/42.0°; maximum observed 30.75° inside the declared 32/32/35° bounds; three screenshots saved |
+| Live post-turn residual (25.0–26.9 s) | In the 22-22 run the sampled peak was 17.71° at head 3.4°/s and the residual 7.90° at 8.5°/s, so that run does not show a monotonic speed fall; the head keeps moving. The head-matched 23-12 run measured peak 18.51° at head 27.8°/s → residual 7.93° at 4.9°/s → near-rest 2.47° at 6.1°/s, post-peak coverage 850 ms (23-06: 12.6° at 36.3°/s → 4.84° at 11.5°/s → 2.83° at 4.8°/s, coverage 833 ms). Oscillatory and run-dependent; reported as residual + near-rest, not a monotonic stop |
+| Held-frame settling (47.7 s) | retained 8.70° decayed to 0.03° (0.3%) in 2,913 ms through the same simulator with the accepted pose held stationary; minimum after one second 0.02°; two screenshots saved |
+| Published-output A/B (held 47.7 s) | 1,864 pixels changed, all on the packaged mask, two ON and two OFF captures pixel-identical (0 self-diff); the independent Media Foundation camera PNG changed by the identical 1,864 pixels. The retained held angle varies (8–24° across recent runs); the gates are ≥5° and ≥800 changed pixels |
+| Simulation cost, p95 | ~0.1 ms (timer granularity) for the pure spring update per accepted pose; main thread only |
+| Render + composite, p95 | 5.8 ms with the simulated pose vs 5.8 ms with the declared rest pose in the run's sequential 2.2 s windows; the OFF state still runs the simulator, so the difference is observed run variation, not an isolated cost |
+| Presented-frame interval, p95 | 44.3 ms vs 44.3 ms in the run's sequential 2.2 s windows; not isolated and not attributed to the simulation |
+| Paused-output captures | manual pause, tracking loss and processing failure delivered the opaque paused canvas in preview and camera (≈12,15,20); multiple faces (10,13,18) and no-effect were preview-asserted; removal fell back to no-effect |
+
 Replay-derived tracking measurements from the same run are documented in
 [`docs/notes/0003-face-tracking-and-mask.md`](docs/notes/0003-face-tracking-and-mask.md); the
 occlusion and smoothing method, trade-offs and limits are in
@@ -536,9 +645,12 @@ numbers are replay-derived. They do **not** establish the parent spec's 720p/30 
 camera-to-output target, physical-camera compatibility, tracking on a physical camera, call-application
 compatibility, or laptop integrated-graphics suitability. The camera latency includes the app's ~30 Hz
 publish cadence (a frame waits up to one 33 ms sample slot), so p95 is dominated by pacing rather than
-transport. The mask has face-based occlusion and bounded face anchoring but no secondary motion; the
-canonical face occluder is rigid, has no hair/ears/neck or full head silhouette, and does not deform
-with expressions, and the policy cannot detect every possible visual defect. The packaged face
+transport. The mask has face-based occlusion, bounded face anchoring and bounded secondary motion;
+the canonical face occluder is rigid, has no hair/ears/neck or full head silhouette, and does not
+deform with expressions, and the policy cannot detect every possible visual defect. Secondary motion
+is a fixed rigid-spring model: each movable part is one GLB node rotating about one local axis,
+bounded by stiffness/damping/max angle. It is not strand-level hair, cloth/soft-body simulation,
+collision, a chained bone rig, or a conversion of arbitrary Blender physics. The packaged face
 distortion is a bounded whole-face radial warp (`bulge`/`pinch`) whose ellipse follows the tracked
 face box; it is not a per-landmark/expression warp or a 3D mesh deformation. Its renderer treats a
 lost WebGL context as non-drawable, so the undrawable guard hides both outputs instead of publishing
@@ -548,15 +660,16 @@ submission only, not GPU/compositor cost. See
 `docs/notes/0001-preview-stack-and-loop.md`,
 `docs/notes/0002-windows-virtual-camera-spike.md`,
 `docs/notes/0003-face-tracking-and-mask.md`,
-`docs/notes/0005-face-occlusion-and-anchoring.md` and
-`docs/notes/0006-face-distortion.md`.
+`docs/notes/0005-face-occlusion-and-anchoring.md`,
+`docs/notes/0006-face-distortion.md` and
+`docs/notes/0007-secondary-motion.md`.
 
 ## Fixtures
 
 The default input is a CC0-1.0 webcam-style recording of one person facing the camera
 (`webcam-loop-v1`). A second CC0 Wikitongues clip (`pose-loop-v1`, 49.6 s, 480p) supplies real head
-turns, nods and leaning for the tracking check and the face-distortion motion-following evidence; the
-app's default input is unchanged. Their source,
+turns, nods and leaning for the tracking check, the face-distortion motion-following evidence and
+the secondary-motion turn/settling evidence; the app's default input is unchanged. Their source,
 license, attribution, checksums, acquisition commands, content coverage and gaps are documented in
 [`docs/fixture-webcam-loop.md`](docs/fixture-webcam-loop.md) and
 [`docs/fixture-pose-loop.md`](docs/fixture-pose-loop.md). Media bytes and the face-tracker model are
@@ -566,11 +679,13 @@ intentionally not committed; only fetch scripts and metadata are versioned (`tra
 
 ```
 src/core/       output policy, tracking state machine, bounded pose smoothing, replay clock, canvas
-                pipeline, effects, effect-package contract/validator, ZIP safety reader, GLB validator
+                pipeline, effects, effect-package contract/validator, bounded secondary-motion
+                spring simulation, ZIP safety reader, GLB validator
 src/main/       Electron main process, local asset protocol, fixture/tracker validation, effect-package
                 store/import/remove, IPC, virtual camera lifecycle
 src/renderer/   desktop preview UI (HTML/CSS/TS), MediaPipe tracker wrapper, Three.js mask renderer
-                with the depth-only canonical face occluder (bundled + package GLB), the fixed
+                with the depth-only canonical face occluder (bundled + package GLB) and movable-part
+                rest-pose transforms, the fixed
                 face-distortion shader, and camera frame publication
 scripts/        build, start, fixture/model fetch, canonical face-occluder generation, package fixture
                 generation/validation, public-workflow check, native camera scripts
@@ -639,7 +754,7 @@ with no physical camera or human participation. The imported-effect async switch
 switching-interruption sub-case: the whole output stays on the opaque paused screen until the new
 effect loads, or remains hidden with an explanation if the load fails.
 
-Deferred: physical webcam capture, live-human acceptance, secondary motion (issue #8), the
+Deferred: physical webcam capture, live-human acceptance, the
 Blender/AI authoring flow (issue #9), real Zoom/Meet/OBS compatibility (issue #10),
 final live acceptance, NV12 support, complexity budgets (issue #11), laptop integrated-graphics
 validation, and the 720p/30 FPS / ≤100 ms target. Two-person footage is not part of this slice;

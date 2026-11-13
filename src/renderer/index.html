@@ -15,7 +15,7 @@
         <h1>Shymask</h1>
         <p class="tagline">Development preview &middot; recorded replay input</p>
       </div>
-      <p class="build-tag">Preview / face tracking / occlusion / anchored mask / face distortion</p>
+      <p class="build-tag">Preview / face tracking / occlusion / anchored mask / face distortion / secondary motion</p>
     </header>
 
     <main class="layout">
@@ -72,6 +72,14 @@
             Apply face-distortion warp (diagnostic A/B)
           </label>
           <label class="checkbox">
+            <input type="checkbox" id="secondary-motion-toggle" data-testid="secondary-motion-toggle" checked />
+            Apply secondary motion (diagnostic A/B)
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="secondary-motion-settle" data-testid="secondary-motion-settle" />
+            Settle held frame (diagnostic)
+          </label>
+          <label class="checkbox">
             <input type="checkbox" id="distortion-context-loss" data-testid="distortion-context-loss" />
             Simulate distortion WebGL context loss (diagnostic)
           </label>
@@ -115,6 +123,7 @@
             <div><dt>Mask</dt><dd id="diag-mask"></dd></div>
             <div><dt>Occlusion</dt><dd id="diag-occlusion"></dd></div>
             <div><dt>Face distortion</dt><dd id="diag-distortion"></dd></div>
+            <div><dt>Secondary motion</dt><dd id="diag-secondary-motion"></dd></div>
             <div><dt>Pose smoothing</dt><dd id="diag-smoothing"></dd></div>
             <div><dt>Mask probe</dt><dd id="diag-mask-probe"></dd></div>
             <div><dt>Mask probe colour</dt><dd id="diag-mask-color"></dd></div>

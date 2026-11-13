@@ -11,25 +11,23 @@
  * docs/adr/0004-declarative-effect-packages.md for the decision.
  */
 
-/**
- * Oldest schema this build still accepts. The supported list below is derived
- * from this value and the current schema version, so the constants cannot drift
- * apart.
- */
+/** Oldest schema this build still accepts. */
 export const MIN_EFFECT_PACKAGE_SCHEMA_VERSION = 1;
 
 /**
  * Current package schema. Version 2 adds the optional `faceDistortion`
- * component; version 1 packages (mask and/or color treatment) remain accepted
- * unchanged.
+ * component; version 3 adds the optional bounded `secondaryMotion` component
+ * (a small set of spring-driven movable mask parts). Version 1 packages (mask
+ * and/or color treatment) and version 2 packages remain accepted unchanged.
  */
-export const EFFECT_PACKAGE_SCHEMA_VERSION = 2;
+export const EFFECT_PACKAGE_SCHEMA_VERSION = 3;
 
-/** Every schema version this build accepts, in ascending order. */
-export const SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS = [
-  MIN_EFFECT_PACKAGE_SCHEMA_VERSION,
-  EFFECT_PACKAGE_SCHEMA_VERSION,
-] as const;
+/**
+ * Every schema version this build accepts, in ascending order. This literal list
+ * must stay in sync with `MIN_EFFECT_PACKAGE_SCHEMA_VERSION` and
+ * `EFFECT_PACKAGE_SCHEMA_VERSION`; the schema-version tests cover both ends.
+ */
+export const SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS = [1, 2, 3] as const;
 
 export type EffectPackageSchemaVersion = (typeof SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS)[number];
 
@@ -177,6 +175,105 @@ export const DEFAULT_FACE_DISTORTION = {
   centerOffset: [0, 0] as readonly [number, number],
 } as const;
 
+/**
+ * The first schema version that understands `secondaryMotion`. Declaring the
+ * component in a v1/v2 manifest is rejected instead of silently ignored,
+ * because an older build would otherwise import a package whose declared
+ * moving parts never move.
+ */
+export const SECONDARY_MOTION_SCHEMA_VERSION = 3;
+
+/** Local rotation axes a movable part may swing around. */
+export const SECONDARY_MOTION_AXES = ['x', 'y', 'z'] as const;
+
+export type SecondaryMotionAxis = (typeof SECONDARY_MOTION_AXES)[number];
+
+/** Tracked head-rotation components that may drive a movable part. */
+export const SECONDARY_MOTION_DRIVES = ['yaw', 'pitch', 'roll'] as const;
+
+export type SecondaryMotionDrive = (typeof SECONDARY_MOTION_DRIVES)[number];
+
+/**
+ * Validation bounds for a package's secondary-motion declaration. These are
+ * contract bounds, not complexity budgets: every part is a named GLB node that
+ * rotates about one local axis; the package cannot supply code, geometry or
+ * per-frame motion.
+ */
+export const SECONDARY_MOTION_LIMITS = {
+  /** A mask may declare at most this many movable parts. */
+  maxParts: 4,
+  /** Node name length in the mask GLB (ASCII, no spaces). */
+  maxNodeNameLength: 64,
+  /**
+   * Angular spring stiffness in 1/s^2. The undamped natural frequency is
+   * sqrt(stiffness) rad/s, so 4 is a slow swing and 400 is a fast flutter.
+   */
+  minStiffness: 4,
+  maxStiffness: 400,
+  /** Dimensionless damping ratio; below 1 overshoots, 1 is critically damped. */
+  minDampingRatio: 0.05,
+  maxDampingRatio: 1.5,
+  /** Hard position bound per part, in degrees from the declared rest pose. */
+  minMaxAngleDeg: 1,
+  maxMaxAngleDeg: 60,
+  /** Optional constant rest offset from the authored GLB pose, in degrees. */
+  maxRestAngleDeg: 60,
+} as const;
+
+/**
+ * Fixed runtime constants for the spring simulation. They are shared by the
+ * simulator and its tests but are deliberately not package-tunable.
+ */
+export const SECONDARY_MOTION_RUNTIME = {
+  /**
+   * Fixed runtime sensitivity: the spring target reaches `maxAngleDeg` when the
+   * tracked head rotates at this many degrees per second around `drive`.
+   */
+  driveFullScaleDegPerSec: 45,
+  /**
+   * Largest integration sub-step. Each frame interval is split into
+   * `ceil(dtMs / maxSubStepMs)` equal sub-steps of at most this long; the
+   * split is deterministic for a given accepted-pose sequence.
+   */
+  maxSubStepMs: 1000 / 120,
+  /** Smallest accepted `dt`; shorter positive intervals are clamped up to this. */
+  minDtMs: 0.5,
+  /** Largest accepted input gap before the state deliberately resets. */
+  maxGapMs: 250,
+  /** A per-sample pose discontinuity beyond these resets instead of driving. */
+  maxPoseDeltaDeg: 45,
+  maxHeadSpeedDegPerSec: 1080,
+} as const;
+
+/**
+ * One declarative movable mask part. `node` names a node in the package mask
+ * GLB; the runtime records that node's authored orientation as the zero-offset
+ * base. The declared rest pose is that orientation plus `restAngleDeg`, and the
+ * simulated angle is applied about `axis` driven by the tracked head angular
+ * velocity around `drive`.
+ */
+export interface SecondaryMotionPart {
+  /** Node name in the mask GLB (exactly one node must match). */
+  node: string;
+  /** Local rotation axis of the node, `x`/`y`/`z`. */
+  axis: SecondaryMotionAxis;
+  /** Tracked head-rotation component that drives the spring. */
+  drive: SecondaryMotionDrive;
+  /** Angular spring stiffness in 1/s^2, 4-400. */
+  stiffness: number;
+  /** Damping ratio, 0.05-1.5. */
+  damping: number;
+  /** Hard bound on the applied angle in degrees, 1-60. */
+  maxAngleDeg: number;
+  /** Optional constant angle offset from the authored GLB orientation, -60 to 60. */
+  restAngleDeg: number;
+}
+
+/** Bounded secondary-motion declaration: 1-4 named spring-driven parts. */
+export interface SecondaryMotionParameters {
+  parts: readonly SecondaryMotionPart[];
+}
+
 export interface EffectPackageAuthor {
   name: string;
   /** Free-form credit line, e.g. "Generated by scripts/build-package-fixtures.mjs". */
@@ -212,9 +309,11 @@ export interface EffectPackageManifest {
   colorTreatment?: ColorTreatmentParameters;
   /** Bounded face distortion (schema v2+). */
   faceDistortion?: FaceDistortionParameters;
+  /** Bounded spring-driven movable mask parts (schema v3+). */
+  secondaryMotion?: SecondaryMotionParameters;
   /** Reserved for a later slice; must be absent or an empty array in v1. */
   expressionReactions?: readonly unknown[];
-  /** Reserved for moving parts/secondary motion; absent or empty in v1. */
+  /** Reserved; use `secondaryMotion` for supported moving-part behavior. */
   behaviors?: readonly unknown[];
 }
 
@@ -253,6 +352,7 @@ export const PACKAGE_ISSUE_CODES = [
   'color-parameter-out-of-range',
   'attachment-invalid',
   'distortion-invalid',
+  'secondary-motion-invalid',
   'glb-invalid',
   'glb-external-resource',
   'glb-unsupported-extension',
@@ -289,6 +389,8 @@ export interface PackageComplexity {
   colorParameters: number;
   /** 1 when a bounded face-distortion component is declared, else 0. */
   distortionParameters: number;
+  /** Declared movable parts (0-4 for an accepted secondary-motion declaration). */
+  movingParts: number;
 }
 
 /**
@@ -305,6 +407,8 @@ export interface InstalledEffectPackage {
   treatment: ColorTreatmentParameters | null;
   /** Bounded face distortion, or null when the package does not declare one. */
   distortion: FaceDistortionParameters | null;
+  /** Bounded spring-driven movable mask parts, or null when none are declared. */
+  secondaryMotion: SecondaryMotionParameters | null;
   mask: {
     /** Archive-relative asset path, for diagnostics. */
     asset: string;

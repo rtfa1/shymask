@@ -6,6 +6,7 @@
  *   fixtures/packages/rose-visor.zip     valid: mask-only GLB with nonzero attachment
  *   fixtures/packages/verdant-tint.zip   valid: declarative color treatment only
  *   fixtures/packages/face-distortion.zip valid (schema v2): bounded face distortion only
+ *   fixtures/packages/reactive-ears.zip  valid (schema v3): mask with spring-driven ears + tuft
  *   fixtures/packages/negative/*.zip     invalid packages for public-workflow codes
  *
  * The negative fixtures cover the public-workflow rejection cases; the unit
@@ -184,66 +185,104 @@ function boxGeometry(boxes) {
 }
 
 /**
- * @param {{boxes: number[][], colorSrgb: [number, number, number], document?: object, mutateDocument?: (document: object) => void, embedBin?: boolean}} options
+ * @param {{boxes?: number[][], colorSrgb?: [number, number, number], document?: object, mutateDocument?: (document: object) => void, embedBin?: boolean, parts?: {name: string, boxes: number[][], colorSrgb: [number, number, number], translation?: number[], rotation?: number[]}[]}} options
  */
-function buildGlb({ boxes, colorSrgb, document = {}, mutateDocument, embedBin = true }) {
-  const geometry = boxGeometry(boxes);
-  const positionBytes = geometry.positions.length * 4;
-  const indexBytes = geometry.indices.length * 2;
-  const binLength = positionBytes + indexBytes;
-  const bin = Buffer.alloc(binLength);
-  geometry.positions.forEach((value, index) => bin.writeFloatLE(value, index * 4));
-  geometry.indices.forEach((value, index) => bin.writeUInt16LE(value, positionBytes + index * 2));
+function buildGlb({ boxes, colorSrgb, document = {}, mutateDocument, embedBin = true, parts = null }) {
+  const partDefs =
+    parts ??
+    [
+      {
+        name: 'GuardVisor',
+        boxes: boxes ?? [],
+        colorSrgb: colorSrgb ?? [255, 255, 255],
+        translation: null,
+        rotation: null,
+      },
+    ];
+  const chunkBuffers = [];
+  const accessors = [];
+  const bufferViews = [];
+  const materials = [];
+  const meshes = [];
+  const nodes = [];
+  let byteOffset = 0;
+  for (const [index, part] of partDefs.entries()) {
+    const geometry = boxGeometry(part.boxes);
+    const positionBytes = geometry.positions.length * 4;
+    const indexBytes = geometry.indices.length * 2;
+    // POSITION accessors must be 4-byte aligned; index bytes are also 2-byte.
+    const padding = (4 - (byteOffset % 4)) % 4;
+    if (padding > 0) {
+      chunkBuffers.push(Buffer.alloc(padding, 0));
+      byteOffset += padding;
+    }
+    const positionBuffer = Buffer.alloc(positionBytes);
+    geometry.positions.forEach((value, position) => positionBuffer.writeFloatLE(value, position * 4));
+    const indexBuffer = Buffer.alloc(indexBytes);
+    geometry.indices.forEach((value, position) => indexBuffer.writeUInt16LE(value, position * 2));
+    const positionView = bufferViews.length;
+    bufferViews.push({ buffer: 0, byteOffset, byteLength: positionBytes, target: 34962 });
+    byteOffset += positionBytes;
+    const indexView = bufferViews.length;
+    bufferViews.push({ buffer: 0, byteOffset, byteLength: indexBytes, target: 34963 });
+    byteOffset += indexBytes;
+    chunkBuffers.push(positionBuffer, indexBuffer);
+
+    accessors.push({
+      bufferView: positionView,
+      componentType: 5126,
+      count: geometry.positions.length / 3,
+      type: 'VEC3',
+      min: geometry.min,
+      max: geometry.max,
+    });
+    accessors.push({
+      bufferView: indexView,
+      componentType: 5123,
+      count: geometry.indices.length,
+      type: 'SCALAR',
+    });
+    const materialIndex = materials.length;
+    materials.push({
+      name: `${part.name}Unlit`,
+      doubleSided: false,
+      pbrMetallicRoughness: {
+        baseColorFactor: [
+          SRGB_TO_LINEAR(part.colorSrgb[0]),
+          SRGB_TO_LINEAR(part.colorSrgb[1]),
+          SRGB_TO_LINEAR(part.colorSrgb[2]),
+          1,
+        ],
+        metallicFactor: 0,
+        roughnessFactor: 1,
+      },
+      extensions: { KHR_materials_unlit: {} },
+    });
+    const meshIndex = meshes.length;
+    meshes.push({
+      name: part.name,
+      primitives: [{ attributes: { POSITION: accessors.length - 2 }, indices: accessors.length - 1, material: materialIndex, mode: 4 }],
+    });
+    nodes.push({
+      mesh: meshIndex,
+      name: part.name,
+      ...(part.translation ? { translation: part.translation } : {}),
+      ...(part.rotation ? { rotation: part.rotation } : {}),
+    });
+  }
+  const bin = Buffer.concat(chunkBuffers);
+  const binLength = bin.length;
 
   const gltf = {
     asset: { version: '2.0', generator: 'shymask scripts/build-package-fixtures.mjs' },
     scene: 0,
-    scenes: [{ nodes: [0] }],
-    nodes: [{ mesh: 0, name: 'GuardVisor' }],
-    meshes: [
-      {
-        name: 'GuardVisor',
-        primitives: [{ attributes: { POSITION: 0 }, indices: 1, material: 0, mode: 4 }],
-      },
-    ],
-    materials: [
-      {
-        name: 'GuardVisorUnlit',
-        doubleSided: false,
-        pbrMetallicRoughness: {
-          baseColorFactor: [
-            SRGB_TO_LINEAR(colorSrgb[0]),
-            SRGB_TO_LINEAR(colorSrgb[1]),
-            SRGB_TO_LINEAR(colorSrgb[2]),
-            1,
-          ],
-          metallicFactor: 0,
-          roughnessFactor: 1,
-        },
-        extensions: { KHR_materials_unlit: {} },
-      },
-    ],
+    scenes: [{ nodes: nodes.map((_, index) => index) }],
+    nodes,
+    meshes,
+    materials,
     extensionsUsed: ['KHR_materials_unlit'],
-    accessors: [
-      {
-        bufferView: 0,
-        componentType: 5126,
-        count: geometry.positions.length / 3,
-        type: 'VEC3',
-        min: geometry.min,
-        max: geometry.max,
-      },
-      {
-        bufferView: 1,
-        componentType: 5123,
-        count: geometry.indices.length,
-        type: 'SCALAR',
-      },
-    ],
-    bufferViews: [
-      { buffer: 0, byteOffset: 0, byteLength: positionBytes, target: 34962 },
-      { buffer: 0, byteOffset: positionBytes, byteLength: indexBytes, target: 34963 },
-    ],
+    accessors,
+    bufferViews,
     buffers: embedBin ? [{ byteLength: binLength }] : [{ uri: 'mask.bin', byteLength: binLength }],
   };
 
@@ -303,6 +342,25 @@ const GUARD_VISOR_BOXES = [
 const GUARD_VISOR_COLOR = [225, 29, 154];
 /** Second mask sample uses a different exact colour and a nonzero attachment. */
 const ROSE_VISOR_COLOR = [32, 196, 128];
+/** Third mask sample (secondary motion) uses another distinct unlit colour. */
+const REACTIVE_EARS_COLOR = [150, 90, 240];
+
+/**
+ * Schema v3 sample: two ears driven by tracked yaw and a hair tuft driven by
+ * tracked pitch. Each part is its own GLB node whose origin is the pivot; the
+ * geometry is authored around that pivot so a local-axis rotation swings it.
+ */
+const REACTIVE_EAR_LEFT_BOXES = [
+  [-3.0, 0, 0, 6.0, 2.8, 1.6],
+  [-5.0, 1.2, 0, 1.6, 5.2, 1.4],
+  [-4.0, -2.2, 0, 2.4, 2.4, 1.4],
+];
+const REACTIVE_EAR_RIGHT_BOXES = REACTIVE_EAR_LEFT_BOXES.map(([x, y, z, sx, sy, sz]) => [-x, y, z, sx, sy, sz]);
+const REACTIVE_TUFT_BOXES = [
+  [0, 2.5, 0, 2.6, 5.0, 2.2],
+  [0, 6.0, 0, 4.6, 2.2, 2.8],
+  [0, 8.2, 0, 2.0, 2.2, 2.0],
+];
 
 const guardVisorManifest = {
   schemaVersion: 1,
@@ -376,6 +434,31 @@ function manifestBytes(manifest) {
   return strToU8(`${JSON.stringify(manifest, null, 2)}\n`);
 }
 
+const reactiveEarsManifest = {
+  schemaVersion: 3,
+  id: 'shymask.reactive-ears',
+  name: 'Reactive ears',
+  version: '1.0.0',
+  description:
+    'Unlit visor with two spring-driven ears that react to tracked yaw and a hair tuft that reacts to tracked pitch.',
+  author: {
+    name: 'Shymask sample author',
+    attribution: 'Generated reproducibly by scripts/build-package-fixtures.mjs',
+    license: 'CC0-1.0',
+  },
+  mask: {
+    asset: 'assets/reactive-ears.glb',
+    attachment: { position: [0, 0, 0], rotationDeg: [0, 0, 0], scale: 1 },
+  },
+  secondaryMotion: {
+    parts: [
+      { node: 'ear-left', axis: 'y', drive: 'yaw', stiffness: 60, damping: 0.3, maxAngleDeg: 32, restAngleDeg: 0 },
+      { node: 'ear-right', axis: 'y', drive: 'yaw', stiffness: 60, damping: 0.3, maxAngleDeg: 32, restAngleDeg: 0 },
+      { node: 'hair-tuft', axis: 'x', drive: 'pitch', stiffness: 45, damping: 0.25, maxAngleDeg: 35, restAngleDeg: 0 },
+    ],
+  },
+};
+
 function writePackage(fileName, files) {
   const target = path.join(outputDir, fileName);
   const archive = writeDeflatedZip(files);
@@ -429,6 +512,37 @@ function roseMaskGlb() {
   return buildGlb({ boxes: GUARD_VISOR_BOXES, colorSrgb: ROSE_VISOR_COLOR });
 }
 
+/**
+ * Multi-node mask for the secondary-motion sample. The visor is the main body;
+ * each movable part is a separate node whose translation is the pivot and whose
+ * mesh geometry is authored relative to that pivot.
+ */
+function reactiveEarsMaskGlb() {
+  return buildGlb({
+    parts: [
+      { name: 'visor', boxes: GUARD_VISOR_BOXES, colorSrgb: REACTIVE_EARS_COLOR },
+      {
+        name: 'ear-left',
+        boxes: REACTIVE_EAR_LEFT_BOXES,
+        colorSrgb: REACTIVE_EARS_COLOR,
+        translation: [-9.6, 0.5, 0],
+      },
+      {
+        name: 'ear-right',
+        boxes: REACTIVE_EAR_RIGHT_BOXES,
+        colorSrgb: REACTIVE_EARS_COLOR,
+        translation: [9.6, 0.5, 0],
+      },
+      {
+        name: 'hair-tuft',
+        boxes: REACTIVE_TUFT_BOXES,
+        colorSrgb: REACTIVE_EARS_COLOR,
+        translation: [0, 8.5, 0.5],
+      },
+    ],
+  });
+}
+
 function mutateManifest(base, mutate) {
   const manifest = JSON.parse(JSON.stringify(base));
   mutate(manifest);
@@ -455,6 +569,10 @@ function main() {
   writePackage('face-distortion.zip', {
     'manifest.json': manifestBytes(faceDistortionManifest),
   });
+  writePackage('reactive-ears.zip', {
+    'manifest.json': manifestBytes(reactiveEarsManifest),
+    'assets/reactive-ears.glb': reactiveEarsMaskGlb(),
+  });
 
   // Required negative fixtures: malformed JSON, unsupported schemaVersion,
   // unsupported behavior, missing asset, invalid color parameters, zip-slip,
@@ -463,9 +581,9 @@ function main() {
     'manifest.json': strToU8('{ "schemaVersion": 1, this is not valid JSON'),
     'assets/guard-visor.glb': glb,
   });
-  writeNegative('schema-version-3', {
+  writeNegative('schema-version-4', {
     'manifest.json': mutateManifest(guardVisorManifest, (manifest) => {
-      manifest.schemaVersion = 3;
+      manifest.schemaVersion = 4;
     }),
     'assets/guard-visor.glb': glb,
   });
@@ -489,6 +607,49 @@ function main() {
   writeNegative('distortion-unknown-field', {
     'manifest.json': mutateManifest(faceDistortionManifest, (manifest) => {
       manifest.faceDistortion.swirl = 1;
+    }),
+  });
+  // secondaryMotion is a v3 capability. A v2 manifest declaring it must be
+  // rejected, not imported as a rigid mask whose declared parts never move.
+  writeNegative('secondary-motion-schema-v2', {
+    'manifest.json': mutateManifest(reactiveEarsManifest, (manifest) => {
+      manifest.schemaVersion = 2;
+    }),
+    'assets/reactive-ears.glb': reactiveEarsMaskGlb(),
+  });
+  writeNegative('secondary-motion-invalid-axis', {
+    'manifest.json': mutateManifest(reactiveEarsManifest, (manifest) => {
+      manifest.secondaryMotion.parts[0].axis = 'w';
+    }),
+    'assets/reactive-ears.glb': reactiveEarsMaskGlb(),
+  });
+  writeNegative('secondary-motion-unknown-node', {
+    'manifest.json': mutateManifest(reactiveEarsManifest, (manifest) => {
+      manifest.secondaryMotion.parts[0].node = 'left-ear';
+    }),
+    'assets/reactive-ears.glb': reactiveEarsMaskGlb(),
+  });
+  writeNegative('secondary-motion-out-of-range', {
+    'manifest.json': mutateManifest(reactiveEarsManifest, (manifest) => {
+      manifest.secondaryMotion.parts[0].stiffness = 4000;
+    }),
+    'assets/reactive-ears.glb': reactiveEarsMaskGlb(),
+  });
+  writeNegative('secondary-motion-unknown-field', {
+    'manifest.json': mutateManifest(reactiveEarsManifest, (manifest) => {
+      manifest.secondaryMotion.parts[0].gravity = 1;
+    }),
+    'assets/reactive-ears.glb': reactiveEarsMaskGlb(),
+  });
+  writeNegative('secondary-motion-rest-beyond-max', {
+    'manifest.json': mutateManifest(reactiveEarsManifest, (manifest) => {
+      manifest.secondaryMotion.parts[0].restAngleDeg = 40;
+    }),
+    'assets/reactive-ears.glb': reactiveEarsMaskGlb(),
+  });
+  writeNegative('secondary-motion-without-mask', {
+    'manifest.json': mutateManifest(reactiveEarsManifest, (manifest) => {
+      delete manifest.mask;
     }),
   });
   writeNegative('unsupported-behavior', {

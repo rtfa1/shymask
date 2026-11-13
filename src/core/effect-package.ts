@@ -1,5 +1,5 @@
 /**
- * Pure, unit-testable validation for Shymask effect packages (schema v1/v2).
+ * Pure, unit-testable validation for Shymask effect packages (schema v1/v2/v3).
  *
  * `validateEffectPackage` takes archive bytes and returns either a validated,
  * in-memory package (manifest + declared asset bytes + complexity measurements)
@@ -23,6 +23,10 @@ import {
   PACKAGE_ASSET_PREFIX,
   PACKAGE_MANIFEST_PATH,
   PACKAGE_SAFETY_LIMITS,
+  SECONDARY_MOTION_AXES,
+  SECONDARY_MOTION_DRIVES,
+  SECONDARY_MOTION_LIMITS,
+  SECONDARY_MOTION_SCHEMA_VERSION,
   SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS,
   countDeclaredColorParameters,
   type ColorTreatmentParameters,
@@ -33,6 +37,8 @@ import {
   type MaskAttachment,
   type PackageComplexity,
   type PackageIssue,
+  type SecondaryMotionParameters,
+  type SecondaryMotionPart,
 } from './effect-package-contract';
 import { inspectGlb } from './glb';
 import { readZip, type ZipEntry } from './zip';
@@ -89,6 +95,7 @@ const MANIFEST_KEYS = new Set([
   'mask',
   'colorTreatment',
   'faceDistortion',
+  'secondaryMotion',
   'expressionReactions',
   'behaviors',
 ]);
@@ -96,7 +103,18 @@ const AUTHOR_KEYS = new Set(['name', 'attribution', 'license', 'url']);
 const MASK_KEYS = new Set(['asset', 'attachment']);
 const ATTACHMENT_KEYS = new Set(['position', 'rotationDeg', 'scale']);
 const FACE_DISTORTION_KEYS = new Set(['mode', 'strength', 'radiusScale', 'centerOffset']);
+const SECONDARY_MOTION_KEYS = new Set(['parts']);
+const SECONDARY_MOTION_PART_KEYS = new Set([
+  'node',
+  'axis',
+  'drive',
+  'stiffness',
+  'damping',
+  'maxAngleDeg',
+  'restAngleDeg',
+]);
 const ASSET_PATH_PATTERN = /^assets\/[A-Za-z0-9][A-Za-z0-9._-]*\.glb$/;
+const SECONDARY_MOTION_NODE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const PACKAGE_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{1,62}$/;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
 
@@ -460,6 +478,160 @@ function readVec2(
   return [numbers[0] as number, numbers[1] as number];
 }
 
+function validateSecondaryMotion(
+  value: unknown,
+  hasMask: boolean,
+): { secondaryMotion: SecondaryMotionParameters | null; issues: PackageIssue[] } {
+  const issues: PackageIssue[] = [];
+  const fail = (message: string, path: string): void => {
+    issues.push(error('secondary-motion-invalid', message, path));
+  };
+  if (!isRecord(value)) {
+    fail(
+      'manifest secondaryMotion must be an object with a parts array of named mask nodes and bounded spring parameters.',
+      'secondaryMotion',
+    );
+    return { secondaryMotion: null, issues };
+  }
+  for (const key of Object.keys(value)) {
+    if (!SECONDARY_MOTION_KEYS.has(key)) {
+      fail(
+        `Unknown secondaryMotion field "${key}". Supported fields: parts.`,
+        `secondaryMotion.${key}`,
+      );
+    }
+  }
+  const rawParts = value.parts;
+  if (!Array.isArray(rawParts)) {
+    fail('secondaryMotion.parts must be an array of 1-4 movable part declarations.', 'secondaryMotion.parts');
+    return { secondaryMotion: null, issues };
+  }
+  if (rawParts.length < 1 || rawParts.length > SECONDARY_MOTION_LIMITS.maxParts) {
+    fail(
+      `secondaryMotion.parts must declare between 1 and ${SECONDARY_MOTION_LIMITS.maxParts} parts; got ${rawParts.length}.`,
+      'secondaryMotion.parts',
+    );
+  }
+  if (!hasMask) {
+    fail(
+      'secondaryMotion requires a "mask" component: movable parts are named nodes of the package mask GLB.',
+      'secondaryMotion',
+    );
+  }
+  const seenNodes = new Set<string>();
+  const parts: SecondaryMotionPart[] = [];
+  for (const [index, rawPart] of rawParts.entries()) {
+    const field = `secondaryMotion.parts[${index}]`;
+    if (!isRecord(rawPart)) {
+      fail(`${field} must be an object with node, axis, drive, stiffness, damping and maxAngleDeg.`, field);
+      continue;
+    }
+    for (const key of Object.keys(rawPart)) {
+      if (!SECONDARY_MOTION_PART_KEYS.has(key)) {
+        fail(
+          `Unknown ${field} field "${key}". Supported fields: node, axis, drive, stiffness, damping, maxAngleDeg, restAngleDeg.`,
+          `${field}.${key}`,
+        );
+      }
+    }
+    const node = rawPart.node;
+    if (
+      typeof node !== 'string' ||
+      node.length > SECONDARY_MOTION_LIMITS.maxNodeNameLength ||
+      !SECONDARY_MOTION_NODE_PATTERN.test(node)
+    ) {
+      fail(
+        `${field}.node must be a mask GLB node name of 1-${SECONDARY_MOTION_LIMITS.maxNodeNameLength} characters: an ASCII letter or digit first, then only letters, digits, "_" or "-"; got ${JSON.stringify(node)}.`,
+        `${field}.node`,
+      );
+    } else if (seenNodes.has(node)) {
+      fail(`${field}.node "${node}" is declared more than once; each movable part needs a distinct node.`, `${field}.node`);
+    } else {
+      seenNodes.add(node);
+    }
+    const axis = rawPart.axis;
+    if (typeof axis !== 'string' || !(SECONDARY_MOTION_AXES as readonly string[]).includes(axis)) {
+      fail(
+        `${field}.axis must be one of ${SECONDARY_MOTION_AXES.map((entry) => `"${entry}"`).join(', ')}; got ${JSON.stringify(axis)}.`,
+        `${field}.axis`,
+      );
+    }
+    const drive = rawPart.drive;
+    if (typeof drive !== 'string' || !(SECONDARY_MOTION_DRIVES as readonly string[]).includes(drive)) {
+      fail(
+        `${field}.drive must be one of ${SECONDARY_MOTION_DRIVES.map((entry) => `"${entry}"`).join(', ')} (the tracked head rotation that drives the part); got ${JSON.stringify(drive)}.`,
+        `${field}.drive`,
+      );
+    }
+    const boundedNumber = (
+      raw: unknown,
+      name: string,
+      minimum: number,
+      maximum: number,
+      defaultValue?: number,
+    ): number => {
+      if (raw === undefined && defaultValue !== undefined) return defaultValue;
+      if (!isFiniteNumber(raw) || raw < minimum || raw > maximum) {
+        fail(
+          `${field}.${name} must be a finite number between ${minimum} and ${maximum}; got ${JSON.stringify(raw)}.`,
+          `${field}.${name}`,
+        );
+        return defaultValue ?? minimum;
+      }
+      return raw;
+    };
+    const stiffness = boundedNumber(
+      rawPart.stiffness,
+      'stiffness',
+      SECONDARY_MOTION_LIMITS.minStiffness,
+      SECONDARY_MOTION_LIMITS.maxStiffness,
+    );
+    const damping = boundedNumber(
+      rawPart.damping,
+      'damping',
+      SECONDARY_MOTION_LIMITS.minDampingRatio,
+      SECONDARY_MOTION_LIMITS.maxDampingRatio,
+    );
+    const maxAngleDeg = boundedNumber(
+      rawPart.maxAngleDeg,
+      'maxAngleDeg',
+      SECONDARY_MOTION_LIMITS.minMaxAngleDeg,
+      SECONDARY_MOTION_LIMITS.maxMaxAngleDeg,
+    );
+    const restAngleDeg = boundedNumber(
+      rawPart.restAngleDeg,
+      'restAngleDeg',
+      -SECONDARY_MOTION_LIMITS.maxRestAngleDeg,
+      SECONDARY_MOTION_LIMITS.maxRestAngleDeg,
+      0,
+    );
+    if (Math.abs(restAngleDeg) > maxAngleDeg) {
+      fail(
+        `${field}.restAngleDeg must be within the declared maxAngleDeg (${maxAngleDeg}); got ${restAngleDeg}.`,
+        `${field}.restAngleDeg`,
+      );
+    }
+    if (
+      typeof node === 'string' &&
+      SECONDARY_MOTION_NODE_PATTERN.test(node) &&
+      typeof axis === 'string' &&
+      typeof drive === 'string'
+    ) {
+      parts.push({
+        node,
+        axis: axis as SecondaryMotionParameters['parts'][number]['axis'],
+        drive: drive as SecondaryMotionParameters['parts'][number]['drive'],
+        stiffness,
+        damping,
+        maxAngleDeg,
+        restAngleDeg,
+      });
+    }
+  }
+  if (issues.length > 0) return { secondaryMotion: null, issues };
+  return { secondaryMotion: { parts }, issues };
+}
+
 function validateMask(value: unknown): {
   mask: { asset: string; attachment: MaskAttachment } | null;
   issues: PackageIssue[];
@@ -560,7 +732,7 @@ function validateManifestObject(value: unknown, issues: PackageIssue[], warnings
     issues.push(
       error(
         'schema-version-unsupported',
-        `schemaVersion ${JSON.stringify(value.schemaVersion)} is not supported. This build reads effect package schema versions ${SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS.join(' and ')}.`,
+        `schemaVersion ${JSON.stringify(value.schemaVersion)} is not supported. This build reads effect package schema versions ${describeSchemaVersions()}.`,
         'schemaVersion',
       ),
     );
@@ -574,6 +746,17 @@ function validateManifestObject(value: unknown, issues: PackageIssue[], warnings
         'schema-version-unsupported',
         `faceDistortion requires schemaVersion ${FACE_DISTORTION_SCHEMA_VERSION}; this manifest declares schemaVersion ${schemaVersion}. Raise schemaVersion or remove the distortion declaration.`,
         'faceDistortion',
+      ),
+    );
+  }
+  // Likewise, a lower-version build would ignore secondary motion and render a
+  // rigid mask, so the declaration requires the version that understands it.
+  if (value.secondaryMotion !== undefined && schemaVersion !== null && schemaVersion < SECONDARY_MOTION_SCHEMA_VERSION) {
+    issues.push(
+      error(
+        'schema-version-unsupported',
+        `secondaryMotion requires schemaVersion ${SECONDARY_MOTION_SCHEMA_VERSION}; this manifest declares schemaVersion ${schemaVersion}. Raise schemaVersion or remove the moving-part declaration.`,
+        'secondaryMotion',
       ),
     );
   }
@@ -639,6 +822,16 @@ function validateManifestObject(value: unknown, issues: PackageIssue[], warnings
     issues.push(...parsed.issues);
     distortion = parsed.distortion;
   }
+  let secondaryMotion: SecondaryMotionParameters | null = null;
+  if (
+    value.secondaryMotion !== undefined &&
+    schemaVersion !== null &&
+    schemaVersion >= SECONDARY_MOTION_SCHEMA_VERSION
+  ) {
+    const parsed = validateSecondaryMotion(value.secondaryMotion, mask !== null);
+    issues.push(...parsed.issues);
+    secondaryMotion = parsed.secondaryMotion;
+  }
   if (value.mask === undefined && value.colorTreatment === undefined && value.faceDistortion === undefined) {
     issues.push(
       error(
@@ -659,7 +852,14 @@ function validateManifestObject(value: unknown, issues: PackageIssue[], warnings
     ...(mask ? { mask: { asset: mask.asset, attachment: mask.attachment } } : {}),
     ...(treatment ? { colorTreatment: treatment } : {}),
     ...(distortion ? { faceDistortion: distortion } : {}),
+    ...(secondaryMotion ? { secondaryMotion } : {}),
   };
+}
+
+function describeSchemaVersions(): string {
+  const versions = SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS;
+  if (versions.length <= 1) return versions.join('');
+  return `${versions.slice(0, -1).join(', ')} and ${versions[versions.length - 1]}`;
 }
 
 export function validateEffectPackage(bytes: Uint8Array): EffectPackageValidation {
@@ -763,6 +963,23 @@ export function validateEffectPackage(bytes: Uint8Array): EffectPackageValidatio
         materials = glb.summary.materials;
         nodes = glb.summary.nodes;
         textures = glb.summary.textures;
+        // A declared movable part must resolve to exactly one named GLB node.
+        // Checking it here (not at selection) keeps a typo an import error with
+        // an actionable message instead of an unanimated mask at runtime.
+        if (manifest.secondaryMotion) {
+          for (const [partIndex, part] of manifest.secondaryMotion.parts.entries()) {
+            const matches = glb.summary.nodeNames.filter((name) => name === part.node).length;
+            if (matches !== 1) {
+              errors.push(
+                error(
+                  'secondary-motion-invalid',
+                  `secondaryMotion.parts[${partIndex}].node "${part.node}" must name exactly one node in the mask GLB "${asset.name}"; found ${matches}. Rename the part or the GLB node.`,
+                  `secondaryMotion.parts[${partIndex}].node`,
+                ),
+              );
+            }
+          }
+        }
       }
     }
   }
@@ -792,6 +1009,7 @@ export function validateEffectPackage(bytes: Uint8Array): EffectPackageValidatio
     declaredBehaviors,
     colorParameters: manifest.colorTreatment ? countDeclaredColorParameters(manifest.colorTreatment) : 0,
     distortionParameters: manifest.faceDistortion ? 1 : 0,
+    movingParts: manifest.secondaryMotion ? manifest.secondaryMotion.parts.length : 0,
   };
   return { ok: true, package: { manifest, assets, complexity, warnings } };
 }
