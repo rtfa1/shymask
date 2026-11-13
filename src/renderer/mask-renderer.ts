@@ -3,6 +3,11 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import type { MaskAttachment } from '../core/effect-package-contract';
 import { maskAttachmentTransform } from '../core/mask-attachment';
 import { poseFromColumnMajorMatrix, type TrackingPose } from '../core/tracking';
+import {
+  CANONICAL_FACE_INDICES,
+  CANONICAL_FACE_POSITIONS,
+  CANONICAL_FACE_TRIANGLE_COUNT,
+} from './canonical-face';
 
 /**
  * Rigid 3D mask renderer for both the bundled procedural mask and imported
@@ -15,6 +20,14 @@ import { poseFromColumnMajorMatrix, type TrackingPose } from '../core/tracking';
  * the mask is bundled or loaded from a validated package GLB. Package masks are
  * loaded with Three.js GLTFLoader into this same scene, with the manifest's
  * declarative attachment applied; no package code is executed.
+ *
+ * Face occlusion is a depth-only mesh of the same 468-vertex canonical face
+ * surface MediaPipe fits when it produces the transformation matrix. It is
+ * attached to the same matrix as the mask, renders first, writes depth and not
+ * colour, so mask fragments behind the reconstructed face fail the depth test
+ * and the underlying video (the real face) shows through. This is real tracked
+ * geometry, not a screen-space mask-shape heuristic, and it applies to bundled
+ * and imported mask content because both live under the same group.
  *
  * The camera uses MediaPipe's documented 63 degree vertical field-of-view
  * assumption (the same assumption face_geometry uses for the transformation
@@ -87,6 +100,9 @@ type ProbeKind = 'eye' | 'material' | 'none';
 
 export class MaskRenderer {
   readonly canvas: HTMLCanvasElement;
+  /** Static description of the depth-only occluder, for diagnostics. */
+  readonly occluderTriangles = CANONICAL_FACE_TRIANGLE_COUNT;
+  readonly occluderVertices = CANONICAL_FACE_POSITIONS.length / 3;
   private readonly renderer: THREE.WebGLRenderer;
   private readonly scene: THREE.Scene;
   private readonly camera: THREE.PerspectiveCamera;
@@ -96,6 +112,9 @@ export class MaskRenderer {
   private readonly content: THREE.Group;
   /** Built once; removed/re-added by reference so a switch never rebuilds it. */
   private readonly bundled: THREE.Group;
+  /** Depth-only canonical face mesh; hides mask fragments behind the face. */
+  private readonly occluder: THREE.Mesh;
+  private occluderEnabled = true;
   private visible = false;
   private probeKind: ProbeKind = 'eye';
   private materialProbeColor: { r: number; g: number; b: number } | null = null;
@@ -138,8 +157,47 @@ export class MaskRenderer {
     this.content.add(this.bundled);
     this.probeKind = 'eye';
     this.materialProbeColor = null;
+    this.occluder = this.buildFaceOccluder();
+    // The depth-only face renders before the mask content in the same group, so
+    // its depth is already in the buffer when mask fragments are depth-tested.
+    this.group.add(this.occluder);
     this.group.add(this.content);
     this.scene.add(this.group);
+  }
+
+  /**
+   * Builds the invisible depth-only face mesh from the canonical MediaPipe face
+   * model. `colorWrite: false` means it contributes only depth; `DoubleSide` is
+   * deliberate because the canonical surface is open and winding is less
+   * important than reliably writing the nearest face surface.
+   */
+  private buildFaceOccluder(): THREE.Mesh {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute([...CANONICAL_FACE_POSITIONS], 3));
+    geometry.setIndex([...CANONICAL_FACE_INDICES]);
+    geometry.computeVertexNormals();
+    geometry.computeBoundingSphere();
+    const material = new THREE.MeshBasicMaterial({
+      colorWrite: false,
+      depthWrite: true,
+      depthTest: true,
+      side: THREE.DoubleSide,
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.name = 'face-occluder';
+    mesh.renderOrder = -1;
+    mesh.visible = this.occluderEnabled;
+    return mesh;
+  }
+
+  /** Enables/disables the depth-only face occluder (diagnostic comparison). */
+  setOcclusionEnabled(enabled: boolean): void {
+    this.occluderEnabled = enabled;
+    this.occluder.visible = enabled;
+  }
+
+  get occlusionEnabled(): boolean {
+    return this.occluderEnabled;
   }
 
   /** Restores the bundled procedural mask (used when switching back to it). */
@@ -297,6 +355,8 @@ export class MaskRenderer {
     this.disposed = true;
     this.disposeContent();
     this.disposeObjectResources(this.bundled);
+    this.occluder.geometry.dispose();
+    (this.occluder.material as THREE.Material).dispose();
     this.visible = false;
     this.group.visible = false;
     this.scene.clear();
@@ -351,8 +411,10 @@ export class MaskRenderer {
     this.camera.updateMatrixWorld(true);
 
     // Box3.setFromObject returns a world-space box (it applies matrixWorld), so
-    // the corners must not be transformed a second time.
-    const box = new THREE.Box3().setFromObject(this.group);
+    // the corners must not be transformed a second time. Only the mask content
+    // is measured: the depth-only face occluder is not part of the mask's
+    // reported bounds or probe.
+    const box = new THREE.Box3().setFromObject(this.content);
     let minX = Number.POSITIVE_INFINITY;
     let minY = Number.POSITIVE_INFINITY;
     let maxX = Number.NEGATIVE_INFINITY;
@@ -404,6 +466,21 @@ export class MaskRenderer {
     const startedAt = performance.now();
     this.renderer.render(this.scene, this.camera);
     return performance.now() - startedAt;
+  }
+
+  /**
+   * Projects the origin of a raw tracker matrix without changing the rendered
+   * scene. Smoothing evidence compares this raw origin with the rendered mask
+   * origin to measure the offset the filter introduced.
+   */
+  projectMatrixOrigin(matrix: ArrayLike<number>): { x: number; y: number } | null {
+    if (matrix.length < 16) return null;
+    const world = new THREE.Vector3(
+      matrix[12] as number,
+      matrix[13] as number,
+      matrix[14] as number,
+    );
+    return this.project(world);
   }
 
   private project(world: THREE.Vector3): { x: number; y: number } {

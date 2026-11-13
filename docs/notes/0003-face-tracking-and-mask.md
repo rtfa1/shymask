@@ -6,6 +6,11 @@ tracking slice. It is deliberately scoped to recorded video: no physical camera
 or human participant is used, and the numbers below are not a performance-target
 claim.
 
+Issue #6 later adds face-based occlusion and bounded pose smoothing on top of
+this slice without changing the tracker or output policy; see
+[note 0005](0005-face-occlusion-and-anchoring.md) for that method, its measured
+trade-offs and its limitations.
+
 ## What was built
 
 - **One tracked face.** The renderer runs MediaPipe Face Landmarker in VIDEO mode
@@ -186,8 +191,9 @@ cameras, call applications and live-human acceptance remain later slices.
 
 - The recorded fixtures are replay only; no physical-camera or live-human
   tracking evidence exists in this slice.
-- The mask is rigid and has no occlusion refinement or secondary motion; those
-  are issues #6 and later.
+- The mask is rigid and, in this slice, has no occlusion refinement or secondary
+  motion. Issue #6 adds the depth-only face occluder and bounded anchoring
+  smoother; secondary motion remains later work.
 - Multiple faces are exercised by a labelled diagnostic injection in the
   public-workflow check. The real detector is configured with `numFaces: 2`, and
   the policy is the same one the injection drives, but real two-person footage is

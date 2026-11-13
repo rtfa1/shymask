@@ -24,11 +24,17 @@ import {
   type PreviewState,
 } from '../core/output-policy';
 import { PreviewPipeline, type FrameStats } from '../core/pipeline';
+import {
+  POSE_SMOOTHING_LIMITS,
+  PoseSmoother,
+  type PoseFilterStats,
+} from '../core/pose-smoothing';
 import { ReplayTimeline, type ReplayFrameTimestamp } from '../core/replay-clock';
 import { SwitchGeneration } from '../core/switch-generation';
 import {
   acceptsDetectedPose,
   initialTrackingSnapshot,
+  poseFromColumnMajorMatrix,
   TrackingStateMachine,
   TRACKING_LIMITS,
   type TrackingSample,
@@ -53,6 +59,14 @@ const INJECTION_OPTIONS: ReadonlyArray<{ id: TrackingInjection; label: string }>
   { id: 'lost', label: 'Inject tracking lost (diagnostic)' },
   { id: 'multiple', label: 'Inject multiple faces (diagnostic)' },
   { id: 'unreliable', label: 'Inject unreliable tracking (diagnostic)' },
+];
+
+/** Diagnostic pose-smoothing modes; normal output uses the bounded smoother. */
+type PoseSmoothingMode = 'smoothed' | 'raw';
+
+const POSE_SMOOTHING_OPTIONS: ReadonlyArray<{ id: PoseSmoothingMode; label: string }> = [
+  { id: 'smoothed', label: 'Bounded smoothing (normal)' },
+  { id: 'raw', label: 'Raw tracker pose (diagnostic)' },
 ];
 
 const EMPTY_MASK_PROJECTION: MaskProjection = {
@@ -83,9 +97,12 @@ const importPackageButton = mustGet<HTMLButtonElement>('import-package');
 const removePackageButton = mustGet<HTMLButtonElement>('remove-package');
 const packageResult = mustGet<HTMLParagraphElement>('package-result');
 const injectionSelect = mustGet<HTMLSelectElement>('tracking-injection');
+const poseSmoothingSelect = mustGet<HTMLSelectElement>('pose-smoothing');
+const occlusionToggle = mustGet<HTMLInputElement>('occlusion-toggle');
 const recheckButton = mustGet<HTMLButtonElement>('recheck');
 const captureButton = mustGet<HTMLButtonElement>('capture');
 const failureToggle = mustGet<HTMLInputElement>('simulate-failure');
+const holdFrameToggle = mustGet<HTMLInputElement>('hold-frame');
 const captureResult = mustGet<HTMLParagraphElement>('capture-result');
 const statusPanel = mustGet<HTMLElement>('status-panel');
 const statusTitle = mustGet<HTMLParagraphElement>('status-title');
@@ -131,6 +148,7 @@ const state: PreviewState = {
 let video: HTMLVideoElement | null = null;
 let frameLoopActive = false;
 let failureSimulated = false;
+let replayFrameHeld = false;
 let captureInFlight = false;
 let currentDecision: OutputDecision | null = null;
 let latestTimestamp: ReplayFrameTimestamp | null = null;
@@ -158,7 +176,43 @@ let detectionTimings: number[] = [];
 let detectedFrames = 0;
 let warmupInferenceMs = 0;
 let persistentTrackerError: string | null = null;
+let lastRawPoseMatrix: number[] | null = null;
 let lastPoseMatrix: number[] | null = null;
+let poseSmoothingEnabled = true;
+const poseSmoother = new PoseSmoother();
+
+/**
+ * Rolling per-presented-frame pose stability evidence. Second differences of
+ * the rendered mask origin/orientation measure high-frequency jitter; the
+ * rendered-vs-raw offset measures the lag the smoother introduced. Keeping the
+ * metric in the renderer means every presented frame contributes instead of the
+ * ~10 Hz sampling a public diagnostic reader can achieve.
+ */
+const POSE_METRIC_LIMIT = 180;
+interface RenderedPoseSample {
+  originX: number;
+  originY: number;
+  yaw: number;
+  pitch: number;
+  roll: number;
+}
+let previousRawPose: RenderedPoseSample | null = null;
+let previousPreviousRawPose: RenderedPoseSample | null = null;
+let previousSmoothedPose: RenderedPoseSample | null = null;
+let previousPreviousSmoothedPose: RenderedPoseSample | null = null;
+let previousMetricAtMs: number | null = null;
+let metricFrameIntervals: number[] = [];
+let metricRawOriginJitterPx: number[] = [];
+let metricSmoothedOriginJitterPx: number[] = [];
+let metricRawRotationJitterDeg: number[] = [];
+let metricSmoothedRotationJitterDeg: number[] = [];
+let metricOriginLagPx: number[] = [];
+let metricRotationLagDeg: number[] = [];
+let metricRampLagMs: number[] = [];
+let metricSmoothingCostMs: number[] = [];
+let metricAlpha: number[] = [];
+let metricSnaps = 0;
+let metricFrames = 0;
 
 // Effect packages: validated descriptors only. The renderer never sees archive
 // bytes or executable content; package mask assets are fetched as .glb.
@@ -187,6 +241,7 @@ statusTitle.textContent = PAUSED_TITLE;
 
 buildEffectOptions();
 buildInjectionOptions();
+buildPoseSmoothingOptions();
 bindControls();
 updateStaticDiagnostics();
 void refreshVirtualCamera();
@@ -302,6 +357,17 @@ function buildInjectionOptions(): void {
   injectionSelect.value = trackingInjection;
 }
 
+function buildPoseSmoothingOptions(): void {
+  for (const option of POSE_SMOOTHING_OPTIONS) {
+    const element = document.createElement('option');
+    element.value = option.id;
+    element.textContent = option.label;
+    poseSmoothingSelect.appendChild(element);
+  }
+  poseSmoothingSelect.value = poseSmoothingEnabled ? 'smoothed' : 'raw';
+  occlusionToggle.checked = true;
+}
+
 function bindControls(): void {
   startButton.addEventListener('click', () => {
     void startPreview();
@@ -343,6 +409,15 @@ function bindControls(): void {
     state.processingHealthy = !failureSimulated;
     state.processingError = failureSimulated ? SIMULATED_FAILURE_MESSAGE : null;
     renderNow();
+  });
+  holdFrameToggle.addEventListener('change', () => {
+    setReplayFrameHeld(holdFrameToggle.checked);
+  });
+  poseSmoothingSelect.addEventListener('change', () => {
+    setPoseSmoothingEnabled(poseSmoothingSelect.value !== 'raw');
+  });
+  occlusionToggle.addEventListener('change', () => {
+    setOcclusionEnabled(occlusionToggle.checked);
   });
   vcamRestart.addEventListener('click', () => {
     if (!window.shymask) return;
@@ -592,6 +667,8 @@ async function initializeTracker(info: TrackerInfo): Promise<void> {
     // A retry must not leave a previous WebGL renderer/scene alive.
     disposeMaskRenderer();
     maskRenderer = new MaskRenderer(pipeline.width, pipeline.height);
+    maskRenderer.setOcclusionEnabled(occlusionToggle.checked);
+    resetPoseTrackingState();
     trackerReady = true;
     tracking.reset(performance.now());
     state.tracking = tracking.snapshot(performance.now());
@@ -720,6 +797,8 @@ function applyFixture(fixture: FixtureInfo): void {
   // state. A recheck must not leave a stale simulated-failure pause behind.
   failureSimulated = false;
   failureToggle.checked = false;
+  replayFrameHeld = false;
+  holdFrameToggle.checked = false;
   state.processingHealthy = true;
   state.processingError = null;
   trackingInjection = 'auto';
@@ -729,6 +808,7 @@ function applyFixture(fixture: FixtureInfo): void {
   lastDetection = null;
   lastPoseMatrix = null;
   lastMaskProjection = EMPTY_MASK_PROJECTION;
+  resetPoseTrackingState();
   detectionErrors = 0;
   detectionTimings = [];
   detectedFrames = 0;
@@ -805,6 +885,13 @@ function disposeVideo(): void {
   element.remove();
 }
 
+function resetPoseTrackingState(): void {
+  lastRawPoseMatrix = null;
+  lastPoseMatrix = null;
+  poseSmoother.reset();
+  resetPoseMetrics();
+}
+
 /**
  * Releases the mask renderer's geometries/materials/textures and its WebGL
  * context. Called when tracker initialization is retried or the window tears
@@ -817,7 +904,7 @@ function disposeMaskRenderer(): void {
   loadedMaskKey = null;
   maskSummary = null;
   lastMaskProjection = EMPTY_MASK_PROJECTION;
-  lastPoseMatrix = null;
+  resetPoseTrackingState();
 }
 
 async function startPreview(): Promise<void> {
@@ -828,12 +915,15 @@ async function startPreview(): Promise<void> {
   state.started = true;
   state.ready = false;
   state.manualPaused = false;
+  replayFrameHeld = false;
+  holdFrameToggle.checked = false;
   state.processingHealthy = !failureSimulated;
   state.processingError = failureSimulated ? SIMULATED_FAILURE_MESSAGE : null;
   tracking.reset(performance.now());
   state.tracking = tracking.snapshot(performance.now());
   lastMaskProjection = EMPTY_MASK_PROJECTION;
   lastPoseMatrix = null;
+  resetPoseTrackingState();
   detectionErrors = 0;
   detectionTimings = [];
   detectedFrames = 0;
@@ -869,6 +959,13 @@ function subscribeFrameLoop(): void {
   frameLoopActive = true;
   const onFrame = (now: number, metadata: VideoFrameCallbackMetadata): void => {
     if (video !== element || !element.isConnected) {
+      frameLoopActive = false;
+      return;
+    }
+    if (replayFrameHeld) {
+      // A frame callback queued before the Hold control paused the element must
+      // not process one more (possibly seeked) frame after the hold; that would
+      // make a held A/B comparison span two different video frames.
       frameLoopActive = false;
       return;
     }
@@ -987,15 +1084,28 @@ function updateTracking(element: HTMLVideoElement, nowMs: number): void {
     lastDetection = detected;
     sample = detected;
     // Classify/update the state machine before the mask is drawn, then project
-    // the detected pose only for a sample it accepted. A rejected sample (for
+    // the accepted pose only for a sample it accepted. A rejected sample (for
     // example one implausible pose jump) keeps the previous accepted projection
     // through the unreliable confirmation window instead of teleporting the
-    // mask for one frame.
+    // mask for one frame. Smoothing runs on the accepted raw matrix; leaving
+    // tracking resets it so recovery snaps to the reacquired face instead of
+    // trailing a stale pose.
     const snapshot = tracking.update(sample, nowMs, false);
     state.tracking = snapshot;
+    if (snapshot.phase !== 'tracking') {
+      poseSmoother.reset();
+      resetPoseMetrics();
+    }
     if (acceptsDetectedPose(snapshot) && detected.matrix && maskRenderer) {
-      lastPoseMatrix = detected.matrix;
-      lastMaskProjection = maskRenderer.setPose(detected.matrix);
+      lastRawPoseMatrix = detected.matrix.slice(0, 16);
+      // The smoother always runs as a shadow filter so raw and smoothed jitter
+      // can be compared on exactly the same frames; the diagnostic raw mode only
+      // changes which matrix is rendered.
+      const smoothedMatrix = poseSmoother.push(lastRawPoseMatrix, nowMs);
+      const renderedMatrix = poseSmoothingEnabled ? smoothedMatrix : lastRawPoseMatrix;
+      lastPoseMatrix = renderedMatrix;
+      lastMaskProjection = maskRenderer.setPose(renderedMatrix);
+      recordPoseMetrics(lastRawPoseMatrix, smoothedMatrix, nowMs);
     }
   } catch (error) {
     detectionErrors += 1;
@@ -1015,6 +1125,120 @@ function updateTracking(element: HTMLVideoElement, nowMs: number): void {
     };
     state.tracking = tracking.update(sample, nowMs, false);
   }
+}
+
+function pushMetric(values: number[], value: number): number[] {
+  if (!Number.isFinite(value)) return values;
+  const next = values.length >= POSE_METRIC_LIMIT ? values.slice(values.length - (POSE_METRIC_LIMIT - 1)) : values.slice();
+  next.push(value);
+  return next;
+}
+
+function resetPoseMetrics(): void {
+  previousRawPose = null;
+  previousPreviousRawPose = null;
+  previousSmoothedPose = null;
+  previousPreviousSmoothedPose = null;
+  previousMetricAtMs = null;
+  metricFrameIntervals = [];
+  metricRawOriginJitterPx = [];
+  metricSmoothedOriginJitterPx = [];
+  metricRawRotationJitterDeg = [];
+  metricSmoothedRotationJitterDeg = [];
+  metricOriginLagPx = [];
+  metricRotationLagDeg = [];
+  metricRampLagMs = [];
+  metricSmoothingCostMs = [];
+  metricAlpha = [];
+  metricSnaps = 0;
+  metricFrames = 0;
+}
+
+/**
+ * Records one accepted tracker frame together with the shadow-smoothed pose.
+ * Both chains are measured over exactly the same frames, so the public
+ * diagnostics can compare raw and smoothed jitter without run-to-run sampling
+ * differences, and can report the raw-vs-smoothed offset as the added lag.
+ */
+function recordPoseMetrics(rawMatrix: number[], smoothedMatrix: number[], nowMs: number): void {
+  if (!maskRenderer) return;
+  const rawOrigin = maskRenderer.projectMatrixOrigin(rawMatrix);
+  const smoothedOrigin = maskRenderer.projectMatrixOrigin(smoothedMatrix);
+  const rawPose = poseFromColumnMajorMatrix(rawMatrix);
+  const smoothedPose = poseFromColumnMajorMatrix(smoothedMatrix);
+  if (!rawOrigin || !smoothedOrigin || !rawPose || !smoothedPose) return;
+
+  const raw: RenderedPoseSample = {
+    originX: rawOrigin.x,
+    originY: rawOrigin.y,
+    yaw: rawPose.yawDeg,
+    pitch: rawPose.pitchDeg,
+    roll: rawPose.rollDeg,
+  };
+  const smoothed: RenderedPoseSample = {
+    originX: smoothedOrigin.x,
+    originY: smoothedOrigin.y,
+    yaw: smoothedPose.yawDeg,
+    pitch: smoothedPose.pitchDeg,
+    roll: smoothedPose.rollDeg,
+  };
+
+  // A skipped (rejected) sample breaks the frame-to-frame history: starting the
+  // second-difference chain across the gap would report a false jitter spike.
+  if (previousMetricAtMs !== null && nowMs - previousMetricAtMs > 100) {
+    previousRawPose = null;
+    previousPreviousRawPose = null;
+    previousSmoothedPose = null;
+    previousPreviousSmoothedPose = null;
+    metricFrameIntervals = [];
+  }
+  if (previousMetricAtMs !== null && nowMs > previousMetricAtMs) {
+    metricFrameIntervals = pushMetric(metricFrameIntervals, nowMs - previousMetricAtMs);
+  }
+  previousMetricAtMs = nowMs;
+  metricFrames += 1;
+
+  if (previousRawPose && previousPreviousRawPose) {
+    const second = (current: RenderedPoseSample, previous: RenderedPoseSample, previousPrevious: RenderedPoseSample) => ({
+      originPx: Math.hypot(
+        current.originX - 2 * previous.originX + previousPrevious.originX,
+        current.originY - 2 * previous.originY + previousPrevious.originY,
+      ),
+      rotationDeg: Math.hypot(
+        current.yaw - 2 * previous.yaw + previousPrevious.yaw,
+        current.pitch - 2 * previous.pitch + previousPrevious.pitch,
+        current.roll - 2 * previous.roll + previousPrevious.roll,
+      ),
+    });
+    const rawSecond = second(raw, previousRawPose, previousPreviousRawPose);
+    metricRawOriginJitterPx = pushMetric(metricRawOriginJitterPx, rawSecond.originPx);
+    metricRawRotationJitterDeg = pushMetric(metricRawRotationJitterDeg, rawSecond.rotationDeg);
+    if (previousSmoothedPose && previousPreviousSmoothedPose) {
+      const smoothedSecond = second(smoothed, previousSmoothedPose, previousPreviousSmoothedPose);
+      metricSmoothedOriginJitterPx = pushMetric(metricSmoothedOriginJitterPx, smoothedSecond.originPx);
+      metricSmoothedRotationJitterDeg = pushMetric(metricSmoothedRotationJitterDeg, smoothedSecond.rotationDeg);
+    }
+  }
+
+  metricOriginLagPx = pushMetric(
+    metricOriginLagPx,
+    Math.hypot(smoothed.originX - raw.originX, smoothed.originY - raw.originY),
+  );
+  metricRotationLagDeg = pushMetric(
+    metricRotationLagDeg,
+    Math.hypot(smoothed.yaw - raw.yaw, smoothed.pitch - raw.pitch, smoothed.roll - raw.roll),
+  );
+
+  const stats: PoseFilterStats = poseSmoother.lastStats;
+  metricRampLagMs = pushMetric(metricRampLagMs, stats.rampLagMs);
+  metricSmoothingCostMs = pushMetric(metricSmoothingCostMs, stats.costMs);
+  metricAlpha = pushMetric(metricAlpha, stats.alpha);
+  if (stats.snapped) metricSnaps += 1;
+
+  previousPreviousRawPose = previousRawPose;
+  previousRawPose = raw;
+  previousPreviousSmoothedPose = previousSmoothedPose;
+  previousSmoothedPose = smoothed;
 }
 
 function injectedSample(injection: Exclude<TrackingInjection, 'auto'>): TrackingSample {
@@ -1070,6 +1294,7 @@ function checkDecodeStall(): void {
   const expectFrame =
     state.started &&
     !state.manualPaused &&
+    !replayFrameHeld &&
     state.fixture.state === 'ready' &&
     state.effect !== 'none';
   const stalled = watchdog.check(performance.now(), expectFrame);
@@ -1116,6 +1341,70 @@ function applyDecision(decision: OutputDecision): void {
   statusExplanation.textContent = decision.explanation;
   statusAction.textContent = decision.action ?? '';
   updateControls();
+}
+
+/**
+ * Switches between the bounded smoother (normal output) and the raw tracker
+ * pose (diagnostic). Raw mode exists so the public check can measure the same
+ * recorded motion with and without smoothing and report the trade-off.
+ */
+function setPoseSmoothingEnabled(enabled: boolean): void {
+  if (poseSmoothingEnabled === enabled) return;
+  poseSmoothingEnabled = enabled;
+  poseSmoother.reset();
+  resetPoseMetrics();
+  // Show the requested mode immediately; the next accepted tracker sample then
+  // either snaps (smoothing re-enabled) or is used directly (raw mode).
+  if (lastRawPoseMatrix && maskRenderer) {
+    lastPoseMatrix = lastRawPoseMatrix;
+    lastMaskProjection = maskRenderer.setPose(lastRawPoseMatrix);
+  }
+  renderNow();
+  updateDiagnostics(performance.now());
+}
+
+/** Enables or disables the depth-only face occluder for public A/B evidence. */
+function setOcclusionEnabled(enabled: boolean): void {
+  maskRenderer?.setOcclusionEnabled(enabled);
+  refreshMaskProjection();
+  renderNow();
+  updateDiagnostics(performance.now());
+}
+
+/**
+ * Freezes the replay image while keeping the processed output visible, so a
+ * diagnostic comparison (occlusion on/off) is not polluted by the person moving
+ * between captures. The decode-stall watchdog is told a frame is not expected;
+ * this is not a passthrough or a paused-output bypass, it only holds the last
+ * valid replay frame. Resuming re-arms the normal watchdog.
+ */
+function setReplayFrameHeld(held: boolean): void {
+  if (!video) return;
+  replayFrameHeld = held;
+  if (held) {
+    frameLoopActive = false;
+    video.pause();
+    // Re-sample the held image once so the mask pose and the frozen video frame
+    // are consistent even if the decoder had presented one frame past the last
+    // processed sample. This is one normal tracker sample on the same frame the
+    // A/B captures will compare.
+    const now = performance.now();
+    updateTracking(video, now);
+    state.tracking = tracking.snapshot(now);
+    renderNow();
+    return;
+  }
+  if (state.started && !state.manualPaused) {
+    watchdog.arm(performance.now());
+    subscribeFrameLoop();
+    void video.play().catch((error: Error) => {
+      state.processingHealthy = false;
+      state.processingError = `Playback did not resume: ${error.message}`;
+      watchdog.disarm();
+      renderNow();
+    });
+  }
+  renderNow();
 }
 
 function togglePause(): void {
@@ -1175,6 +1464,9 @@ function updateControls(): void {
   captureButton.disabled = captureInFlight;
   effectSelect.disabled = false;
   injectionSelect.disabled = !trackerReady;
+  poseSmoothingSelect.disabled = !trackerReady;
+  occlusionToggle.disabled = !trackerReady;
+  holdFrameToggle.disabled = !state.started;
   recheckButton.disabled = false;
   importPackageButton.disabled = importInFlight;
   removePackageButton.disabled = activeEffect.source !== 'package' || removeInFlight || importInFlight;
@@ -1275,6 +1567,34 @@ function updateTrackingDiagnostics(): void {
       `${state.tracker.metadata.id} sha256=${state.tracker.metadata.sha256.slice(0, 12)}… license=${state.tracker.metadata.license} state=${state.tracker.state}`,
     );
   }
+  updateOcclusionDiagnostics();
+  updateSmoothingDiagnostics();
+}
+
+/**
+ * Public description of the depth-only face occluder. The geometry counts come
+ * from the same committed canonical face table the mask scene renders, so the
+ * check can assert that the full face surface is active rather than a
+ * screen-space approximation.
+ */
+function updateOcclusionDiagnostics(): void {
+  if (!maskRenderer) {
+    setDiag('diag-occlusion', 'state=starting');
+    return;
+  }
+  setDiag(
+    'diag-occlusion',
+    `enabled=${maskRenderer.occlusionEnabled} mode=depth-only mesh=canonical-face vertices=${maskRenderer.occluderVertices} triangles=${maskRenderer.occluderTriangles} colorWrite=false depthWrite=true`,
+  );
+}
+
+function updateSmoothingDiagnostics(): void {
+  const mode = poseSmoothingEnabled ? 'smoothed' : 'raw';
+  const frameMs = percentile95(metricFrameIntervals);
+  setDiag(
+    'diag-smoothing',
+    `mode=${mode} samples=${metricFrames} baseAlpha=${POSE_SMOOTHING_LIMITS.baseAlpha.toFixed(2)} referenceRampLagMs=${poseSmoother.referenceRampLagMs.toFixed(1)} frameMs=${frameMs.toFixed(1)} alphaP50=${percentile(metricAlpha, 0.5).toFixed(2)} alphaP95=${percentile(metricAlpha, 0.95).toFixed(2)} snaps=${metricSnaps} rawJitterOriginPxP95=${percentile95(metricRawOriginJitterPx).toFixed(2)} smoothedJitterOriginPxP95=${percentile95(metricSmoothedOriginJitterPx).toFixed(2)} rawJitterRotationDegP95=${percentile95(metricRawRotationJitterDeg).toFixed(2)} smoothedJitterRotationDegP95=${percentile95(metricSmoothedRotationJitterDeg).toFixed(2)} lagOriginPxP95=${percentile95(metricOriginLagPx).toFixed(2)} lagRotationDegP95=${percentile95(metricRotationLagDeg).toFixed(2)} rampLagMsP95=${percentile95(metricRampLagMs).toFixed(1)} costMsP95=${percentile95(metricSmoothingCostMs).toFixed(3)} capCm=${POSE_SMOOTHING_LIMITS.maxTranslationLagCm} capDeg=${POSE_SMOOTHING_LIMITS.maxRotationLagDeg}`,
+  );
 }
 
 /** Output-canvas pixel at the mask's eye probe, for public evidence checks. */
@@ -1292,11 +1612,15 @@ function pushRolling(values: number[], value: number): number[] {
   return next;
 }
 
-function percentile95(values: number[]): number {
+function percentile(values: number[], fraction: number): number {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((left, right) => left - right);
-  const index = Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1);
+  const index = Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1);
   return sorted[index] ?? 0;
+}
+
+function percentile95(values: number[]): number {
+  return percentile(values, 0.95);
 }
 
 function setDiag(id: string, value: string): void {

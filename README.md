@@ -2,14 +2,15 @@
 
 Shymask applies visual effects to a webcam feed and publishes the result as a virtual webcam. This
 repository currently delivers a **recorded-replay preview** (issue #2), the **Windows 11 virtual
-camera** (issue #3), **one-face tracking with a basic rigid 3D mask** (issue #4), and **imported,
-validated effect packages** (issue #5): a desktop
+camera** (issue #3), **one-face tracking with a basic rigid 3D mask** (issue #4), **imported,
+validated effect packages** (issue #5), and **face-based occlusion with bounded face anchoring**
+(issue #6): a desktop
 preview loops a recorded webcam-style clip at real-time pacing, tracks exactly one face, attaches a
-procedural low-poly mask to that face, displays a selectable effect, and publishes its 1280×720
-output canvas as **Shymask Camera** so other applications can select it. The camera publishes the
-app's output canvas; a native opaque paused fallback covers the short window before the app connects
-and is used when app frames stop arriving. No physical webcam, account, cloud service, or live test
-subject is used.
+procedural low-poly mask to that face, hides mask geometry behind the face, displays a selectable
+effect, and publishes its 1280×720 output canvas as **Shymask Camera** so other applications can
+select it. The camera publishes the app's output canvas; a native opaque paused fallback covers the
+short window before the app connects and is used when app frames stop arriving. No physical webcam,
+account, cloud service, or live test subject is used.
 
 An effect package is a ZIP containing a versioned `manifest.json` plus declared assets only —
 never executable effect code. A package is **one complete effect** that may combine a rigid GLB
@@ -22,9 +23,9 @@ missing tracker model, no effect, manual pause and processing failures all repla
 with the exact opaque "Tracking paused" screen in both the preview and the virtual camera. There is
 no raw-passthrough branch.
 
-Occlusion refinement, secondary motion, real call-application compatibility (issue #10), the
-Blender/AI authoring flow (issue #9), complexity budgets (issue #11), and the final 720p/30 FPS /
-100 ms target are later child tickets of the parent spec.
+Secondary motion, real call-application compatibility (issue #10), the Blender/AI authoring flow
+(issue #9), complexity budgets (issue #11), and the final 720p/30 FPS / 100 ms target are later child
+tickets of the parent spec. Hand-over-mask occlusion remains out of scope.
 
 ## Quick start (Windows 11)
 
@@ -231,9 +232,10 @@ for the architecture, the registration failure that was investigated, and the me
 
 ```powershell
 npm run typecheck        # strict TypeScript across src and tests
-npm test                 # unit tests for the output policy, tracking state machine, replay clock,
-                         # frame watchdog, treatments, package schema/ZIP safety/GLB validation and
-                         # the effect registry (94 tests)
+npm test                 # unit tests for the output policy, tracking state machine, bounded pose
+                         # smoothing, replay clock, frame watchdog, treatments, package schema/ZIP
+                         # safety/GLB validation and the effect registry (115 tests)
+npm run build:face-occluder # regenerate the committed canonical face-occluder table (fetches once)
 npm run build:packages   # regenerate the committed sample + negative effect-package fixtures
 npm run validate:package -- <file.zip>  # validate one package with the app's pure validator
 npm run check            # builds TypeScript + native camera, stages it, launches the real Electron app with
@@ -291,10 +293,11 @@ independent camera consumer:
     removal, and that acceptance is recorded explicitly.
 19. Face-tracker assets are validated before Start; the model is ready and the recorded replay
     produces exactly one face with full landmarks and a transform.
-20. The rigid mask is attached to the tracked face (origin inside the face bounding box, sized to
-    it) and the output pixel at its cyan eye plate is the exact mask colour.
+20. The rigid mask is attached to the tracked face (origin inside the face bounding box expanded
+    by 35% of its width/height, sized to it) and the output pixel at its cyan eye plate is the exact
+    mask colour when the probe is visible.
 21. Mask position and orientation change with the recorded head motion, frame by frame, while the
-    mask stays on the face.
+    mask origin stays inside the expanded tracked-face bounding box.
 22. The camera consumer receives the same masked canvas: its saved PNG mean matches the preview and
     contains the mask eye plate at the expected probe colour.
 23. Injected tracking loss replaces the whole output with the exact opaque paused screen in preview
@@ -308,22 +311,70 @@ independent camera consumer:
     command is `npm run fetch:tracker`.
 28. On the second recorded CC0 clip, a documented 8 s window with real turns, nods and leaning keeps
     exactly one face tracked and moves/rotates the mask by at least 12° of yaw and pitch and 40 px of
-    origin movement, with screenshots at three points in the turn.
-29. A valid generated package imports through the public **Import package…** control (only the OS file
+    origin movement, with screenshots at three points in the turn. The camera-side motion evidence is
+    captured on the held 47.7 s motion-window frame (the moving behavior is the sampled window plus
+    those screenshots); resuming live playback after the long held A/B is not used as evidence because
+    the automated session can occasionally stall its video frame-callback timestamps after a loop seam
+    (the output then correctly hides under the paused policy).
+29. Face occlusion is active in the normal preview and camera path. Two held side-view frames in
+    opposite yaw directions (47.7 s, about −20° to −22°, and 16.0 s, about +9° to +14°) are compared
+    with only the depth-only canonical face occluder disabled: the bundled mask changes
+    ~15.7k–17.4k pixels, with 88%+ inside the tracked-face **bounding box** (~89–94%), ~5.3k–5.7k for
+    `guard-visor` (94.5–96.5% inside that bbox) and ~2.3k for `rose-visor` (100% inside that bbox).
+    ON and OFF are each captured twice and each same-state pair is pixel-identical, and the
+    independent camera's total and inside-bbox change counts are asserted equal to the preview's for
+    the bundled mask and `guard-visor` (there is no `rose-visor` camera A/B). The ON frame is also
+    proved to reveal non-mask content: the imported package's exact unlit material colour covers ≥97%
+    of the changed pixels in OFF and ≤3% in ON (observed 0.3–1.5%), while the bundled mask's dominant
+    rendered palette (top 64 exact shades, ≥90% coverage) does not reappear in ON (≤1%, observed
+    ≤0.1%, including 4 px in one opposite-view run).
+    The ON changed pixels must additionally pass a plausible-video floor (mean luminance ≥30,
+    luminance stddev ≥6, ≤10% near-black, ≥16 distinct colours), and for the untreated bundled mask
+    and `rose-visor` ≥90% of sampled ON pixels must match the held replay frame drawn at the pipeline
+    scale (observed across recent runs: bundled ~125–130 mean luminance / ~32–36 stddev, `rose-visor`
+    ~149–151 / ~13–14.5, opposite-view bundled ~102–105 / ~40–41; held-replay match 0.93–0.97). This
+    proves mask material is removed and plausible video is revealed; the saved PNGs show the face, but
+    it is not an exact-colour proof of identity. The occlusion A/B therefore covers bundled and
+    imported masks through the same renderer path: both turn directions for the bundled mask and
+    `guard-visor`, and the primary view for `rose-visor`.
+30. Bounded face anchoring is measured against raw tracking on the same recorded frames. The initial
+    ~2 s segment is measured, not assumed, to be slow (pose span about 5.6–8.5° yaw, 6–9° pitch, ~2°
+    roll and 11–14 px origin, p50 alpha ~0.33–0.34; enforced bounds 10°/10°/5°, 30 px and p50 alpha
+    ≤0.4). Slow-segment p95 jitter drops from about 3.7–4.2 px / 2.4–2.7° raw to about 1.5–2.3 px /
+    1.0–1.4° smoothed (40–66% origin and 43–59% rotation lower; enforced gates smoothed ≤0.80× raw
+    origin and ≤0.85× raw rotation; recent runs measured 1.72–2.24 px / 41.6–55.3% origin and
+    1.09–1.36° / 43–59% rotation). Across the full
+    turn/nod/lean window the rendered mask origin's p95 sliding relative to the face-box centre is
+    a bounded measured value of ~12–16 px (about 5–7% of face width; enforced bound 24 px;
+    earlier runs up to ~20 px), not a claim that it does not slide. The same documented window is
+    sampled again through the public raw Pose smoothing mode: observed runs measured raw-mode p95
+    ~9–13 px vs rendered ~12–16 px, so smoothing did not reduce this proxy metric (the rendered
+    pass was about 2–77% higher, consistent with filter lag and frame-timing differences); its
+    measured benefit is the slow-segment jitter reduction above. The face-box centre shifts under yaw,
+    so the metric is a proxy and no correction is claimed: acceptance criterion 2's sliding is
+    bounded, not corrected (jitter is reduced and clipping is addressed by the occluder). The raw
+    origin-to-centre offset p95 is ~29–34 px (bound 60 px), and the p95
+    raw-vs-smoothed lag is ~3.6–4.3 px / ~1.7–1.9° with a ~60–62 ms constant-velocity delay; the
+    filter costs ~0.1 ms p95.
+31. A valid generated package imports through the public **Import package…** control (only the OS file
     picker is stubbed), appears in the Effect selector, and renders its packaged GLB mask + declared
-    color treatment in the preview. The package's unlit material colour is the exact probe pixel, so
-    the packaged asset — not the bundled mask — is composited.
-30. The independent camera consumer receives the same imported mask + treatment: its saved PNG mean
-    matches the preview, contains the package material colour, and the pixel at the mask probe is that
-    colour.
-31. A color-treatment-only package visibly changes the preview and camera output through the same path.
-32. Switching bundled → imported → imported paints the opaque paused output first and completes;
+    color treatment in the preview. The exact unlit material colour appears in exact 1280×720 preview
+    and camera PNGs (enforced >20,000 px for guard and >25,000 for rose; about 31k–33k for guard and
+    about 39k–41k for rose across recent runs; some runs measured 40,025 and 40,943 for rose), so the
+    packaged asset — not the bundled mask — is composited. Face occlusion can
+    hide the bounding-box-centre probe; the preview probe is asserted
+    by reading the actual saved ON PNG pixel when the public diagnostic reports it visible, and the
+    camera probe is asserted under the same condition.
+32. The independent camera consumer receives the same imported mask + treatment: its saved PNG mean
+    matches the preview and contains the package material colour.
+33. A color-treatment-only package visibly changes the preview and camera output through the same path.
+34. Switching bundled → imported → imported paints the opaque paused output first and completes;
     manual pause persists across a switch and keeps the camera paused; an imported effect honors
     tracking-loss/multiple-face/unreliable gates and recovers automatically; an invalid/removed
     selection falls back to the no-effect paused output. A rapid double switch commits only the
     later package's mask, and a mask-only package (`rose-visor`) with nonzero position/rotation/scale
     renders in preview and camera.
-33. Malformed JSON, unsupported schemaVersion, unsupported behavior, missing asset, invalid color,
+35. Malformed JSON, unsupported schemaVersion, unsupported behavior, missing asset, invalid color,
     zip-slip, oversized entry, executable content, an unsupported glTF extension, a glTF camera and
     missing accessor `componentType`/`type` are each rejected with their documented actionable code,
     keep the previous effect rendering, and cause no crash or renderer console error. Removing the
@@ -334,9 +385,12 @@ Artifacts are written to the gitignored `evidence/check-<timestamp>/` directory:
 screenshots, the full app window (including import-error feedback), captured output frames,
 camera-consumer PNGs under `camera-frames/`, and `summary.json` with the derived base SHA, timing
 baseline, tracking/model evidence, effect-package import/negative/rapid-switch/attachment evidence
-(including the displayed complexity subset in each import message), hardware,
-workload, measured boundaries, commands, validation-gate facts and the tested head SHA. The check uses
-an evidence-local `SHYMASK_PACKAGE_DIR`, so it never edits installed packages; the committed sample and
+(including the displayed complexity subset in each import message), hardware, workload, measured
+boundaries, commands, validation-gate facts and the tested head SHA. It also records
+`virtualCamera.captureAttempts`: every processed camera capture's attempt count and its
+app-published/native-fallback frame counts, so the bounded retries and the consumer-frame capture
+window (8 frames, 10 for the motion-window capture) are visible in the evidence. The check uses an
+evidence-local `SHYMASK_PACKAGE_DIR`, so it never edits installed packages; the committed sample and
 negative package fixtures are regenerated with `npm run build:packages`.
 
 `npm run vcam:check` independently exercises the native path: it asserts the test-pattern pixels and
@@ -370,29 +424,39 @@ source clip 3.379 s:
 | Camera mean-RGB spread across the window | 19 (replay content changes across loops) |
 | Replay loops crossed during the camera window | 2 |
 | Source frame interval, p95 | 55.4 ms in this run; ~42–55 ms across passing runs (the clip presents at ~18–24 Hz here; no 30 FPS forcing) |
-| Render + filter cost, p95 | 16.7 ms in this run (main-thread draw/filter plus the diagnostics mean-RGB sample; a connected camera adds canvas readback) |
-| Mask render + composite cost, p95 | 11.4 ms (offscreen mask render plus the drawImage composite into the output canvas, including the diagnostics sample) |
-| Tracker inference, steady-state p95 | 13.6 ms per presented frame (164 frames) |
-| Tracker inference, first-call warm-up | 296.5 ms in this run; ~0.3–2.0 s observed across runs (excluded from the p95) |
+| Render + filter cost, p95 | 16.7 ms in the latest run (main-thread draw/filter plus the diagnostics mean-RGB sample; a connected camera adds canvas readback) |
+| Mask render + composite cost, p95 | 10–15 ms across recent runs (offscreen mask render plus the drawImage composite into the output canvas, including the diagnostics sample) |
+| Tracker inference, steady-state p95 | 13.2–13.8 ms per presented frame |
+| Tracker inference, first-call warm-up | ~0.28 s in recent runs; ~0.3–2.0 s observed across runs (excluded from the p95) |
 | Default-clip mask motion (~2.5 s sample) | origin moved ~7 px horizontally / ~3 px vertically; yaw ~3.5°, pitch ~2.1° (a longer manual sample saw ~12 × 23 px) |
-| Recorded motion-window swing (41.6–49.6 s) | yaw 28.8°, pitch 29.1°, roll 18.0°, mask origin 99 × 64 px, 18/18 sampled frames tracked |
-| Loop cycles observed | 3 seam crossings inside a 8.27 s sampling window |
+| Recorded motion-window swing (41.6–49.6 s) | enforced minimums yaw/pitch ≥12°, roll ≥4°, origin ≥40 px; observed across recent runs yaw ~24–29°, pitch ~23–35°, roll ~12–19°, mask origin ~91–99 × ~44–77 px, 17–18/18 sampled frames tracked (a representative run 27.0° / 28.9° / 17.8°, 98 × 60 px, 18/18); projected-origin sliding p95 ~12–16 px (bound 24 px; raw-mode ~9–13 px; earlier runs up to ~20 px rendered), raw origin-to-face-centre offset p95 ~29–34 px (bound 60 px) |
+| Slow-segment pose jitter, p95 | raw 3.7–4.2 px / 2.4–2.7° → smoothed 1.5–2.3 px / 1.0–1.4° (40–66% origin, 43–59% rotation lower; enforced gates smoothed ≤0.80× raw origin and ≤0.85× raw rotation; recent runs measured 1.72–2.24 px / 41.6–55.3% origin and 1.09–1.36° / 43–59% rotation; paired over the same frames). The segment is measured to be slow: about 5.6–8.5° yaw / 6–9° pitch / 2° roll span, 11–14 px origin, p50 alpha ~0.33–0.34 |
+| Smoothing added lag / cost | p95 raw-vs-smoothed offset 3.6–4.3 px origin and 1.7–1.9° rotation; implied constant-velocity delay p95 60.2–61.6 ms; filter cost 0.1 ms p95. The ~50.9 ms reference-interval figure is not a global maximum (effective alpha ~0.34 at the observed ~35 ms interval) |
+| Occlusion A/B at two turned frames (47.7 s about −20° to −22°, 16.0 s about +9° to +14°) | bundled mask 15,705–17,414 px changed (89–94% inside the tracked-face bbox); `guard-visor` 5,319–5,700 px (92–96.5%); `rose-visor` 2,257–2,306 px (100%); same-state repeats pixel-identical. ON reveal is proved by exact colour: package material ≥97% of changed pixels in OFF and ≤3% in ON (observed 0.3–1.5%); bundled dominant palette ≥90% coverage and ≤1% reappearance in ON (observed ≤0.1%, including 4 px in one opposite-view run) |
+| Occlusion camera A/B | the independent consumer received the same change on the held frame: total and inside-bbox pixel counts are asserted equal to the preview's for the bundled mask and `guard-visor`, with 0 same-state self-diff |
+| Loop cycles observed | 3 seam crossings inside an 8.27 s sampling window |
 | Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
 | Replay pacing ratio | 1.004 processing time / wall time in this run |
 
 Effect-package evidence from the same run (replay-based): the committed `guard-visor` sample is a
 1,715-byte archive with 2 entries and a 693-byte manifest, containing a 2,284-byte GLB with 96
 triangles, 1 mesh, 1 material and 1 node; `verdant-tint` is a 397-byte color-only archive. The
-imported mask's unlit material colour (RGB 225,29,154) is the exact preview probe pixel and appears
-in the independent camera-consumer PNG, so the packaged asset is composited through the shared path.
+imported mask's unlit material colour (RGB 225,29,154) appears in exact 1280×720 preview and camera
+PNGs (about 31,000–33,000 pixels in recent runs; enforced >20,000), so the packaged asset is
+composited through the shared path. Face occlusion can legitimately hide the package's
+bounding-box-centre probe; the preview probe is asserted by reading the actual saved ON PNG pixel when
+the public diagnostic reports it visible, the camera probe is asserted under the same condition, and
+the exact material-colour count is always asserted.
 `rose-visor` is a mask-only sample with nonzero `position`/`rotationDeg`/`scale` whose distinct
-material colour (RGB 32,196,128) is asserted in both preview and camera, and a rapid double switch
-must leave only the later package's probe colour committed.
+material colour (RGB 32,196,128) is asserted in both preview and camera (about 38,000–40,000 pixels;
+enforced >25,000), and a rapid double switch must leave only the later package's mask committed.
 Package complexity is reported, not budgeted; no triangle/mesh threshold is asserted.
 
 Replay-derived tracking measurements from the same run are documented in
-[`docs/notes/0003-face-tracking-and-mask.md`](docs/notes/0003-face-tracking-and-mask.md). The
-default clip's recorded motion is deliberately small (it has no large turns or nods); the
+[`docs/notes/0003-face-tracking-and-mask.md`](docs/notes/0003-face-tracking-and-mask.md); the
+occlusion and smoothing method, trade-offs and limits are in
+[`docs/notes/0005-face-occlusion-and-anchoring.md`](docs/notes/0005-face-occlusion-and-anchoring.md).
+The default clip's recorded motion is deliberately small (it has no large turns or nods); the
 larger-motion CC0 fixture supplies the turn/nod/lean evidence and is used only by the check.
 
 Run-to-run variation is expected under desktop load; these are observations, not benchmarks. The
@@ -400,10 +464,13 @@ numbers are replay-derived. They do **not** establish the parent spec's 720p/30 
 camera-to-output target, physical-camera compatibility, tracking on a physical camera, call-application
 compatibility, or laptop integrated-graphics suitability. The camera latency includes the app's ~30 Hz
 publish cadence (a frame waits up to one 33 ms sample slot), so p95 is dominated by pacing rather than
-transport. The mask is a rigid attachment with no occlusion refinement or secondary motion, and the
-policy cannot detect every possible visual defect. See `docs/notes/0001-preview-stack-and-loop.md`,
-`docs/notes/0002-windows-virtual-camera-spike.md` and
-`docs/notes/0003-face-tracking-and-mask.md`.
+transport. The mask has face-based occlusion and bounded face anchoring but no secondary motion; the
+canonical face occluder is rigid, has no hair/ears/neck or full head silhouette, and does not deform
+with expressions, and the policy cannot detect every possible visual defect. See
+`docs/notes/0001-preview-stack-and-loop.md`,
+`docs/notes/0002-windows-virtual-camera-spike.md`,
+`docs/notes/0003-face-tracking-and-mask.md` and
+`docs/notes/0005-face-occlusion-and-anchoring.md`.
 
 ## Fixtures
 
@@ -418,14 +485,15 @@ intentionally not committed; only fetch scripts and metadata are versioned (`tra
 ## Layout
 
 ```
-src/core/       output policy, tracking state machine, replay clock, canvas pipeline, effects,
-                effect-package contract/validator, ZIP safety reader, GLB validator
+src/core/       output policy, tracking state machine, bounded pose smoothing, replay clock, canvas
+                pipeline, effects, effect-package contract/validator, ZIP safety reader, GLB validator
 src/main/       Electron main process, local asset protocol, fixture/tracker validation, effect-package
                 store/import/remove, IPC, virtual camera lifecycle
 src/renderer/   desktop preview UI (HTML/CSS/TS), MediaPipe tracker wrapper, Three.js mask renderer
-                (bundled + package GLB), and camera frame publication
-scripts/        build, start, fixture/model fetch, package fixture generation/validation,
-                public-workflow check, native camera scripts
+                with the depth-only canonical face occluder (bundled + package GLB), and camera frame
+                publication
+scripts/        build, start, fixture/model fetch, canonical face-occluder generation, package fixture
+                generation/validation, public-workflow check, native camera scripts
 native/         Windows virtual camera: Media Foundation media source, host, consumer harness
 tests/          focused unit tests (node:test)
 fixtures/       committed fixture manifests and effect packages; fetched media is gitignored
@@ -480,18 +548,19 @@ docs/           fixture notes, preview/loop + virtual camera + tracking + effect
 Delivered by this slice: recorded input acquisition and validation, real-time looping, monotonic
 processing timestamps, selectable declarative effects (color treatments, a bundled rigid mask, and
 imported validated effect packages combining a declared GLB mask and/or bounded color treatment),
-one-face tracking with readiness/loss hysteresis, the opaque paused-output policy in the preview and
-the virtual camera (including tracking loss, multiple faces, unreliable tracking, missing/corrupt
-tracker assets, async effect switching and failed imported-effect loads), import/remove persistence
-under `userData`, Windows 11 virtual camera publication as `Shymask Camera`, an independent Media
-Foundation consumer harness, and reproducible local checks with no physical camera or human
-participation. The imported-effect async switch is the switching-interruption sub-case: the whole
-output stays on the opaque paused screen until the new effect loads, or remains hidden with an
-explanation if the load fails.
+one-face tracking with readiness/loss hysteresis, face-based occlusion through a depth-only canonical
+face mesh, bounded pose smoothing measured against raw tracking, the opaque paused-output policy in
+the preview and the virtual camera (including tracking loss, multiple faces, unreliable tracking,
+missing/corrupt tracker assets, async effect switching and failed imported-effect loads),
+import/remove persistence under `userData`, Windows 11 virtual camera publication as
+`Shymask Camera`, an independent Media Foundation consumer harness, and reproducible local checks
+with no physical camera or human participation. The imported-effect async switch is the
+switching-interruption sub-case: the whole output stays on the opaque paused screen until the new
+effect loads, or remains hidden with an explanation if the load fails.
 
-Deferred: physical webcam capture, live-human acceptance, occlusion refinement (issue #6), secondary
-motion, the Blender/AI authoring flow (issue #9), real Zoom/Meet/OBS compatibility (issue #10),
+Deferred: physical webcam capture, live-human acceptance, secondary motion (issue #8), distortion
+(issue #7), the Blender/AI authoring flow (issue #9), real Zoom/Meet/OBS compatibility (issue #10),
 final live acceptance, NV12 support, complexity budgets (issue #11), laptop integrated-graphics
 validation, and the 720p/30 FPS / ≤100 ms target. Two-person footage is not part of this slice;
 multiple faces are exercised through a labelled diagnostic injection and the `numFaces: 2` detector
-configuration.
+configuration. Hand-over-mask occlusion remains out of scope.
