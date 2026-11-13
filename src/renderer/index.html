@@ -15,7 +15,7 @@
         <h1>Shymask</h1>
         <p class="tagline">Development preview &middot; recorded replay input</p>
       </div>
-      <p class="build-tag">Preview / face tracking / occlusion / anchored mask</p>
+      <p class="build-tag">Preview / face tracking / occlusion / anchored mask / face distortion</p>
     </header>
 
     <main class="layout">
@@ -106,6 +106,7 @@
             <div><dt>Tracked face</dt><dd id="diag-face"></dd></div>
             <div><dt>Mask</dt><dd id="diag-mask"></dd></div>
             <div><dt>Occlusion</dt><dd id="diag-occlusion"></dd></div>
+            <div><dt>Face distortion</dt><dd id="diag-distortion"></dd></div>
             <div><dt>Pose smoothing</dt><dd id="diag-smoothing"></dd></div>
             <div><dt>Mask probe</dt><dd id="diag-mask-probe"></dd></div>
             <div><dt>Mask probe colour</dt><dd id="diag-mask-color"></dd></div>
@@ -121,7 +122,8 @@
     </main>
 
     <footer class="app-footer">
-      Replay-based preview with face-based occlusion and bounded pose smoothing. One tracked face;
+      Replay-based preview with face-based occlusion, bounded pose smoothing and imported face
+      distortion. One tracked face;
       tracking loss, multiple faces and unavailable tracking all replace the whole output with the
       opaque paused screen. The same output canvas is published as Shymask Camera when the Windows
       virtual camera is available; no physical webcam is opened in this slice.

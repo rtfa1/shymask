@@ -8,6 +8,7 @@
 import {
   buildTreatmentCssFilter,
   effectIdForPackage,
+  type FaceDistortionParameters,
   type InstalledEffectPackage,
   type MaskAttachment,
 } from './effect-package-contract';
@@ -26,6 +27,8 @@ export interface EffectDefinition {
   description: string;
   /** Declarative canvas filter for this complete effect, if any. */
   treatment: ColorTreatment | null;
+  /** Bounded face distortion applied around the tracked face, if any. */
+  distortion: FaceDistortionParameters | null;
   /** Rigid face-attached mask, bundled or from a package, if any. */
   mask: EffectMask | null;
   /** Package version, for diagnostics on imported effects. */
@@ -45,6 +48,7 @@ export const BUNDLED_EFFECT_DEFINITIONS: readonly EffectDefinition[] = [
     source: 'bundled',
     description: 'Hides the processed output (the opaque paused screen) instead of passing the feed through.',
     treatment: null,
+    distortion: null,
     mask: null,
   },
   {
@@ -53,6 +57,7 @@ export const BUNDLED_EFFECT_DEFINITIONS: readonly EffectDefinition[] = [
     source: 'bundled',
     description: 'Bundled procedural low-poly helmet/visor attached to the tracked face.',
     treatment: null,
+    distortion: null,
     mask: { kind: 'bundled' },
   },
   ...COLOR_TREATMENTS.map((treatment): EffectDefinition => ({
@@ -61,6 +66,7 @@ export const BUNDLED_EFFECT_DEFINITIONS: readonly EffectDefinition[] = [
     source: 'bundled',
     description: treatment.description,
     treatment,
+    distortion: null,
     mask: null,
   })),
 ];
@@ -81,6 +87,7 @@ export function packageEffectDefinition(pkg: InstalledEffectPackage): EffectDefi
           cssFilter: buildTreatmentCssFilter(pkg.treatment),
         }
       : null,
+    distortion: pkg.distortion,
     mask: pkg.mask
       ? {
           kind: 'gltf',
@@ -150,4 +157,9 @@ export function hasMask(effect: EffectDefinition): boolean {
 /** True when the complete effect applies a color treatment. */
 export function hasTreatment(effect: EffectDefinition): boolean {
   return effect.treatment !== null;
+}
+
+/** True when the complete effect declares a bounded face distortion. */
+export function hasDistortion(effect: EffectDefinition): boolean {
+  return effect.distortion !== null;
 }

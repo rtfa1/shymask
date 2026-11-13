@@ -5,6 +5,7 @@
  *   fixtures/packages/guard-visor.zip    valid: rigid GLB mask + color treatment
  *   fixtures/packages/rose-visor.zip     valid: mask-only GLB with nonzero attachment
  *   fixtures/packages/verdant-tint.zip   valid: declarative color treatment only
+ *   fixtures/packages/face-distortion.zip valid (schema v2): bounded face distortion only
  *   fixtures/packages/negative/*.zip     invalid packages for public-workflow codes
  *
  * The negative fixtures cover the public-workflow rejection cases; the unit
@@ -352,6 +353,25 @@ const verdantManifest = {
   colorTreatment: { sepia: 0.6, hueRotateDeg: 90, saturation: 1.8, brightness: 1.02 },
 };
 
+/**
+ * Schema v2 sample: a bounded declarative face distortion with no mask and no
+ * color treatment. The warp is applied by the fixed runtime shader around the
+ * tracked face box; the manifest only selects the mode and bounded numbers.
+ */
+const faceDistortionManifest = {
+  schemaVersion: 2,
+  id: 'shymask.face-distortion',
+  name: 'Face distortion',
+  version: '1.0.0',
+  description: 'Bounded declarative bulge warp that follows the tracked face.',
+  author: {
+    name: 'Shymask sample author',
+    attribution: 'Generated reproducibly by scripts/build-package-fixtures.mjs',
+    license: 'CC0-1.0',
+  },
+  faceDistortion: { mode: 'bulge', strength: 0.6, radiusScale: 1.35, centerOffset: [0, 0] },
+};
+
 function manifestBytes(manifest) {
   return strToU8(`${JSON.stringify(manifest, null, 2)}\n`);
 }
@@ -432,6 +452,9 @@ function main() {
   writePackage('verdant-tint.zip', {
     'manifest.json': manifestBytes(verdantManifest),
   });
+  writePackage('face-distortion.zip', {
+    'manifest.json': manifestBytes(faceDistortionManifest),
+  });
 
   // Required negative fixtures: malformed JSON, unsupported schemaVersion,
   // unsupported behavior, missing asset, invalid color parameters, zip-slip,
@@ -440,11 +463,33 @@ function main() {
     'manifest.json': strToU8('{ "schemaVersion": 1, this is not valid JSON'),
     'assets/guard-visor.glb': glb,
   });
-  writeNegative('schema-version-2', {
+  writeNegative('schema-version-3', {
     'manifest.json': mutateManifest(guardVisorManifest, (manifest) => {
-      manifest.schemaVersion = 2;
+      manifest.schemaVersion = 3;
     }),
     'assets/guard-visor.glb': glb,
+  });
+  // A v1 manifest must not declare faceDistortion: an older v1-only build would
+  // warn about an unknown field and silently drop the distortion.
+  writeNegative('distortion-schema-v1', {
+    'manifest.json': mutateManifest(faceDistortionManifest, (manifest) => {
+      manifest.schemaVersion = 1;
+    }),
+  });
+  writeNegative('distortion-invalid-mode', {
+    'manifest.json': mutateManifest(faceDistortionManifest, (manifest) => {
+      manifest.faceDistortion.mode = 'twist';
+    }),
+  });
+  writeNegative('distortion-out-of-range', {
+    'manifest.json': mutateManifest(faceDistortionManifest, (manifest) => {
+      manifest.faceDistortion.strength = 4;
+    }),
+  });
+  writeNegative('distortion-unknown-field', {
+    'manifest.json': mutateManifest(faceDistortionManifest, (manifest) => {
+      manifest.faceDistortion.swirl = 1;
+    }),
   });
   writeNegative('unsupported-behavior', {
     'manifest.json': mutateManifest(guardVisorManifest, (manifest) => {

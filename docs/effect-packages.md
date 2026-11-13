@@ -1,10 +1,16 @@
-# Effect packages (schema v1)
+# Effect packages (schema v2, v1 still accepted)
 
 Shymask effects can be imported as **validated effect packages**. A package
 contains supported assets and declared behaviors only — never executable effect
-code. This document is the creator-facing contract for schema version **1**, the
-validation and import behavior, what is explicitly unsupported, and guidance for
-the later AI-authoring slice ([issue #9]).
+code. This document is the creator-facing contract for schema versions **1 and
+2**, the validation and import behavior, what is explicitly unsupported, and
+guidance for the later AI-authoring slice ([issue #9]).
+
+- **v1** packages declare a rigid GLB mask and/or a color treatment. They remain
+  accepted unchanged.
+- **v2** adds the optional bounded `faceDistortion` component. A v1 manifest
+  that declares `faceDistortion` is rejected (`schema-version-unsupported`)
+  instead of having the distortion silently dropped by a v1-only build.
 
 This slice was validated with recorded replay input and the Windows virtual
 camera (see [validation evidence](#validation-and-evidence)); no physical webcam
@@ -20,13 +26,14 @@ manifest.json                  required, at the archive root
 assets/<file>.glb              only the mask asset the manifest declares
 ```
 
-- The manifest is versioned with `schemaVersion: 1`. Other versions are
-  rejected with `schema-version-unsupported`.
+- The manifest is versioned with `schemaVersion: 1` or `schemaVersion: 2`.
+  Other versions are rejected with `schema-version-unsupported`. A
+  `faceDistortion` declaration requires schema version 2.
 - Only one complete effect is selected at a time. A complete effect may combine
-  a rigid mask **and** a color treatment; there is no stacking interface and no
-  per-component selection.
-- A package may contain a mask, a color treatment, or both. Declaring neither is
-  rejected as `empty-effect`.
+  a rigid mask, a bounded face distortion and a color treatment; there is no
+  stacking interface and no per-component selection.
+- A package may contain a mask, a face distortion, a color treatment, or a
+  combination. Declaring none of them is rejected as `empty-effect`.
 - Every archive entry must be the manifest or a declared asset. Extra files,
   scripts, `assets` subdirectories and `.gltf`/`.bin`/texture files are
   rejected.
@@ -83,6 +90,36 @@ public check imports it to prove that a nonzero declarative attachment reaches
 the renderer (the displayed `diag-effect` attachment is asserted) and that a
 mask-only package renders through the same preview/camera path.
 
+The fourth committed sample, `fixtures/packages/face-distortion.zip`, is a
+schema v2, distortion-only complete effect. Its manifest is:
+
+```json
+{
+  "schemaVersion": 2,
+  "id": "shymask.face-distortion",
+  "name": "Face distortion",
+  "version": "1.0.0",
+  "description": "Bounded declarative bulge warp that follows the tracked face.",
+  "author": {
+    "name": "Shymask sample author",
+    "attribution": "Generated reproducibly by scripts/build-package-fixtures.mjs",
+    "license": "CC0-1.0"
+  },
+  "faceDistortion": {
+    "mode": "bulge",
+    "strength": 0.6,
+    "radiusScale": 1.35,
+    "centerOffset": [0, 0]
+  }
+}
+```
+
+The public check imports it, asserts the warp follows the tracked face box on
+the default clip and across the recorded turn/nod/lean window, and captures
+matching preview and virtual-camera frames. The negative fixtures
+`distortion-schema-v1`, `distortion-invalid-mode`, `distortion-out-of-range` and
+`distortion-unknown-field` are rejected with their documented codes.
+
 Regenerate the committed sample and negative fixtures with:
 
 ```powershell
@@ -102,21 +139,22 @@ package is rejected. It is intentionally the same pure validator the app uses.
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `schemaVersion` | yes | Must be the number `1`. |
+| `schemaVersion` | yes | `1` (mask/treatment only) or `2` (adds `faceDistortion`). |
 | `id` | yes | Stable package identity, 2-63 chars of lowercase letters, digits, `.`, `_`, `-`. Re-importing the same id replaces the stored copy. |
 | `name` | yes | Display name, 1-80 chars. Shown in the effect selector. |
 | `version` | yes | Semantic version core (`1.0.0`). Shown in the selector and diagnostics. |
 | `description` | yes | 1-500 chars. Shown in the app's package summary. |
 | `author` | yes | `{ name }`; optional `attribution` (≤200), `license` (≤40) and `url` (http/https). Informational only. |
 | `mask` | optional | Rigid face-attached mask component (below). |
+| `faceDistortion` | optional (schema v2) | Bounded declarative face warp (below). |
 | `colorTreatment` | optional | Declarative filter parameters (below). |
 | `expressionReactions` | reserved | Must be absent or an empty array. A non-empty declaration is rejected as `unsupported-behavior`. |
 | `behaviors` | reserved | Reserved for moving parts/secondary motion; absent or empty. Non-empty is rejected. |
 
 Unknown top-level fields and unknown `author` fields produce an `unknown-field`
 **warning** (for forward compatibility) but do not enable behavior. Unknown
-fields inside `mask`, `attachment` or `colorTreatment` are errors, because a typo
-there would silently change the effect.
+fields inside `mask`, `attachment`, `faceDistortion` or `colorTreatment` are
+errors, because a typo there would silently change the effect.
 
 ### `mask`
 
@@ -160,6 +198,42 @@ its colour is exact evidence). GLB features that this runtime cannot execute are
 A GLB produced by a Blender export workflow is accepted when it follows those
 rules; that authoring flow is issue #9 and is not required for playback.
 
+### `faceDistortion` (schema v2)
+
+A **bounded, face-following radial warp** applied by a fixed runtime shader. The
+package selects a mode and three bounded numbers; it cannot supply geometry,
+shader code, a distortion mesh or per-frame displacement.
+
+| Field | Required | Range / default | Meaning |
+| --- | --- | --- | --- |
+| `mode` | yes | `"bulge"` or `"pinch"` | `bulge` magnifies the face region; `pinch` shrinks it. |
+| `strength` | yes | `0`-`1` | `0` is a valid no-op; `1` is the bounded maximum. The runtime multiplies it by a fixed `0.75` warp factor. |
+| `radiusScale` | no | `0.25`-`2.5`, default `1` | Warp-ellipse radius relative to half the tracked face box width/height. |
+| `centerOffset` | no | each axis `-0.5`-`0.5`, default `[0, 0]` | Warp-centre offset from the face-box centre as a fraction of the box width (x) and height (y). |
+
+The warp is recomputed for every processed frame from the tracker's face box:
+the ellipse centre is the box centre plus `centerOffset`, and the radii are
+`radiusScale` × half the box width/height. The distortion therefore follows the
+recorded face's position and distance instead of being a static screen overlay.
+Everything outside the ellipse is the same source frame, so only the face region
+is warped. The public **Face distortion** diagnostic reports the face box, the
+resolved ellipse, the offscreen warp cost and a low-resolution measurement of
+the actual changed pixels inside versus outside the ellipse.
+
+What a package **can** express: one of two whole-face radial warps with bounded
+strength, size and offset.
+
+What a package **cannot** express: per-landmark or per-expression warps (for
+example separate eye/mouth scaling), arbitrary distortion meshes, a 3D face
+deformation, animated or time-varying displacement, or any package-supplied
+shader/code. Those need explicit runtime support in a later schema version.
+
+Validation rejects every invalid declaration with `distortion-invalid` and
+names the field, for example:
+`faceDistortion.mode must be one of "bulge", "pinch"; got "twist".`
+A `faceDistortion` in a `schemaVersion: 1` manifest is rejected as
+`schema-version-unsupported`.
+
 ### `colorTreatment`
 
 All parameters are optional, but at least one must be declared. Every value must
@@ -198,15 +272,19 @@ authoring output.
 | Mask attachment position | ±30 cm per axis |
 | Mask attachment rotation | ±180° per axis |
 | Mask attachment scale | 0.1-5 |
+| Face distortion strength | 0-1 |
+| Face distortion radiusScale | 0.25-2.5 |
+| Face distortion centerOffset | ±0.5 per axis (fraction of face size) |
+| Face distortion effective warp factor | fixed 0.75 maximum |
 
 Validation reports `PackageComplexity` measurements (archive/manifest/mask bytes,
 entry count, triangle/mesh/material/node/texture counts, declared behavior count,
-color parameter count) from the pure validator and in the `validate:package`
-output, so #11 can turn measurements into budgets without changing the contract.
-No triangle or mesh **threshold** is enforced here. `summary.json` records the
-import result messages, which include the complexity subset the app displays
-(triangles, meshes, materials and archive bytes), not the full
-`PackageComplexity` record.
+color parameter count and distortion parameter count) from the pure validator
+and in the `validate:package` output, so #11 can turn measurements into budgets
+without changing the contract. No triangle or mesh **threshold** is enforced
+here. `summary.json` records the import result messages, which include the
+complexity subset the app displays (triangles, meshes, materials and archive
+bytes), not the full `PackageComplexity` record.
 
 ## Archive safety
 
@@ -298,14 +376,15 @@ stops the camera output. No Blender or AI process is involved in playback.
 | `manifest-not-utf8` | Manifest is not valid UTF-8. |
 | `manifest-invalid-json` | Manifest is not valid JSON. |
 | `manifest-schema-invalid` | Wrong JSON shape, unknown component field, or empty color treatment. |
-| `schema-version-unsupported` | `schemaVersion` is not `1`; this build reads v1 only. |
+| `schema-version-unsupported` | `schemaVersion` is not `1` or `2`, or a `faceDistortion` is declared in v1. |
 | `identity-invalid` | `id`/`name`/`version`/`description`/`author` invalid. |
-| `empty-effect` | Neither a mask nor a color treatment is declared. |
-| `unsupported-behavior` | Expression reactions/behaviors, glTF animations or skins are declared; v1 rejects rather than ignores them. |
+| `empty-effect` | No mask, color treatment or face distortion is declared. |
+| `unsupported-behavior` | Expression reactions/behaviors, glTF animations or skins are declared; this schema rejects rather than ignores them. |
 | `unsupported-asset-type` | Asset is not a single-level `.glb` under `assets/` (for example `.gltf`). |
 | `missing-asset` | Declared mask asset is absent or its path is invalid. |
 | `color-parameter-out-of-range` | A color parameter is outside its bounded range (or not finite). |
 | `attachment-invalid` | Attachment position/rotation/scale is out of range or has unknown fields. |
+| `distortion-invalid` | Distortion mode unsupported, or strength/radiusScale/centerOffset out of range, not finite, or an unknown field. |
 | `glb-invalid` | Not a valid self-contained GLB 2.0 / no triangle geometry. |
 | `glb-external-resource` | GLB references an external buffer/image; embed everything. |
 | `glb-unsupported-extension` | A required glTF extension other than `KHR_materials_unlit`. |
@@ -322,12 +401,16 @@ test fails if a stable code is added without a scenario. The public check
 imports the negative fixtures that are practical end-to-end cases; it is not a
 claim that every code is represented by a separate committed archive.
 
-## Explicitly unsupported in v1
+## Explicitly unsupported
 
 - Arbitrary executable or script effect code, WASM, HTML/SVG assets.
 - Expression reactions, blendshape-driven behavior, animations, skins,
   secondary motion and moving parts. These need explicit runtime support in a
   later schema version.
+- Distortion modes other than `bulge` and `pinch`; per-landmark/per-expression
+  warps; a package-supplied distortion mesh or shader; animated or time-varying
+  displacement. The runtime supports only the fixed bounded radial warp.
+- `faceDistortion` in a schema v1 manifest (raise `schemaVersion` to 2).
 - Hand-over-mask occlusion, Unreal authoring, Snapchat Lens imports, and
   full strand-level hair simulation. Face-based occlusion of mask geometry
   behind the tracked face is supported for every mask; hand-over-mask occlusion
@@ -335,7 +418,7 @@ claim that every code is represented by a separate committed archive.
 - `.gltf` plus external `.bin`/textures, Draco/meshopt compression, ZIP64,
   encryption, multiple or nested asset folders.
 - More than one complete effect at a time, or combining components from two
-  packages (one package can combine its own mask and treatment).
+  packages (one package can combine its own mask, distortion and treatment).
 - Physical-webcam or live-human validation of packages; this slice is
   replay-based. Laptop/integrated-graphics behavior is also unverified.
 - Final complexity budgets (issue #11). This slice only measures and reports.
@@ -350,9 +433,13 @@ other integration point is needed.
    do **not** include animations, skins, cameras or lights. Keep the mask around
    the canonical face origin, in centimetres, with +Z toward the camera; use the
    manifest `attachment` for any offset/rotation/scale.
-2. Write `manifest.json` with `schemaVersion: 1`, a stable lowercase `id`, a
-   semantic `version`, a description and author attribution. Declare `mask`
-   and/or bounded `colorTreatment` parameters.
+2. Write `manifest.json` with the right schema: `schemaVersion: 1` for a mask
+   and/or color treatment, or `schemaVersion: 2` when declaring a
+   `faceDistortion`. Use a stable lowercase `id`, a semantic `version`, a
+   description and author attribution. Declare `mask`, bounded
+   `colorTreatment` parameters, and/or a bounded `faceDistortion`
+   (`mode: "bulge" | "pinch"`, `strength` 0-1, optional `radiusScale` 0.25-2.5
+   and `centerOffset` ±0.5 per axis).
 3. Zip only `manifest.json` and the declared `assets/<file>.glb` (one level, no
    extra files). Keep it kilobytes where possible.
 4. Run `npm run validate:package -- <file.zip>` (or import it in the app) and
@@ -370,7 +457,9 @@ for #11's complexity budgets.
 
 ## Validation and evidence
 
-- Unit tests: `npm test` covers schema/version rejection, color bounds, archive
+- Unit tests: `npm test` covers schema/version rejection (including a v1
+  manifest that declares `faceDistortion`), color and distortion bounds,
+  distortion mode/field rejection, the face-relative warp geometry, archive
   safety (zip-slip, absolute paths including directory entries, symlinks,
   duplicates, oversized declared entries, a lying-size inflate bomb, CRC and
   corruption, encryption and unsupported compression), GLB feature rejection
@@ -385,9 +474,18 @@ for #11's complexity budgets.
   material-colour counts and the probe pixel when it is visible), verifies a
   mask-only package with a nonzero attachment, switching/manual-pause/tracking
   gates, rapid double switching, rejects the negative fixtures with actionable
-  codes, and verifies removal and restart persistence. Scenario G additionally
-  holds a turned recorded frame and proves the same depth-only face occluder
-  changes the output for the bundled mask and for `guard-visor` and `rose-visor`.
+  codes, and verifies removal and restart persistence. The same scenario imports
+  the schema v2 `face-distortion` sample, asserts the public distortion
+  diagnostic's face-following ellipse and measured pixel change, captures
+  matching preview and camera frames, exercises every paused-output case for the
+  distortion (manual pause, tracking loss, multiple faces, processing failure,
+  switching, no-effect and removal), rejects the distortion negative fixtures,
+  and records replay-based warp/render/frame-pacing timing for the later
+  benchmark. Scenario G adds recorded-motion evidence: the warp ellipse follows
+  the tracked face box across the documented turn/nod/lean window, with
+  screenshots. Scenario G additionally holds a turned recorded frame and proves
+  the same depth-only face occluder changes the output for the bundled mask and
+  for `guard-visor` and `rose-visor`.
 - Evidence (screenshots, camera PNGs, `summary.json`, logs) is written under the
   gitignored `evidence/check-<timestamp>/` directory; `summary.json` contains the
   tested head SHA, the import result messages (which include the displayed

@@ -27,6 +27,8 @@ export interface PreviewState {
   effectHasMask?: boolean;
   /** Whether the complete effect applies a color treatment. */
   effectHasTreatment?: boolean;
+  /** Whether the complete effect applies a bounded face distortion. */
+  effectHasDistortion?: boolean;
   /** False when the selected id no longer resolves (for example a removed package). */
   effectValid?: boolean;
   /** Set when an imported effect failed to load; output stays paused. */
@@ -170,12 +172,23 @@ export function resolveOutput(state: PreviewState): OutputDecision {
   const label = state.effectLabel ?? getEffectLabel(state.effect);
   const effectHasMask = state.effectHasMask ?? isMaskEffect(state.effect);
   const effectHasTreatment = state.effectHasTreatment ?? getTreatment(state.effect) !== null;
-  const explanation =
-    effectHasMask && effectHasTreatment
-      ? `Processing the replay input with the ${label.toLowerCase()} mask attached to the tracked face and its color treatment applied.`
-      : effectHasMask
-        ? `Processing the replay input with the ${label.toLowerCase()} attached to the tracked face.`
-        : `Processing the replay input with the ${label.toLowerCase()} color treatment.`;
+  const effectHasDistortion = state.effectHasDistortion ?? false;
+  let explanation: string;
+  if (effectHasMask && effectHasDistortion && effectHasTreatment) {
+    explanation = `Processing the replay input with the ${label.toLowerCase()} mask and face distortion attached to the tracked face, and its color treatment applied.`;
+  } else if (effectHasMask && effectHasDistortion) {
+    explanation = `Processing the replay input with the ${label.toLowerCase()} mask and face distortion attached to the tracked face.`;
+  } else if (effectHasMask && effectHasTreatment) {
+    explanation = `Processing the replay input with the ${label.toLowerCase()} mask attached to the tracked face and its color treatment applied.`;
+  } else if (effectHasMask) {
+    explanation = `Processing the replay input with the ${label.toLowerCase()} attached to the tracked face.`;
+  } else if (effectHasDistortion && effectHasTreatment) {
+    explanation = `Processing the replay input with the ${label.toLowerCase()} face distortion applied around the tracked face and its color treatment applied.`;
+  } else if (effectHasDistortion) {
+    explanation = `Processing the replay input with the ${label.toLowerCase()} face distortion applied around the tracked face.`;
+  } else {
+    explanation = `Processing the replay input with the ${label.toLowerCase()} color treatment.`;
+  }
   return {
     mode: 'render',
     reason: 'ready',

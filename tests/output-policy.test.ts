@@ -286,3 +286,42 @@ test('a complete package effect renders with combined face-attachment and treatm
   assert.match(decision.explanation, /mask attached to the tracked face/);
   assert.match(decision.explanation, /color treatment/);
 });
+
+test('a face-distortion-only package renders with face-distortion wording', () => {
+  const decision = resolveOutput(
+    state({
+      effect: 'package:studio.face-distortion',
+      effectLabel: 'Face distortion',
+      effectHasMask: false,
+      effectHasDistortion: true,
+      effectHasTreatment: false,
+    }),
+  );
+  assert.equal(decision.mode, 'render');
+  assert.equal(decision.title, 'Effect active: Face distortion');
+  assert.match(decision.explanation, /face distortion applied around the tracked face/i);
+  assert.doesNotMatch(decision.explanation, /color treatment/i);
+});
+
+test('a face distortion is paused by every tracking and effect failure state', () => {
+  const distortion = {
+    effect: 'package:studio.face-distortion',
+    effectLabel: 'Face distortion',
+    effectHasMask: false,
+    effectHasDistortion: true,
+    effectHasTreatment: false,
+  } as const;
+  for (const phase of ['initializing', 'lost', 'multiple-faces', 'unreliable'] as const) {
+    const decision = resolveOutput(state({ ...distortion, tracking: tracking({ phase }) }));
+    assert.equal(decision.mode, 'paused', `phase ${phase} must pause the distortion`);
+    assert.equal(decision.title, PAUSED_TITLE);
+  }
+  assert.equal(resolveOutput(state({ ...distortion, manualPaused: true })).reason, 'manual-pause');
+  assert.equal(resolveOutput(state({ ...distortion, switching: true })).reason, 'effect-switching');
+  assert.equal(resolveOutput(state({ ...distortion, effectValid: false })).reason, 'effect-invalid');
+  assert.equal(resolveOutput(state({ ...distortion, effect: 'none' })).reason, 'no-effect');
+  assert.equal(
+    resolveOutput(state({ ...distortion, processingHealthy: false, processingError: 'failed' })).reason,
+    'processing-failure',
+  );
+});
