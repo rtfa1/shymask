@@ -392,7 +392,9 @@ async function reloadActiveMask(): Promise<void> {
 async function ensureMaskContent(token: number): Promise<void> {
   const mask = activeEffect.mask;
   if (!mask) {
-    maskSummary = null;
+    // Keep the last loaded package summary cached: diagnostics hide it while a
+    // no-mask effect is active, and returning to an already-loaded package mask
+    // should still report its mesh/probe summary without reloading.
     lastMaskProjection = EMPTY_MASK_PROJECTION;
     syncEffectState();
     renderNow();
