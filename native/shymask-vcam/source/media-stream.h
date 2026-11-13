@@ -84,8 +84,7 @@ class MediaStream final
   Microsoft::WRL::ComPtr<IMFAttributes> attributes_;
   Microsoft::WRL::ComPtr<IMFMediaType> currentType_;
   Microsoft::WRL::ComPtr<IMFVideoSampleAllocatorEx> allocator_;
-  Microsoft::WRL::ComPtr<IUnknown> d3dManager_;
-  GUID subtype_ = GUID_NULL;
+  bool allocatorProvided_ = false;
 
   std::condition_variable requestsAvailable_;
   std::deque<Microsoft::WRL::ComPtr<IUnknown>> pendingRequests_;
@@ -95,8 +94,6 @@ class MediaStream final
   bool allocatorInitialized_ = false;
 
   FrameTransport transport_;
-  uint64_t streamStartMs_ = 0;
-  uint64_t nextTickMs_ = 0;
   uint64_t deliveredSamples_ = 0;
   uint64_t fallbackSamples_ = 0;
   uint64_t allocatorFailures_ = 0;

@@ -23,6 +23,7 @@ class MediaSource final
           Microsoft::WRL::ChainInterfaces<IMFMediaSourceEx, IMFMediaSource, IMFMediaEventGenerator>,
           IMFGetService, IMFSampleAllocatorControl> {
  public:
+  MediaSource();
   HRESULT Initialize(IMFAttributes* activatorAttributes);
 
   // IMFMediaEventGenerator

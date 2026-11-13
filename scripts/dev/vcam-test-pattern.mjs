@@ -7,7 +7,12 @@
  * Electron: it serves two alternating solid-colour frames at 30 Hz and writes
  * the listening port to %ProgramData%\Shymask\vcam-port.
  *
- * Usage: node scripts/dev/vcam-test-pattern.mjs [--port 48010]
+ * Usage: node scripts/dev/vcam-test-pattern.mjs [--port 48010] [--stop-after N]
+ *
+ * `--stop-after N` stops writing frames after N frames but keeps the client
+ * connection open. That simulates a hung renderer so the native media source's
+ * staleness bound can be checked: the consumer must switch from the coloured
+ * test pattern to the opaque native paused fallback within a bounded time.
  */
 import { createServer } from 'node:net';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -21,6 +26,9 @@ const MAGIC = 0x4d594853;
 const args = process.argv.slice(2);
 const portIndex = args.indexOf('--port');
 const requestedPort = portIndex >= 0 ? Number(args[portIndex + 1]) : 48010;
+const stopAfterIndex = args.indexOf('--stop-after');
+const requestedStopAfter = stopAfterIndex >= 0 ? Number(args[stopAfterIndex + 1]) : 0;
+const stopAfter = Number.isFinite(requestedStopAfter) && requestedStopAfter > 0 ? requestedStopAfter : 0;
 
 function buildFrame({ r, g, b }, captureUnixMs, sequence) {
   const header = Buffer.alloc(HEADER_BYTES);
@@ -49,6 +57,7 @@ const cool = buildFrame({ r: 70, g: 120, b: 200 }, Date.now(), 0);
 const server = createServer((socket) => {
   console.log(`client connected from ${socket.remoteAddress}:${socket.remotePort}`);
   let sequence = 0;
+  let sent = 0;
   let useWarm = true;
   const timer = setInterval(() => {
     const base = useWarm ? warm : cool;
@@ -56,6 +65,11 @@ const server = createServer((socket) => {
     base.writeBigUInt64LE(BigInt(Date.now()), 24);
     base.writeBigUInt64LE(BigInt(sequence++), 32);
     socket.write(base);
+    sent += 1;
+    if (stopAfter > 0 && sent >= stopAfter) {
+      clearInterval(timer);
+      console.log(`stopped sending after ${sent} frames (connection kept open)`);
+    }
   }, 33);
   socket.on('close', () => {
     clearInterval(timer);

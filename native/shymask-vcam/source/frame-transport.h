@@ -14,6 +14,13 @@
 
 namespace shymask {
 
+// A cached app frame is only reused for this long after the last complete
+// frame arrived. A hung renderer (the socket stays open but stops sending)
+// must fall back to the native opaque paused frame instead of freezing a
+// processed frame forever. This is a steady-clock bound, independent of the
+// capture timestamp the app puts in the wire header.
+inline constexpr uint64_t kShymaskFrameStaleMs = 1200;
+
 class FrameTransport {
  public:
   FrameTransport();
@@ -29,7 +36,8 @@ class FrameTransport {
   bool HasFrame() const { return hasFrame_; }
   bool Connected() const { return socket_ != kInvalidSocket; }
 
-  // Copies the newest RGBA frame. Returns false when no frame has arrived yet.
+  // Copies the newest RGBA frame. Returns false when no frame has arrived yet
+  // or when the newest complete frame is older than kShymaskFrameStaleMs.
   bool CopyLatest(std::vector<uint8_t>* rgba, uint64_t* captureUnixMs, uint64_t* sequence) const;
 
   // Drops the connection (used when the app exits) and the cached frame.
@@ -58,6 +66,7 @@ class FrameTransport {
   uint64_t captureUnixMs_ = 0;
   uint64_t sequence_ = 0;
   bool hasFrame_ = false;
+  uint64_t lastFrameTickMs_ = 0;
   uint64_t nextConnectAttemptMs_ = 0;
   Stats stats_;
 };

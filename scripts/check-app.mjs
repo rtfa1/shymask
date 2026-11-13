@@ -32,6 +32,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { arch, cpus, platform, release, totalmem, version as osVersion } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { inflateSync } from 'node:zlib';
 import { _electron as electron } from 'playwright-core';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -172,6 +173,28 @@ async function waitForStatusTitle(page, pattern) {
 
 function git(args) {
   return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+}
+
+/**
+ * Derives the validation base instead of hard-coding a SHA. The default is the
+ * merge-base with origin/main; a caller can pin a different ref with
+ * SHYMASK_BASE_REF or an explicit SHA with SHYMASK_BASE_SHA.
+ */
+function resolveValidationBase() {
+  const override = (process.env.SHYMASK_BASE_SHA ?? '').trim();
+  if (override) return { ref: 'SHYMASK_BASE_SHA', sha: override };
+  const candidates = [process.env.SHYMASK_BASE_REF, 'origin/main', 'main'].filter(Boolean);
+  for (const ref of candidates) {
+    try {
+      const sha = git(['merge-base', ref, 'HEAD']);
+      if (sha) return { ref, sha };
+    } catch {
+      // Try the next candidate ref.
+    }
+  }
+  throw new Error(
+    'Could not derive the validation base; set SHYMASK_BASE_REF to a local ref or SHYMASK_BASE_SHA to a commit.',
+  );
 }
 
 /** Best-effort GPU name(s); Windows-only WMI query, empty elsewhere. */
@@ -531,6 +554,24 @@ async function invalidFixtureScenario() {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForProcessExit(pid, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processExists(pid)) return true;
+    await delay(100);
+  }
+  return !processExists(pid);
+}
+
 function parseJsonEvents(lines) {
   const events = [];
   for (const line of lines) {
@@ -581,6 +622,20 @@ function spawnCameraConsumer(prefix, frames, timeoutMs) {
   return { child, lines, exit };
 }
 
+/**
+ * The consumer writes PNG evidence after it decides whether any app frame
+ * arrived, so the PNG paths come as separate `png` events. Attach each path to
+ * its frame by index so assertions can require app-published evidence.
+ */
+function attachCameraPngs(events, frames) {
+  for (const event of events) {
+    if (event.event !== 'png' || typeof event.index !== 'number') continue;
+    const frame = frames.find((candidate) => candidate.index === event.index);
+    if (frame && typeof event.path === 'string') frame.png = event.path;
+  }
+  return frames;
+}
+
 async function runCameraConsumer(prefix, frames, timeoutMs = 15000) {
   const running = spawnCameraConsumer(prefix, frames, timeoutMs);
   const code = await Promise.race([running.exit, delay(timeoutMs + 5000).then(() => 'running')]);
@@ -592,7 +647,7 @@ async function runCameraConsumer(prefix, frames, timeoutMs = 15000) {
   return {
     code,
     events,
-    frames: events.filter((event) => event.event === 'frame'),
+    frames: attachCameraPngs(events, events.filter((event) => event.event === 'frame')),
     lines: running.lines,
   };
 }
@@ -624,9 +679,105 @@ function channelDistance(left, right) {
   );
 }
 
+/**
+ * Selects PNG evidence from an app-published frame when one exists. The native
+ * media source also holds a native opaque paused fallback for the window before
+ * the app's first frame; that fallback must never be used to evidence a
+ * processed state.
+ */
 function firstCameraPng(frames) {
-  const frame = frames.find((candidate) => candidate.png);
-  return frame ? frame.png : null;
+  const appFrame = frames.find((candidate) => candidate.png && candidate.captureUnixMs > 0);
+  if (appFrame) return appFrame.png;
+  const fallbackFrame = frames.find((candidate) => candidate.png);
+  return fallbackFrame ? fallbackFrame.png : null;
+}
+
+function paeth(left, up, upLeft) {
+  const estimate = left + up - upLeft;
+  const leftDistance = Math.abs(estimate - left);
+  const upDistance = Math.abs(estimate - up);
+  const upLeftDistance = Math.abs(estimate - upLeft);
+  if (leftDistance <= upDistance && leftDistance <= upLeftDistance) return left;
+  if (upDistance <= upLeftDistance) return up;
+  return upLeft;
+}
+
+/**
+ * Decodes the saved camera PNG and returns its mean RGB. Assertions use the
+ * pixels that are actually on disk, not the consumer's in-memory statistics, so
+ * a wrong PNG (for example a pre-connection native fallback) cannot satisfy a
+ * processed-state check.
+ */
+function pngMeanRgb(file) {
+  const bytes = readFileSync(file);
+  assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', 'camera frame must be a PNG');
+  let offset = 8;
+  let width = 0;
+  let height = 0;
+  let bitDepth = 0;
+  let colorType = 0;
+  let interlace = 0;
+  const idat = [];
+  while (offset + 8 <= bytes.length) {
+    const length = bytes.readUInt32BE(offset);
+    const type = bytes.subarray(offset + 4, offset + 8).toString('ascii');
+    const data = bytes.subarray(offset + 8, offset + 8 + length);
+    offset += 12 + length;
+    if (type === 'IHDR') {
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      bitDepth = data[8];
+      colorType = data[9];
+      interlace = data[12];
+    } else if (type === 'IDAT') {
+      idat.push(data);
+    } else if (type === 'IEND') {
+      break;
+    }
+  }
+  assert.equal(bitDepth, 8, `unsupported PNG bit depth ${bitDepth}`);
+  assert.equal(interlace, 0, 'interlaced PNG evidence is not supported');
+  const channels = colorType === 6 ? 4 : colorType === 2 ? 3 : 0;
+  assert.ok(channels > 0, `unsupported PNG colour type ${colorType}`);
+  const raw = inflateSync(Buffer.concat(idat));
+  const stride = width * channels;
+  assert.equal(raw.length, height * (stride + 1), 'PNG data length must match its dimensions');
+  const pixels = Buffer.alloc(height * stride);
+  for (let y = 0; y < height; y += 1) {
+    const filter = raw[y * (stride + 1)];
+    const rowIn = raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1));
+    const rowOut = pixels.subarray(y * stride, (y + 1) * stride);
+    const previous = y > 0 ? pixels.subarray((y - 1) * stride, y * stride) : null;
+    for (let x = 0; x < stride; x += 1) {
+      const left = x >= channels ? rowOut[x - channels] : 0;
+      const up = previous ? previous[x] : 0;
+      const upLeft = previous && x >= channels ? previous[x - channels] : 0;
+      let value = rowIn[x];
+      if (filter === 1) value += left;
+      else if (filter === 2) value += up;
+      else if (filter === 3) value += Math.floor((left + up) / 2);
+      else if (filter === 4) value += paeth(left, up, upLeft);
+      rowOut[x] = value & 0xff;
+    }
+  }
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  let count = 0;
+  for (let y = 0; y < height; y += 2) {
+    for (let x = 0; x < width; x += 2) {
+      const index = y * stride + x * channels;
+      red += pixels[index];
+      green += pixels[index + 1];
+      blue += pixels[index + 2];
+      count += 1;
+    }
+  }
+  return {
+    r: Math.round(red / count),
+    g: Math.round(green / count),
+    b: Math.round(blue / count),
+  };
 }
 
 function pngSize(file) {
@@ -644,6 +795,11 @@ function percentile(values, fraction) {
 
 function assertAllPausedFrames(frames, label) {
   assert.ok(frames.length >= 2, `${label}: expected at least two camera frames, got ${frames.length}`);
+  const appFrames = frames.filter((frame) => frame.captureUnixMs > 0);
+  assert.ok(
+    appFrames.length >= 1,
+    `${label}: expected at least one app-published paused frame (captureUnixMs > 0) proving the shared output policy, got ${appFrames.length}`,
+  );
   for (const frame of frames) {
     const rgb = cameraFrameRgb(frame);
     assert.ok(
@@ -668,6 +824,50 @@ function assertProcessedFrames(frames, previewRgb, label) {
     rgbSum(cameraFrameRgb(closest.frame)) > 120,
     `${label}: processed camera frame must not be the dark paused screen`,
   );
+}
+
+/**
+ * Processed states must be evidenced by a saved PNG that really shows the
+ * processed pixels and comes from an app frame, not the native paused fallback.
+ */
+function assertProcessedPng(frames, previewRgb, label) {
+  const png = firstCameraPng(frames);
+  assert.ok(png, `${label}: expected camera PNG evidence from an app frame`);
+  const frame = frames.find((candidate) => candidate.png === png);
+  assert.ok(
+    frame && frame.captureUnixMs > 0,
+    `${label}: saved PNG must come from an app-published frame (captureUnixMs > 0)`,
+  );
+  const pngRgb = pngMeanRgb(png);
+  assert.ok(
+    rgbSum(pngRgb) > 120,
+    `${label}: saved PNG must show processed content, got ${JSON.stringify(pngRgb)}`,
+  );
+  assert.ok(
+    channelDistance(pngRgb, previewRgb) <= 25,
+    `${label}: saved PNG mean ${JSON.stringify(pngRgb)} must match the asserted processed colour ${JSON.stringify(previewRgb)}`,
+  );
+  return { png, rgb: pngRgb };
+}
+
+/**
+ * Paused states must be evidenced by an app-published paused frame and a saved
+ * PNG whose pixels are actually the opaque paused canvas.
+ */
+function assertPausedPng(frames, label) {
+  const png = firstCameraPng(frames);
+  assert.ok(png, `${label}: expected camera PNG evidence for the paused canvas`);
+  const frame = frames.find((candidate) => candidate.png === png);
+  assert.ok(
+    frame && frame.captureUnixMs > 0,
+    `${label}: saved PNG must come from an app-published paused frame (captureUnixMs > 0)`,
+  );
+  const pngRgb = pngMeanRgb(png);
+  assert.ok(
+    rgbSum(pngRgb) < 120,
+    `${label}: saved PNG must be the opaque paused canvas, got ${JSON.stringify(pngRgb)}`,
+  );
+  return { png, rgb: pngRgb };
 }
 
 async function waitForVirtualCamera(page, timeoutMs = 30000) {
@@ -712,21 +912,21 @@ async function virtualCameraScenario() {
 
     // Startup: the preview and the camera both show the opaque paused canvas.
     const previewStartup = await readRgb(page);
-    const startupRun = await captureCameraState(page, 'startup-paused', 4);
+    const startupRun = await captureCameraState(page, 'startup-paused', 6);
     assertAllPausedFrames(startupRun.frames, 'startup');
-    const startupPng = firstCameraPng(startupRun.frames);
-    assert.ok(startupPng, 'startup camera frame should be captured as PNG evidence');
-    const startupSize = pngSize(startupPng);
+    const startupPng = assertPausedPng(startupRun.frames, 'startup');
+    const startupSize = pngSize(startupPng.png);
     assert.deepEqual(startupSize, { width: 1280, height: 720 });
     evidence.states.startup = {
       preview: previewStartup,
       camera: averageFrameRgb(startupRun.frames),
       frames: startupRun.frames.length,
-      png: startupPng,
+      png: startupPng.png,
+      pngRgb: startupPng.rgb,
     };
     pass(
       'Camera startup output is the opaque "Tracking paused" canvas, not the raw feed',
-      `${JSON.stringify(evidence.states.startup.camera)} ${startupPng}`,
+      `${JSON.stringify(evidence.states.startup.camera)} ${startupPng.png}`,
     );
 
     await page.locator('[data-testid="start"]').click();
@@ -734,45 +934,56 @@ async function virtualCameraScenario() {
     await waitFor('warm preview output', async () => (rgbSum(await readRgb(page)) > 120 ? true : null));
     await delay(500);
     const previewWarm = await readRgb(page);
-    const warmRun = await captureCameraState(page, 'warm', 5);
+    const warmRun = await captureCameraState(page, 'warm', 6);
     assertProcessedFrames(warmRun.frames, previewWarm, 'warm');
+    const warmPng = assertProcessedPng(warmRun.frames, previewWarm, 'warm');
     evidence.states.warm = {
       preview: previewWarm,
       camera: averageFrameRgb(warmRun.frames),
       frames: warmRun.frames.length,
-      png: firstCameraPng(warmRun.frames),
+      png: warmPng.png,
+      pngRgb: warmPng.rgb,
     };
     pass(
       'Processed replay frames reach the external camera consumer with the preview treatment',
-      `preview=${JSON.stringify(previewWarm)} camera=${JSON.stringify(evidence.states.warm.camera)}`,
+      `preview=${JSON.stringify(previewWarm)} camera=${JSON.stringify(evidence.states.warm.camera)} png=${JSON.stringify(warmPng.rgb)}`,
     );
 
     await page.locator('[data-testid="effect-select"]').selectOption('cool');
     await waitForStatusTitle(page, /Effect active: Cool tint/);
     await delay(600);
     const previewCool = await readRgb(page);
-    const coolRun = await captureCameraState(page, 'cool', 5);
+    const coolRun = await captureCameraState(page, 'cool', 6);
     assertProcessedFrames(coolRun.frames, previewCool, 'cool');
+    const coolPng = assertProcessedPng(coolRun.frames, previewCool, 'cool');
     const coolCamera = averageFrameRgb(coolRun.frames);
     assert.ok(
       rgbDistance(coolCamera, evidence.states.warm.camera) > 40,
       `switching the effect must change the camera output, warm=${JSON.stringify(evidence.states.warm.camera)} cool=${JSON.stringify(coolCamera)}`,
     );
-    evidence.states.cool = { preview: previewCool, camera: coolCamera, frames: coolRun.frames.length };
+    evidence.states.cool = {
+      preview: previewCool,
+      camera: coolCamera,
+      frames: coolRun.frames.length,
+      png: coolPng.png,
+      pngRgb: coolPng.rgb,
+    };
     pass('Switching the color treatment changes the camera output too', JSON.stringify(coolCamera));
 
     await page.locator('[data-testid="pause-toggle"]').click();
     await waitForStatusTitle(page, /^Tracking paused$/);
     await delay(400);
     const previewPaused = await readRgb(page);
-    const pausedRun = await captureCameraState(page, 'manual-pause', 4);
+    const pausedRun = await captureCameraState(page, 'manual-pause', 6);
     assertAllPausedFrames(pausedRun.frames, 'manual pause');
+    const pausedPng = assertPausedPng(pausedRun.frames, 'manual pause');
     assert.ok(rgbSum(previewPaused) < 120, 'preview paused output must be dark');
     evidence.states.manualPause = {
       preview: previewPaused,
       camera: averageFrameRgb(pausedRun.frames),
       frames: pausedRun.frames.length,
-      png: firstCameraPng(pausedRun.frames),
+      png: pausedPng.png,
+      pngRgb: pausedPng.rgb,
     };
     pass(
       'Manual pause produces the opaque paused canvas in the camera consumer',
@@ -783,43 +994,75 @@ async function virtualCameraScenario() {
     await waitForStatusTitle(page, /Effect active: Cool tint/);
     await delay(600);
     const resumedPreview = await readRgb(page);
-    const resumedRun = await captureCameraState(page, 'resumed', 5);
+    const resumedRun = await captureCameraState(page, 'resumed', 6);
     assertProcessedFrames(resumedRun.frames, resumedPreview, 'resume');
-    evidence.states.resumed = { preview: resumedPreview, camera: averageFrameRgb(resumedRun.frames) };
+    const resumedPng = assertProcessedPng(resumedRun.frames, resumedPreview, 'resume');
+    evidence.states.resumed = {
+      preview: resumedPreview,
+      camera: averageFrameRgb(resumedRun.frames),
+      png: resumedPng.png,
+      pngRgb: resumedPng.rgb,
+    };
     pass('Resume restores processed camera output', JSON.stringify(evidence.states.resumed.camera));
 
     await page.locator('[data-testid="effect-select"]').selectOption('none');
     await waitForStatusTitle(page, /^Tracking paused$/);
     await delay(400);
-    const noEffectRun = await captureCameraState(page, 'no-effect', 4);
+    const noEffectRun = await captureCameraState(page, 'no-effect', 6);
     assertAllPausedFrames(noEffectRun.frames, 'no effect');
-    evidence.states.noEffect = { camera: averageFrameRgb(noEffectRun.frames) };
+    const noEffectPng = assertPausedPng(noEffectRun.frames, 'no effect');
+    evidence.states.noEffect = {
+      camera: averageFrameRgb(noEffectRun.frames),
+      png: noEffectPng.png,
+      pngRgb: noEffectPng.rgb,
+    };
     pass('No active effect hides the camera feed behind the opaque paused canvas', JSON.stringify(evidence.states.noEffect.camera));
 
     await page.locator('[data-testid="effect-select"]').selectOption('warm');
     await waitForStatusTitle(page, /Effect active: Warm tint/);
     await delay(600);
     const recoveryPreview = await readRgb(page);
-    const recoveryRun = await captureCameraState(page, 'effect-recovered', 5);
+    const recoveryRun = await captureCameraState(page, 'effect-recovered', 6);
     assertProcessedFrames(recoveryRun.frames, recoveryPreview, 'effect recovery');
-    evidence.states.effectRecovered = { preview: recoveryPreview, camera: averageFrameRgb(recoveryRun.frames) };
+    const recoveryPng = assertProcessedPng(recoveryRun.frames, recoveryPreview, 'effect recovery');
+    evidence.states.effectRecovered = {
+      preview: recoveryPreview,
+      camera: averageFrameRgb(recoveryRun.frames),
+      png: recoveryPng.png,
+      pngRgb: recoveryPng.rgb,
+    };
     pass('Selecting a treatment restores processed camera output', JSON.stringify(evidence.states.effectRecovered.camera));
 
     await page.locator('[data-testid="simulate-failure"]').check();
     await waitForStatusTitle(page, /^Tracking paused$/);
     await delay(400);
-    const failureRun = await captureCameraState(page, 'processing-failure', 4);
+    const failureRun = await captureCameraState(page, 'processing-failure', 6);
     assertAllPausedFrames(failureRun.frames, 'processing failure');
-    evidence.states.processingFailure = { camera: averageFrameRgb(failureRun.frames), png: firstCameraPng(failureRun.frames) };
+    const failurePng = assertPausedPng(failureRun.frames, 'processing failure');
+    evidence.states.processingFailure = {
+      camera: averageFrameRgb(failureRun.frames),
+      png: failurePng.png,
+      pngRgb: failurePng.rgb,
+    };
     pass('Injected processing failure hides the camera feed behind the opaque paused canvas', JSON.stringify(evidence.states.processingFailure.camera));
 
     await page.locator('[data-testid="simulate-failure"]').uncheck();
     await waitForStatusTitle(page, /Effect active: Warm tint/);
     await delay(600);
     const failureRecoveryPreview = await readRgb(page);
-    const failureRecoveryRun = await captureCameraState(page, 'failure-recovered', 5);
+    const failureRecoveryRun = await captureCameraState(page, 'failure-recovered', 6);
     assertProcessedFrames(failureRecoveryRun.frames, failureRecoveryPreview, 'failure recovery');
-    evidence.states.failureRecovered = { preview: failureRecoveryPreview, camera: averageFrameRgb(failureRecoveryRun.frames) };
+    const failureRecoveryPng = assertProcessedPng(
+      failureRecoveryRun.frames,
+      failureRecoveryPreview,
+      'failure recovery',
+    );
+    evidence.states.failureRecovered = {
+      preview: failureRecoveryPreview,
+      camera: averageFrameRgb(failureRecoveryRun.frames),
+      png: failureRecoveryPng.png,
+      pngRgb: failureRecoveryPng.rgb,
+    };
     pass('Camera output recovers automatically after the processing failure clears', JSON.stringify(evidence.states.failureRecovered.camera));
 
     // Multiple replay loops and the replay-to-camera timing baseline.
@@ -870,6 +1113,12 @@ async function virtualCameraScenario() {
     );
 
     // Closing the app must stop camera output and remove the camera device.
+    const vcamBeforeClose = parseKeyValues(await readDiagnostic(page, 'diag-vcam'));
+    const hostPid = Number(vcamBeforeClose.pid ?? 0);
+    assert.ok(
+      Number.isInteger(hostPid) && hostPid > 0,
+      `virtual camera host PID must be reported before closing, got ${vcamBeforeClose.pid}`,
+    );
     const streaming = spawnCameraConsumer('close-stop', 100000, 15000);
     await waitFor(
       'camera stream before closing the app',
@@ -878,32 +1127,48 @@ async function virtualCameraScenario() {
     );
     const closedAt = Date.now();
     await closeApp(app);
+    const hostPidExited = await waitForProcessExit(hostPid, 8000);
+    assert.ok(hostPidExited, `camera host pid ${hostPid} must exit after the app closes`);
     const consumerExit = await Promise.race([streaming.exit, delay(12000).then(() => 'running')]);
     if (consumerExit === 'running') streaming.child.kill();
     const closeEvents = parseJsonEvents(streaming.lines);
     const closeFrames = closeEvents.filter((event) => event.event === 'frame');
     const lateFrames = closeFrames.filter((frame) => frame.receivedUnixMs > closedAt + 1500);
     assert.equal(lateFrames.length, 0, `camera kept delivering ${lateFrames.length} frames after the app closed`);
-    assert.ok(
-      closeEvents.some((event) => ['stream-end', 'read-failed', 'timeout'].includes(event.event)) ||
-        consumerExit !== 'running',
-      'camera consumer must observe the stream ending after the app closes',
+    const sawStreamEnd = closeEvents.some(
+      (event) => event.event === 'stream-end' || event.event === 'read-failed',
     );
+    const sawTimeout = closeEvents.some((event) => event.event === 'timeout');
     await delay(1500);
     const listed = spawnSync(hostListPath, ['list'], { encoding: 'utf8' });
     const devices = parseJsonEvents((listed.stdout ?? '').split(/\r?\n/)).filter(
       (event) => event.event === 'device' && /^Shymask Camera/.test(event.name ?? ''),
     );
     assert.equal(devices.length, 0, 'the Shymask Camera must not be enumerable after the app closes');
+    // A consumer timeout only counts as the stream ending when there were no
+    // late frames and the camera device really disappeared, and the evidence
+    // says so explicitly rather than treating "no event" as success.
+    const consumerTimedOut = consumerExit === 'running' || sawTimeout;
+    const timeoutAccepted = consumerTimedOut && lateFrames.length === 0 && devices.length === 0;
+    assert.ok(
+      sawStreamEnd || timeoutAccepted,
+      `camera consumer must observe the stream ending after the app closes (streamEnd=${sawStreamEnd} timeout=${consumerTimedOut} lateFrames=${lateFrames.length} devices=${devices.length})`,
+    );
     evidence.close = {
+      hostPid,
+      hostPidExited,
       framesBeforeClose: closeFrames.length,
       framesAfterClose: lateFrames.length,
       consumerExit,
+      sawStreamEnd,
+      sawTimeout,
+      consumerTimedOut,
+      timeoutAccepted,
       enumerableAfterClose: devices.length,
     };
     pass(
       'Closing Shymask stops camera output and removes the camera device',
-      `consumer exit=${consumerExit} lateFrames=${lateFrames.length} devices=${devices.length}`,
+      `hostPid=${hostPid} exited=${hostPidExited} consumer exit=${consumerExit} lateFrames=${lateFrames.length} timeoutAccepted=${timeoutAccepted} devices=${devices.length}`,
     );
 
     assert.deepEqual(consoleErrors, [], `renderer console errors: ${consoleErrors.join(' | ')}`);
@@ -928,14 +1193,18 @@ async function missingFixtureCameraScenario() {
     assert.match(status.explanation, /missing/i);
     assert.equal(await page.locator('[data-testid="start"]').isDisabled(), true);
     await waitForVirtualCamera(page);
-    const run = await captureCameraState(page, 'missing-fixture', 4);
+    const run = await captureCameraState(page, 'missing-fixture', 6);
     assertAllPausedFrames(run.frames, 'missing fixture');
-    const png = firstCameraPng(run.frames);
-    assert.ok(png, 'missing-fixture camera frame should be captured as PNG evidence');
-    evidence.states.missingFixture = { camera: averageFrameRgb(run.frames), frames: run.frames.length, png };
+    const pausedPng = assertPausedPng(run.frames, 'missing fixture');
+    evidence.states.missingFixture = {
+      camera: averageFrameRgb(run.frames),
+      frames: run.frames.length,
+      png: pausedPng.png,
+      pngRgb: pausedPng.rgb,
+    };
     pass(
       'Missing replay input keeps the camera on the opaque paused canvas',
-      `${JSON.stringify(evidence.states.missingFixture.camera)} ${png}`,
+      `${JSON.stringify(evidence.states.missingFixture.camera)} ${pausedPng.png}`,
     );
     assert.equal(consoleErrors.length, 0, `renderer console errors: ${consoleErrors.join(' | ')}`);
   } finally {
@@ -1003,11 +1272,13 @@ function prepareNativeComponents() {
 async function main() {
   const headSha = git(['rev-parse', 'HEAD']);
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
+  const validationBase = resolveValidationBase();
   const environment = collectEnvironment();
   const ciWorkflowsPresent = existsSync(path.join(root, '.github', 'workflows'));
   log('== Shymask public-workflow check ==');
   log(`head:     ${headSha}`);
   log(`branch:   ${branch}`);
+  log(`base:     ${validationBase.sha} (merge-base with ${validationBase.ref})`);
   log(`command:  npm run check (build + this Electron/Playwright harness)`);
   log(`source:   recorded replay fixture ${metadata.fileName} (no physical webcam; Windows virtual camera path included)`);
   log(
@@ -1029,7 +1300,8 @@ async function main() {
     generatedAt: new Date().toISOString(),
     headSha,
     branch,
-    baseSha: 'd28427e8b1844ce67f6923c982d4c14cf7ed130a',
+    baseSha: validationBase.sha,
+    baseRef: validationBase.ref,
     environment,
     workload: {
       sourceMode: 'recorded replay fixture (no physical webcam)',

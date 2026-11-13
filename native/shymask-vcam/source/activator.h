@@ -20,6 +20,7 @@ class Activator final
           Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
           Microsoft::WRL::ChainInterfaces<IMFActivate, IMFAttributes>> {
  public:
+  Activator();
   HRESULT Initialize();
   ~Activator() override;
 

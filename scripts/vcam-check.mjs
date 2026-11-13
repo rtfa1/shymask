@@ -87,6 +87,8 @@ async function waitFor(predicate, timeoutMs, description) {
   throw new Error(`timed out waiting for ${description}`);
 }
 
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 function readJsonLines(lines, event) {
   return lines
     .filter((line) => line.startsWith('{'))
@@ -190,6 +192,7 @@ async function main() {
   const host = runProcess('host', hostPath, ['run'], { stdin: true });
   let consumerOutput = [];
   let cameraStarted = false;
+  let staleFrameSource = null;
 
   try {
     const portLine = await waitFor(
@@ -247,7 +250,7 @@ async function main() {
       if (consumerCode === 'timeout') consumer.child.kill();
       consumerOutput = consumer.lines;
       const frames = readJsonLines(consumer.lines, 'frame');
-      const pngs = frames.filter((frame) => frame.png);
+      const pngs = readJsonLines(consumer.lines, 'png');
       record(
         'Independent Media Foundation consumer received frames',
         frames.length >= 6 && consumerCode === 0 ? 'pass' : 'fail',
@@ -267,6 +270,75 @@ async function main() {
           `warm=${warmFrames.length} cool=${coolFrames.length} pausedFallback=${pausedFrames.length}`,
         );
       }
+
+      // Staleness bound: the frame source goes silent but keeps the socket
+      // open. The native media source must stop reusing the cached processed
+      // frame after kShymaskFrameStaleMs (1200 ms) and deliver the opaque
+      // paused fallback, so a hung renderer cannot freeze a processed frame.
+      if (frameSource.child.exitCode === null) frameSource.child.kill();
+      await Promise.race([frameSource.exit, delay(3000)]);
+      staleFrameSource = runProcess('stale-source', process.execPath, [
+        frameSourcePath,
+        '--port',
+        '48011',
+        '--stop-after',
+        '100',
+      ]);
+      await waitFor(
+        () => staleFrameSource.lines.find((line) => line.startsWith('serving ')),
+        10000,
+        'the staleness test-pattern source',
+      );
+      await delay(600);
+      const staleConsumer = runProcess('stale-consumer', consumerPath, [
+        '--device',
+        'Shymask Camera',
+        '--frames',
+        '200',
+        '--out',
+        framesDir,
+        '--prefix',
+        'stale',
+        '--max-pngs',
+        '2',
+        '--timeout-ms',
+        '15000',
+      ]);
+      const staleCode = await Promise.race([
+        staleConsumer.exit,
+        delay(17000).then(() => 'timeout'),
+      ]);
+      if (staleCode === 'timeout') staleConsumer.child.kill();
+      const staleFrames = readJsonLines(staleConsumer.lines, 'frame');
+      const staleSummary = readJsonLines(staleConsumer.lines, 'summary')[0] ?? {};
+      const brightness = (frame) =>
+        (frame.meanR ?? 0) + (frame.meanG ?? 0) + (frame.meanB ?? 0);
+      const colored = staleFrames.filter((frame) => brightness(frame) > 120);
+      const lastColored = colored[colored.length - 1];
+      const darkAfterColored = lastColored
+        ? staleFrames.filter(
+            (frame) => frame.index > lastColored.index && brightness(frame) < 120,
+          )
+        : [];
+      const firstDark = darkAfterColored[0];
+      const staleGapMs =
+        firstDark && lastColored
+          ? firstDark.receivedUnixMs - lastColored.captureUnixMs
+          : null;
+      const staleOk =
+        staleCode === 0 &&
+        colored.length >= 10 &&
+        darkAfterColored.length >= 5 &&
+        staleGapMs !== null &&
+        staleGapMs >= 800 &&
+        staleGapMs <= 3000;
+      record(
+        'Hung frame source falls back to the native paused frame',
+        staleOk ? 'pass' : 'fail',
+        `colored=${colored.length} darkAfter=${darkAfterColored.length} gap=${staleGapMs}ms ` +
+          `(staleness bound 1200ms, accepted 800-3000ms) exit=${staleCode} ` +
+          `frames=${staleSummary.frames ?? staleFrames.length}`,
+      );
     } else if (outcome.error) {
       record('Virtual camera registered and started', 'blocked', `${outcome.error.code} ${outcome.error.hresult}`);
       // Give the frame server a moment to flush its event record.
@@ -331,10 +403,14 @@ async function main() {
     await Promise.race([host.exit, new Promise((resolve) => setTimeout(resolve, 8000))]);
     if (host.child.exitCode === null) host.child.kill();
     if (frameSource.child.exitCode === null) frameSource.child.kill();
+    if (staleFrameSource && staleFrameSource.child.exitCode === null) {
+      staleFrameSource.child.kill();
+    }
   }
 
   if (cameraStarted) {
     const frames = readJsonLines(consumerOutput, 'frame');
+    const pngEvents = readJsonLines(consumerOutput, 'png');
     writeSummary({
       generatedAt: new Date().toISOString(),
       headSha,
@@ -342,7 +418,13 @@ async function main() {
       status: 'pass',
       environment,
       results,
-      frames: frames.map(({ png, ...rest }) => ({ ...rest, png: png ? path.basename(png) : '' })),
+      frames,
+      pngs: pngEvents.map(({ path: pngPath, ...rest }) => ({
+        ...rest,
+        png: pngPath ? path.basename(pngPath) : '',
+      })),
+      frameStalenessBoundMs: 1200,
+      // The freshness bound lives in native/shymask-vcam/source/frame-transport.h.
       commands: { build: 'npm run build:native', install: 'npm run vcam:install', check: 'npm run vcam:check' },
       limitations: [
         'Test-pattern source, not the Shymask replay canvas (the Electron integration is a later slice).',

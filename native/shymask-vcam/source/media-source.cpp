@@ -1,6 +1,7 @@
 #include "media-source.h"
 
 #include "logging.h"
+#include "module-lock.h"
 #include "protocol.h"
 
 #include <mfapi.h>
@@ -13,7 +14,12 @@ using Microsoft::WRL::ComPtr;
 
 namespace shymask {
 
-MediaSource::~MediaSource() { Shutdown(); }
+MediaSource::MediaSource() { ModuleAddLiveObject(); }
+
+MediaSource::~MediaSource() {
+  Shutdown();
+  ModuleRemoveLiveObject();
+}
 
 HRESULT MediaSource::Initialize(IMFAttributes* activatorAttributes) {
   HRESULT hr = MFCreateAttributes(&attributes_, 4);

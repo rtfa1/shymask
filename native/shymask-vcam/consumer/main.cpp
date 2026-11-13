@@ -22,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "protocol.h"
@@ -230,6 +231,19 @@ Options ParseOptions(int argc, wchar_t** argv) {
   return options;
 }
 
+/** A frame held in memory until the consumer knows which PNGs to keep. */
+struct PngCandidate {
+  int index = 0;
+  int width = 0;
+  int height = 0;
+  int stride = 0;
+  uint64_t captureUnixMs = 0;
+  int meanR = 0;
+  int meanG = 0;
+  int meanB = 0;
+  std::vector<BYTE> pixels;
+};
+
 ComPtr<IMFMediaType> CreateRgb32Type(UINT32 width, UINT32 height) {
   ComPtr<IMFMediaType> type;
   if (FAILED(MFCreateMediaType(&type))) return nullptr;
@@ -368,7 +382,11 @@ int Capture(const Options& options) {
   const uint64_t startedAtMs = NowUnixMs();
   std::vector<double> intervals;
   int frames = 0;
-  int pngs = 0;
+  // PNG evidence prefers app-published frames (captureUnixMs > 0). The native
+  // paused fallback is only kept when the whole run produced no app frame, so
+  // a processed state can never be evidenced by a pre-connection fallback.
+  std::vector<PngCandidate> appPngCandidates;
+  std::vector<PngCandidate> fallbackPngCandidates;
   int64_t previousCaptureMs = -1;
   uint64_t lastSampleTime = 0;
   HRESULT lastError = S_OK;
@@ -453,14 +471,27 @@ int Capture(const Options& options) {
     }
     previousCaptureMs = static_cast<int64_t>(receivedUnixMs);
 
-    std::string pngPath;
-    if (pngs < options.maxPngs && !options.outDirectory.empty()) {
-      wchar_t fileName[512];
-      swprintf_s(fileName, L"%s-%03d.png", options.prefix.c_str(), frames);
-      const std::wstring fullPath = options.outDirectory + L"\\" + fileName;
-      if (WritePng(fullPath, static_cast<int>(width), static_cast<int>(height), stride, pixels)) {
-        pngPath = ToUtf8(fullPath);
-        ++pngs;
+    if (!options.outDirectory.empty() && options.maxPngs > 0) {
+      std::vector<PngCandidate>* target = nullptr;
+      if (captureUnixMs > 0) {
+        if (static_cast<int>(appPngCandidates.size()) < options.maxPngs) {
+          target = &appPngCandidates;
+        }
+      } else if (static_cast<int>(fallbackPngCandidates.size()) < options.maxPngs) {
+        target = &fallbackPngCandidates;
+      }
+      if (target) {
+        PngCandidate candidate;
+        candidate.index = frames;
+        candidate.width = static_cast<int>(width);
+        candidate.height = static_cast<int>(height);
+        candidate.stride = stride;
+        candidate.captureUnixMs = captureUnixMs;
+        candidate.meanR = meanR;
+        candidate.meanG = meanG;
+        candidate.meanB = meanB;
+        candidate.pixels.assign(pixels, pixels + static_cast<size_t>(stride) * height);
+        target->push_back(std::move(candidate));
       }
     }
 
@@ -468,12 +499,11 @@ int Capture(const Options& options) {
     std::snprintf(frameJson, sizeof(frameJson),
                   "{\"event\":\"frame\",\"index\":%d,\"sampleTimeMs\":%.1f,\"receivedUnixMs\":%llu,"
                   "\"captureUnixMs\":%llu,\"latencyMs\":%lld,\"width\":%u,\"height\":%u,"
-                  "\"meanR\":%d,\"meanG\":%d,\"meanB\":%d,\"png\":\"%s\"}",
+                  "\"meanR\":%d,\"meanG\":%d,\"meanB\":%d}",
                   frames, static_cast<double>(timestamp) / 10000.0,
                   static_cast<unsigned long long>(receivedUnixMs),
                   static_cast<unsigned long long>(captureUnixMs),
-                  static_cast<long long>(latencyMs), width, height, meanR, meanG, meanB,
-                  JsonEscape(pngPath).c_str());
+                  static_cast<long long>(latencyMs), width, height, meanR, meanG, meanB);
     Emit(frameJson);
     lastSampleTime = static_cast<uint64_t>(timestamp);
     ++frames;
@@ -483,6 +513,29 @@ int Capture(const Options& options) {
 
   finished.store(true);
   watchdog.join();
+
+  // Write PNG evidence only from the preferred class of frames: app frames
+  // when at least one arrived, otherwise the native paused fallback (a stream
+  // with no app connection at all).
+  const std::vector<PngCandidate>& selectedPngs =
+      !appPngCandidates.empty() ? appPngCandidates : fallbackPngCandidates;
+  for (const PngCandidate& candidate : selectedPngs) {
+    wchar_t fileName[512];
+    swprintf_s(fileName, L"%s-%03d.png", options.prefix.c_str(), candidate.index);
+    const std::wstring fullPath = options.outDirectory + L"\\" + fileName;
+    if (!WritePng(fullPath, candidate.width, candidate.height, candidate.stride,
+                  candidate.pixels.data())) {
+      continue;
+    }
+    char pngJson[2048];
+    std::snprintf(pngJson, sizeof(pngJson),
+                  "{\"event\":\"png\",\"index\":%d,\"captureUnixMs\":%llu,\"width\":%d,"
+                  "\"height\":%d,\"meanR\":%d,\"meanG\":%d,\"meanB\":%d,\"path\":\"%s\"}",
+                  candidate.index, static_cast<unsigned long long>(candidate.captureUnixMs),
+                  candidate.width, candidate.height, candidate.meanR, candidate.meanG,
+                  candidate.meanB, JsonEscape(ToUtf8(fullPath)).c_str());
+    Emit(pngJson);
+  }
 
   if (intervals.empty()) {
     Emit("{\"event\":\"summary\",\"frames\":" + std::to_string(frames) + ",\"intervalsMs\":[]}");

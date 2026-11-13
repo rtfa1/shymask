@@ -3,9 +3,11 @@
 Shymask applies visual effects to a webcam feed and publishes the result as a virtual webcam. This
 repository currently delivers a **recorded-replay preview** (issue #2) and the **Windows 11 virtual
 camera** (issue #3): a desktop preview loops a recorded webcam-style clip at real-time pacing,
-displays a selectable color treatment, and publishes the exact same 1280×720 output canvas as
-**Shymask Camera** so other applications can select it. No physical webcam, account, cloud service,
-or live test subject is used.
+displays a selectable color treatment, and publishes its 1280×720 output canvas as
+**Shymask Camera** so other applications can select it. The camera publishes the app's output
+canvas; a native opaque paused fallback covers the short window before the app connects and is used
+when app frames stop arriving. No physical webcam, account, cloud service, or live test subject is
+used.
 
 Face tracking, masks, effect packages, real call-application compatibility (issue #10), and the
 final 720p/30 FPS / 100 ms target are later child tickets of the parent spec.
@@ -60,7 +62,8 @@ the virtual camera. Closing Shymask stops its camera output.
   produces an actionable error and hidden output; `Start` stays disabled.
 - **One output canvas.** Every frame — processed or paused — is drawn to the single `#output`
   canvas at 1280×720. That same canvas is what the virtual camera publishes; there is no second
-  pipeline and no separate camera state machine.
+  pipeline and no separate camera state machine. The only exception is the native opaque paused
+  fallback, which the media source shows before the app's first frame and when app frames go stale.
 - **Real-time loop.** The clip plays muted at rate 1 with `requestVideoFrameCallback` as the
   present-time scheduler. The processing timestamp is monotonic across loop seams:
   `loopIndex × clipDuration + mediaTime`. A loop seam is a deliberate media-time reset, not a
@@ -80,9 +83,9 @@ the virtual camera. Closing Shymask stops its camera output.
   canvas to the native Windows virtual camera over a loopback frame transport, and
   `src/renderer/renderer.ts` pushes every drawn output frame plus a 100 ms heartbeat (only while a
   camera consumer is connected). Startup, no effect, manual pause, processing errors, missing input
-  and effect switches therefore all appear in the camera as the exact opaque "Tracking paused"
-  canvas. The camera uses `MFVirtualCameraLifetime_Session`, so closing Shymask stops the stream and
-  removes the device.
+  and effect switches therefore all appear in the camera as the same opaque "Tracking paused"
+  canvas; the native opaque fallback covers only the pre-connection window. The camera uses
+  `MFVirtualCameraLifetime_Session`, so closing Shymask stops the stream and removes the device.
 
 ## Windows virtual camera (issue #3)
 
@@ -105,6 +108,37 @@ That is why the first install is elevated. The install also stages the binaries 
 access, so later `npm run vcam:install` runs restage rebuilt binaries **without** elevation while the
 machine-wide registration stays in place.
 
+### Prototype trust boundary
+
+This virtual camera is a **single-user development-machine prototype**, not a hardened system
+component. The elevated install and the ACL grant are development conveniences, and they are a real
+security trade-off rather than a harmless permission tweak:
+
+- The HKLM registration makes the Windows frame server (`NT AUTHORITY\LocalService`) load
+  `C:\ProgramData\Shymask\bin\ShymaskVirtualCamera.dll`. The installer's modify grant on
+  `C:\ProgramData\Shymask` is inherited by that DLL and by `vcam-port`. A standard user in the
+  installing account can therefore replace the DLL the Local Service frame server loads, and can
+  rewrite `vcam-port` to point the camera at a different local frame server.
+- The camera pipeline also trusts local same-user processes: any process in the account can read the
+  loopback frame transport and compete for the port the media source connects to. That is acceptable
+  for a local development prototype and is **not** a multi-user security boundary.
+- Do not use this build on a shared, multi-user, or production machine. A production integration
+  needs a non-user-writable staging path, a service-owned frame transport, and authentication
+  between the app and the media source.
+
+To revoke both the registration and the ACL grant, use an elevated prompt:
+
+```powershell
+# Removes the per-user and machine-wide COM registration.
+npm run vcam:uninstall
+
+# Removes the modify ACE granted to the installing user; staged files remain.
+icacls "$env:ProgramData\Shymask" /remove:g "$env:USERDOMAIN\$env:USERNAME" /T
+```
+
+`npm run vcam:uninstall` does not remove the staged binaries, `vcam.log`, or the ACL entry, and a
+non-elevated uninstall leaves the machine-wide registration in place.
+
 ```powershell
 npm run build:native # rebuild the COM media source, camera host and consumer harness
 npm run vcam:install # stage binaries + (elevated first time) machine-wide registration
@@ -120,8 +154,12 @@ on this development machine; uninstall is documented for cleanup.
 
 The camera publishes **RGB32 1280×720 at 30 FPS**. The media source allocates samples from the
 allocator the frame server provides (`IMFSampleAllocatorControl`), which is required for frames to
-reach a consumer process. NV12 and real call applications are not implemented here; that is issue
-#10. See [`docs/notes/0002-windows-virtual-camera-spike.md`](docs/notes/0002-windows-virtual-camera-spike.md)
+reach a consumer process. It also applies a **1200 ms freshness bound** to the cached app frame: if
+the connected renderer stops sending (a hung renderer, socket still open), the media source delivers
+the native opaque paused fallback instead of freezing the last processed frame, and a recovered
+renderer restores processed output as soon as a complete frame arrives. NV12 and real call
+applications are not implemented here; that is issue #10. See
+[`docs/notes/0002-windows-virtual-camera-spike.md`](docs/notes/0002-windows-virtual-camera-spike.md)
 for the architecture, the registration failure that was investigated, and the measured results.
 
 ## Checks
@@ -165,23 +203,31 @@ independent camera consumer:
     new failure message.
 13. `Shymask Camera` is registered and enumerable by a separate Media Foundation consumer process.
 14. Camera startup, no effect, manual pause, injected processing failure and missing input all
-    deliver the opaque "Tracking paused" canvas to the camera consumer (mean RGB ≈ 12,15,20, with
-    PNG evidence).
+    deliver the opaque "Tracking paused" canvas to the camera consumer (mean RGB ≈ 12,15,20). The
+    assertion requires at least one app-published frame (`captureUnixMs > 0`) and decodes the saved
+    PNG, so the native pre-connection fallback cannot satisfy a paused state by itself.
 15. Processed replay frames in the camera match the preview's treatment (warm, cool), effect
-    switches and pause/resume change the camera output, and recovery is automatic.
+    switches and pause/resume change the camera output, and recovery is automatic. Each processed
+    state's saved PNG is decoded from disk and asserted against the same processed colour.
 16. The camera receives a continuous 30 FPS sample stream across multiple replay loops.
 17. A replay-based replay-to-camera latency baseline is recorded.
-18. Closing the app stops camera frames and removes the camera from device enumeration.
+18. Closing the app stops camera frames, exits the camera host process, and removes the camera from
+    device enumeration; a consumer timeout is accepted only with zero late frames and device
+    removal, and that acceptance is recorded explicitly.
 
 Artifacts are written to the gitignored `evidence/check-<timestamp>/` directory: per-state canvas
 screenshots, the full app window, captured output frames, camera-consumer PNGs under
-`camera-frames/`, and `summary.json` with the timing baseline, camera evidence, hardware, workload,
-measured boundaries, commands, validation-gate facts and the tested head SHA.
+`camera-frames/`, and `summary.json` with the derived base SHA, timing baseline, camera evidence,
+hardware, workload, measured boundaries, commands, validation-gate facts and the tested head SHA.
+
+`npm run vcam:check` independently exercises the native path: it asserts the test-pattern pixels and
+that a connected frame source which stops sending (socket kept open) is replaced by the native opaque
+paused fallback within the 1200 ms staleness bound (1268 ms observed in the validated run).
 
 ### Measured baseline (replay-based, virtual camera)
 
-From a passing `npm run check` run on 2026-11-13 (the check summary records the exact head SHA),
-source clip 3.379 s:
+From a passing `npm run check` run on 2026-11-13 at validated head `@VALIDATED_HEAD@` (the check
+summary records the same SHA), source clip 3.379 s:
 
 - **Hardware:** 11th Gen Intel Core i7-11700K (8 cores / 16 logical), NVIDIA GeForce RTX 3070 Ti,
   31.8 GiB RAM, Windows 11 Pro 10.0.26100 (build 26100). Node.js 24.19.0, Electron 45.3.1.
@@ -189,7 +235,7 @@ source clip 3.379 s:
   Chromium; Electron preview publishing its output canvas as the `Shymask Camera` virtual webcam; an
   independent Media Foundation Source Reader process consumes the camera. No physical webcam or call
   application is in the path.
-- **Commands:** `npm run typecheck`, `npm test`, `npm run check`.
+- **Commands:** `npm run typecheck`, `npm test`, `npm run check`, `npm run vcam:check`.
 
 | Measurement | Value |
 | --- | --- |
@@ -255,7 +301,9 @@ docs/           fixture note and the preview/loop + virtual camera notes
   `0x80070003` means the machine-wide registration is missing or stale (elevated
   `npm run vcam:install`); `0x80070005` points at Windows camera privacy settings.
 - **Camera connected but no frames:** the consumer harness (`npm run vcam:check`) is the fastest
-  oracle; a stalled consumer now times out with JSON instead of hanging.
+  oracle; a stalled consumer now times out with JSON instead of hanging. A connected app that goes
+  silent (hung renderer) is replaced by the native opaque paused fallback after 1200 ms rather than
+  freezing the last processed frame.
 - The check harness accepts `SHYMASK_FIXTURE_DIR` and `SHYMASK_EVIDENCE_DIR` to point at a different
   media/evidence directory. The app also honors these variables; the checks use them to exercise
   missing and corrupt fixture states.
@@ -266,8 +314,11 @@ Delivered by this slice: recorded input acquisition and validation, real-time lo
 processing timestamps, selectable color treatments, the opaque paused-output policy in the preview
 and the virtual camera, Windows 11 virtual camera publication as `Shymask Camera`, an independent
 Media Foundation consumer harness, and reproducible local checks with a replay-based timing
-baseline.
+baseline. A treatment change is synchronous (the renderer redraws the new treatment immediately), so
+the AC3 async switching-interruption sub-case has no async state to exercise here and is deliberately
+deferred to the later tracking/effect slice that introduces asynchronous work.
 
 Deferred: physical webcam capture, face tracking, masks/occlusion, secondary motion, effect
-packages, real Zoom/Meet/OBS compatibility (issue #10), final live acceptance, NV12 support, laptop
-integrated-graphics validation, and the 720p/30 FPS / ≤100 ms target.
+packages, real Zoom/Meet/OBS compatibility (issue #10), final live acceptance, NV12 support, the
+async effect-switching interruption sub-case, laptop integrated-graphics validation, and the
+720p/30 FPS / ≤100 ms target.

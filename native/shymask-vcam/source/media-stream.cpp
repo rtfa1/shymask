@@ -71,7 +71,6 @@ HRESULT MediaStream::Initialize(IMFMediaSource* source, DWORD streamId) {
   ComPtr<IMFMediaType> type = CreateRgb32Type();
   if (!type) return E_OUTOFMEMORY;
   currentType_ = type;
-  type->GetGUID(MF_MT_SUBTYPE, &subtype_);
 
   IMFMediaType* types[1] = {type.Get()};
   hr = MFCreateStreamDescriptor(streamId, 1, types, &descriptor_);
@@ -107,7 +106,6 @@ HRESULT MediaStream::Start(IMFMediaType* type) {
       return MF_E_INVALIDMEDIATYPE;
     }
     currentType_ = type;
-    subtype_ = subtype;
   }
 
   HRESULT hr = EnsureAllocator(currentType_.Get());
@@ -124,13 +122,11 @@ HRESULT MediaStream::Start(IMFMediaType* type) {
   loggedConnected_ = false;
   stopWorker_ = false;
   running_ = true;
-  streamStartMs_ = GetTickCount64();
-  nextTickMs_ = streamStartMs_;
   worker_ = std::thread([this] { RunWorker(); });
 
   hr = queue_->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr);
-  Log(L"MediaStream started (providedAllocator=%d), hr=0x%08X",
-      allocatorInitialized_ ? 1 : 0, static_cast<unsigned>(hr));
+  Log(L"MediaStream started (providedAllocator=%d), hr=0x%08X", allocatorProvided_ ? 1 : 0,
+      static_cast<unsigned>(hr));
   return hr;
 }
 
@@ -215,20 +211,25 @@ HRESULT MediaStream::SetAllocator(IUnknown* allocator) {
   if (FAILED(hr)) return hr;
   std::lock_guard<std::mutex> guard(lock_);
   allocator_ = videoAllocator;
+  allocatorProvided_ = true;
   return S_OK;
 }
 
 HRESULT MediaStream::SetD3DManager(IUnknown* manager) {
   Log(L"MediaStream::SetD3DManager manager=%p", manager);
-  std::lock_guard<std::mutex> guard(lock_);
-  d3dManager_ = manager;
   // The Shymask pipeline produces CPU canvas frames, so the stream writes into
-  // CPU-accessible samples. The manager is retained for diagnostics only.
+  // CPU-accessible samples. Nothing is retained from the manager.
   return S_OK;
 }
 
 MFSampleAllocatorUsage MediaStream::GetAllocatorUsage() const {
-  return MFSampleAllocatorUsage_UsesProvidedAllocator;
+  std::lock_guard<std::mutex> guard(lock_);
+  // Only claim the caller-provided allocator when one was actually supplied
+  // through IMFSampleAllocatorControl::SetDefaultAllocator. The in-process
+  // fallback uses a private allocator (or a plain memory sample), which is a
+  // custom allocator, not the frame server's provided one.
+  return allocator_ && allocatorProvided_ ? MFSampleAllocatorUsage_UsesProvidedAllocator
+                                          : MFSampleAllocatorUsage_UsesCustomAllocator;
 }
 
 // IMFMediaStream2
@@ -350,7 +351,6 @@ void MediaStream::RunWorker() {
     const auto now = std::chrono::steady_clock::now();
     if (now < next) std::this_thread::sleep_until(next);
     next = std::max(next, now) + std::chrono::milliseconds(33);
-    if (now - next > std::chrono::milliseconds(500)) next = now;
 
     const HRESULT hr = DeliverSample(token.Get());
     if (FAILED(hr)) {
@@ -452,37 +452,74 @@ HRESULT MediaStream::CreateSample(const std::vector<uint8_t>& rgba, uint64_t cap
 }
 
 HRESULT MediaStream::FillSampleBuffer(IMFSample* sample, const std::vector<uint8_t>& rgba) {
+  constexpr DWORD kPayloadBytes = kShymaskFrameWidth * kShymaskFrameHeight * 4;
+  if (rgba.size() != kPayloadBytes) return E_INVALIDARG;
+
   ComPtr<IMFMediaBuffer> buffer;
   HRESULT hr = sample->GetBufferByIndex(0, &buffer);
   if (FAILED(hr)) return hr;
+
+  // Reject a buffer that cannot hold a full frame before touching memory. A
+  // zero length can mean the 2-D path below is required, so the Lock result is
+  // checked again for the authoritative limit.
+  DWORD declaredMaxLength = 0;
+  if (SUCCEEDED(buffer->GetMaxLength(&declaredMaxLength)) && declaredMaxLength != 0 &&
+      declaredMaxLength < kPayloadBytes) {
+    Log(L"MediaStream sample buffer is too small (max=%u, need=%u)",
+        static_cast<unsigned>(declaredMaxLength), static_cast<unsigned>(kPayloadBytes));
+    return MF_E_BUFFERTOOSMALL;
+  }
 
   BYTE* destination = nullptr;
   DWORD maxLength = 0;
   DWORD currentLength = 0;
   hr = buffer->Lock(&destination, &maxLength, &currentLength);
-  if (FAILED(hr)) {
-    // Some frame-server allocator buffers are 2D (DXGI/staging) surfaces and
-    // must be written through IMF2DBuffer.
-    ComPtr<IMF2DBuffer> buffer2d;
-    hr = buffer.As(&buffer2d);
-    if (FAILED(hr)) return hr;
-    BYTE* scanline0 = nullptr;
-    LONG pitch = 0;
-    hr = buffer2d->Lock2D(&scanline0, &pitch);
-    if (FAILED(hr)) return hr;
-    for (uint32_t y = 0; y < kShymaskFrameHeight; ++y) {
-      const uint8_t* source = rgba.data() + static_cast<size_t>(y) * kShymaskFrameWidth * 4;
-      uint8_t* row = scanline0 + static_cast<ptrdiff_t>(y) * pitch;
-      ConvertRgbaToRgb32(source, row, kShymaskFrameWidth);
+  if (SUCCEEDED(hr)) {
+    if (!destination || maxLength < kPayloadBytes) {
+      buffer->Unlock();
+      Log(L"MediaStream locked buffer is too small (max=%u, need=%u)",
+          static_cast<unsigned>(maxLength), static_cast<unsigned>(kPayloadBytes));
+      return MF_E_BUFFERTOOSMALL;
     }
-    buffer2d->Unlock2D();
-    return S_OK;
+    ConvertRgbaToRgb32(rgba.data(), destination,
+                       static_cast<size_t>(kShymaskFrameWidth) * kShymaskFrameHeight);
+    buffer->Unlock();
+    return buffer->SetCurrentLength(kPayloadBytes);
   }
 
-  ConvertRgbaToRgb32(rgba.data(), destination, static_cast<size_t>(kShymaskFrameWidth) *
-                                                    kShymaskFrameHeight);
-  buffer->Unlock();
-  return buffer->SetCurrentLength(kShymaskFrameWidth * kShymaskFrameHeight * 4);
+  // Some frame-server allocator buffers are 2D (DXGI/staging) surfaces and
+  // must be written through IMF2DBuffer.
+  ComPtr<IMF2DBuffer> buffer2d;
+  hr = buffer.As(&buffer2d);
+  if (FAILED(hr)) return hr;
+  BYTE* scanline0 = nullptr;
+  LONG pitch = 0;
+  hr = buffer2d->Lock2D(&scanline0, &pitch);
+  if (FAILED(hr)) return hr;
+
+  const int64_t pitchMagnitude = pitch < 0 ? -static_cast<int64_t>(pitch) : pitch;
+  if (!scanline0 || pitchMagnitude < static_cast<int64_t>(kShymaskFrameWidth) * 4 ||
+      pitchMagnitude * static_cast<int64_t>(kShymaskFrameHeight) <
+          static_cast<int64_t>(kPayloadBytes)) {
+    buffer2d->Unlock2D();
+    Log(L"MediaStream 2-D buffer is too small (pitch=%ld, need=%u)", pitch,
+        static_cast<unsigned>(kPayloadBytes));
+    return MF_E_BUFFERTOOSMALL;
+  }
+
+  for (uint32_t y = 0; y < kShymaskFrameHeight; ++y) {
+    const uint8_t* source = rgba.data() + static_cast<size_t>(y) * kShymaskFrameWidth * 4;
+    // A negative pitch means the surface is bottom-up; write the logical
+    // top-down row into its mirrored position instead of running off the end.
+    uint8_t* row = pitch >= 0
+                       ? scanline0 + static_cast<ptrdiff_t>(y) * pitch
+                       : scanline0 +
+                             static_cast<ptrdiff_t>(kShymaskFrameHeight - 1 - y) *
+                                 static_cast<ptrdiff_t>(-pitch);
+    ConvertRgbaToRgb32(source, row, kShymaskFrameWidth);
+  }
+  buffer2d->Unlock2D();
+  return S_OK;
 }
 
 }  // namespace shymask

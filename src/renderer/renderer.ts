@@ -200,7 +200,7 @@ function updateVirtualCameraDiagnostics(): void {
   }
   setDiag(
     'diag-vcam',
-    `state=${latestVirtualCamera.state} enumerable=${latestVirtualCamera.enumerable} clients=${latestVirtualCamera.clients} frames=${latestVirtualCamera.framesPublished} port=${latestVirtualCamera.port ?? 'none'} published=${publishedFrames}`,
+    `state=${latestVirtualCamera.state} enumerable=${latestVirtualCamera.enumerable} clients=${latestVirtualCamera.clients} frames=${latestVirtualCamera.framesPublished} port=${latestVirtualCamera.port ?? 'none'} pid=${latestVirtualCamera.hostPid ?? 'none'} published=${publishedFrames}`,
   );
 }
 

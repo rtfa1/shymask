@@ -1,16 +1,20 @@
 # Spike note: Windows 11 virtual camera publication
 
-- **Status:** implemented for issue #3. The processed replay canvas (and the exact opaque
+- **Status:** implemented for issue #3. The processed replay canvas (and the same opaque
   "Tracking paused" screen) is published as the **Shymask Camera** Windows virtual webcam at
-  1280×720 / 30 FPS, and an independent Media Foundation consumer process receives it.
+  1280×720 / 30 FPS, and an independent Media Foundation consumer process receives it. A native
+  opaque paused fallback covers the window before the app connects and is used when app frames go
+  stale.
 - **Date:** 2026-11-13
 - **Issue:** [#3 Publish processed replay as a Windows virtual webcam](https://github.com/rtfa1/shymask/issues/3),
   parent spec [#1](https://github.com/rtfa1/shymask/issues/1).
 - **Related decisions:** [ADR-0003](../adr/0003-conceal-the-face-on-tracking-failure.md) (opaque
   paused output in every output path), [ADR-0004](../adr/0004-declarative-effect-packages.md).
-- **Validated head:** `npm run check` records the exact head SHA, hardware, workload, timing,
-  camera evidence and tested commands in `evidence/check-<timestamp>/summary.json`; the matching
-  log is `evidence/logs/check-final.log`. Local validation is the gate (no CI in the repository).
+- **Validated head:** `@VALIDATED_HEAD@` (full `npm run check` plus `npm run vcam:check` at that
+  commit). The check summary records the same head SHA, hardware, workload, timing, camera evidence
+  and tested commands in `evidence/check-<timestamp>/summary.json`; the matching logs are
+  `evidence/logs/check-final.log` and `evidence/logs/vcam-final.log`. Local validation is the gate
+  (no CI in the repository).
 
 ## Decision
 
@@ -53,10 +57,13 @@ Media Foundation frame server  ──►  Shymask Camera (Windows Virtual Camera
   writes PNGs with WIC, reports mean RGB and sample/latency statistics as JSON, and has a hard
   wall-clock watchdog so a stalled stream cannot hang the check.
 - `src/main/virtual-camera.ts` — app-side owner: loopback frame server, host supervision, status,
-  graceful stop. `src/renderer/renderer.ts` publishes the exact canvas after every drawn output
-  frame plus a 100 ms heartbeat (both gated on a connected camera consumer, so an idle camera costs
-  no preview render time), so a newly connected consumer can never receive a stale frame from
-  before a pause, effect switch or error.
+  graceful stop. `src/renderer/renderer.ts` publishes the app's output canvas after every drawn
+  output frame plus a 100 ms heartbeat (both gated on a connected camera consumer, so an idle camera
+  costs no preview render time), so a newly connected consumer can never receive a stale frame from
+  before a pause, effect switch or error. The media source additionally has a **1200 ms freshness
+  bound** on the cached app frame: if the renderer stops sending while the socket stays open, the
+  source delivers the native opaque paused fallback instead of freezing the last processed frame;
+  the next complete frame restores processed output.
 
 ## Registration requirement (learned the hard way)
 
@@ -78,6 +85,29 @@ This is a one-time elevated action (see Install below). The install also stages 
 access so later `npm run vcam:install` runs restage the binaries **without** elevation while the
 machine-wide registration stays in place.
 
+### Prototype trust boundary
+
+The prototype is scoped to a **single-user development machine**. The elevated install and the ACL
+grant are development conveniences and represent a real security trade-off, not a harmless
+permission tweak:
+
+- The HKLM registration makes the Local Service frame server load
+  `C:\ProgramData\Shymask\bin\ShymaskVirtualCamera.dll`. The user's modify ACE on
+  `C:\ProgramData\Shymask` is inherited by that DLL and by `vcam-port`, so the standard user can
+  replace the code the frame server loads and can redirect the camera to a different local frame
+  server. That is local code execution as Local Service, plus camera-frame redirection.
+- The frame pipeline trusts local same-user processes: any same-user process can read the loopback
+  transport and race for the port the media source connects to. It is not a multi-user boundary.
+- Do not use this build on a shared or multi-user machine. A production version needs a
+  non-user-writable staging path, a service-owned transport, and authentication between the app and
+  the media source.
+
+Revocation, from an elevated prompt: `npm run vcam:uninstall` removes the per-user and machine-wide
+COM registrations, then
+`icacls "$env:ProgramData\Shymask" /remove:g "$env:USERDOMAIN\$env:USERNAME" /T` removes the granted
+modify ACE. `vcam:uninstall` does not remove the staged binaries, `vcam.log`, or the ACL, and a
+non-elevated uninstall leaves the machine-wide registration in place.
+
 ## Frame delivery: why the first implementation produced no consumer frames
 
 The source was requested 30 samples/s by the frame server but the client received nothing. The
@@ -97,6 +127,18 @@ and never reach the client. The fix:
 
 RGB32 flows end to end; NV12 is **not** required for the harness consumer. Offering NV12 remains a
 possible compatibility addition for real consumers (see Open questions).
+
+### Freshness bound and the native paused fallback
+
+`FrameTransport::CopyLatest` tracks when the newest **complete** frame arrived and returns false when
+that frame is older than 1200 ms on the steady clock. `MediaStream` then uses the native opaque
+"Tracking paused" bitmap (`paused-frame.cpp`) instead of reusing the cached processed frame, so a hung
+renderer or a silently stalled producer cannot freeze the camera. The socket stays connected and the
+next complete frame restores processed output immediately. A socket close still resets the cached
+frame and falls back at once. `npm run vcam:check` exercises the steady-clock path with
+`scripts/dev/vcam-test-pattern.mjs --stop-after N`, which stops writing but keeps the connection open,
+and asserts that the consumer sees coloured frames followed by the dark paused fallback within the
+bound (1268 ms observed in the validated run).
 
 Two harness bugs found during bring-up are fixed: the consumer double-released its Source Reader
 at exit (access violation), and the host emitted unescaped backslashes in its JSON `list` output.
@@ -136,24 +178,32 @@ controls and an independent Media Foundation consumer process:
 - `Shymask Camera` is registered and enumerable (`state=publishing enumerable=true`).
 - Startup, no effect, manual pause, injected processing failure and a missing replay fixture all
   produce the opaque "Tracking paused" canvas **in the camera consumer** (mean RGB 12,15,20; PNGs
-  under `evidence/check-<timestamp>/camera-frames/`).
+  under `evidence/check-<timestamp>/camera-frames/`). Each paused assertion requires an
+  app-published frame (`captureUnixMs > 0`) and decodes the saved PNG, so the native pre-connection
+  paused fallback cannot pass a paused state on its own.
 - Start produces processed replay frames in the consumer that match the preview's treatment
   (warm preview 143,66,41 vs camera 144,67,42 in the validated run; switching to cool changes the
-  camera output as well).
+  camera output as well). The saved PNG is decoded from disk and must match the asserted processed
+  colour, so a native fallback PNG cannot evidence a processed state.
 - Resume, effect re-selection and failure recovery restore processed camera output automatically.
 - The camera consumer receives a continuous stream across at least two replay loops
   (212 frames over 6.75 s, 30.5 Hz) with strictly increasing sample times and visible content
   changes.
-- Closing the app stops the camera stream (no frames after close) and removes the device from
-  camera enumeration.
+- Closing the app stops the camera stream (no frames after close), exits the camera host process
+  within a bounded wait, and removes the device from camera enumeration. A consumer timeout is
+  accepted only with zero late frames and device removal, and the summary records that acceptance
+  explicitly.
 - The preview checks (startup/no-effect/manual pause/decode stall/missing and corrupt fixture,
   treatments, loops/seams, pacing, PNG capture, no console errors) and 23 unit tests remain green.
+- `npm run vcam:check` exercises the native path without Electron: test-pattern pixels and the
+  1200 ms freshness bound (a source that stops writing but keeps the socket open must give the
+  consumer the dark native paused fallback; 1268 ms observed in the validated run).
 
 ### Measured baseline (replay-based, virtual camera)
 
-From a passing `npm run check` run on 2026-11-13 (run-to-run variation is expected; the check
-summary records the exact head SHA of the run it cites), source clip 3.379 s, Windows 11 Pro 26100,
-i7-11700K / RTX 3070 Ti / 31.8 GiB, Electron 45.3.1:
+From a passing `npm run check` run on 2026-11-13 at validated head `@VALIDATED_HEAD@` (run-to-run
+variation is expected; the check summary records the same head SHA), source clip 3.379 s, Windows 11
+Pro 26100, i7-11700K / RTX 3070 Ti / 31.8 GiB, Electron 45.3.1:
 
 | Measurement | Value |
 | --- | --- |
@@ -180,6 +230,10 @@ Boundaries:
 - Face tracking does not exist yet, so the tracking-failure/multiple-face paths are still future
   work; the effect-processing failure injection and decode-stall watchdog are the current failure
   coverage.
+- AC3's asynchronous switching-interruption sub-case is deliberately deferred. In this slice a
+  treatment change is synchronous: the select handler redraws the new treatment immediately, so
+  there is no in-flight async switch that could momentarily expose a raw or stale processed frame.
+  A later tracking/effect slice that introduces asynchronous work must exercise that sub-case.
 
 ## Verification methodology and limits
 
@@ -187,8 +241,8 @@ Boundaries:
   (Start, Pause/Resume, treatment select, Recheck input, capture, diagnostic failure toggle).
 - The camera consumer is a separate process using the public OS camera API
   (`MFEnumDeviceSources` + Source Reader). It writes PNGs and JSON pixel/timing statistics; the
-  harness compares camera mean RGB with the preview's diagnostics and asserts the paused screen for
-  every paused state.
+  harness compares camera mean RGB with the preview's diagnostics, requires app-published paused
+  frames, and decodes the saved PNG for paused and processed assertions.
 - The harness bounds every consumer run (consumer-side watchdog plus a Node-side timeout) so a
   stalled camera fails the check instead of hanging.
 - Timing numbers come from a single desktop run and vary with load; they are observations, not
@@ -201,5 +255,7 @@ Boundaries:
 2. Whether a real call application adds latency beyond this replay-based harness measurement.
 3. Laptop integrated-graphics behavior, and the final 720p/30 FPS / ≤100 ms budgets, which still
    require tracking/rendering work and a physical camera.
-4. Consumer behaviour when the frame server is restarted or the app crashes (session lifetime
-   removes the camera; a crash leaves at most the opaque paused fallback until the host exits).
+4. Consumer behaviour when the frame server is restarted or the app crashes. Session lifetime
+   removes the camera when the host exits; a hung renderer or silently stalled producer now falls
+   back to the native opaque paused frame after the 1200 ms freshness bound instead of freezing a
+   processed frame.

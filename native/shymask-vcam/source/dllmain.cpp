@@ -6,6 +6,7 @@
 
 #include "activator.h"
 #include "logging.h"
+#include "module-lock.h"
 #include "protocol.h"
 
 #include <windows.h>
@@ -20,6 +21,7 @@ namespace {
 
 HMODULE g_module = nullptr;
 LONG g_lockCount = 0;
+LONG g_liveObjectCount = 0;
 
 constexpr wchar_t kClsidKey[] = L"Software\\Classes\\CLSID";
 const wchar_t* kClsidString = L"{5E1D3A6B-2C4F-4A7E-9B8D-0C1F2A3B4C5D}";
@@ -33,8 +35,17 @@ std::wstring ClsidKeyPath() {
 
 }  // namespace
 
+namespace shymask {
+
+void ModuleAddLiveObject() { InterlockedIncrement(&g_liveObjectCount); }
+void ModuleRemoveLiveObject() { InterlockedDecrement(&g_liveObjectCount); }
+
+}  // namespace shymask
+
 class ClassFactory final : public IClassFactory {
  public:
+  ClassFactory() { shymask::ModuleAddLiveObject(); }
+
   STDMETHODIMP QueryInterface(REFIID riid, void** object) override {
     if (!object) return E_POINTER;
     *object = nullptr;
@@ -72,7 +83,7 @@ class ClassFactory final : public IClassFactory {
   }
 
  private:
-  ~ClassFactory() = default;
+  ~ClassFactory() { shymask::ModuleRemoveLiveObject(); }
   LONG references_ = 1;
 };
 
@@ -87,7 +98,9 @@ STDAPI DllGetClassObject(REFCLSID clsid, REFIID riid, LPVOID* object) {
   return hr;
 }
 
-STDAPI DllCanUnloadNow() { return g_lockCount == 0 ? S_OK : S_FALSE; }
+STDAPI DllCanUnloadNow() {
+  return g_lockCount == 0 && g_liveObjectCount == 0 ? S_OK : S_FALSE;
+}
 
 STDAPI DllRegisterServer() {
   const std::wstring keyPath = ClsidKeyPath() + L"\\InprocServer32";

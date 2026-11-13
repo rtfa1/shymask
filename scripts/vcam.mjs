@@ -93,6 +93,9 @@ function isElevated() {
  */
 function grantInstallerAccess(directory) {
   if (!isElevated()) return false;
+  // On a clean machine the data directory does not exist yet; create it before
+  // icacls so the installing user actually receives the restaging grant.
+  mkdirSync(directory, { recursive: true });
   const user = `${process.env.USERDOMAIN ?? ''}\\${process.env.USERNAME ?? ''}`;
   const result = spawnSync('icacls', [directory, '/grant', `${user}:(OI)(CI)M`, '/T'], {
     encoding: 'utf8',

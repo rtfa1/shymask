@@ -54,6 +54,7 @@ void FrameTransport::Reset() {
   rx_.clear();
   latest_.clear();
   hasFrame_ = false;
+  lastFrameTickMs_ = 0;
   captureUnixMs_ = 0;
   sequence_ = 0;
 }
@@ -176,6 +177,7 @@ void FrameTransport::ConsumeBufferedFrames() {
     captureUnixMs_ = captureUnixMs;
     sequence_ = sequence;
     hasFrame_ = true;
+    lastFrameTickMs_ = GetTickCount64();
     stats_.framesReceived++;
     rx_.erase(rx_.begin(), rx_.begin() + static_cast<std::ptrdiff_t>(frameBytes));
 
@@ -190,6 +192,11 @@ void FrameTransport::ConsumeBufferedFrames() {
 bool FrameTransport::CopyLatest(std::vector<uint8_t>* rgba, uint64_t* captureUnixMs,
                                 uint64_t* sequence) const {
   if (!hasFrame_) return false;
+  // A connected app that stops sending must not freeze the last processed
+  // frame: after the freshness bound the caller delivers the native opaque
+  // paused fallback instead. The socket stays connected, so a recovered
+  // renderer is picked up again as soon as a complete frame arrives.
+  if (GetTickCount64() - lastFrameTickMs_ > kShymaskFrameStaleMs) return false;
   *rgba = latest_;
   *captureUnixMs = captureUnixMs_;
   *sequence = sequence_;

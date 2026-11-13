@@ -1,6 +1,7 @@
 ﻿#include "activator.h"
 
 #include "logging.h"
+#include "module-lock.h"
 #include "protocol.h"
 
 #include <mfapi.h>
@@ -10,6 +11,8 @@
 using Microsoft::WRL::ComPtr;
 
 namespace shymask {
+
+Activator::Activator() { ModuleAddLiveObject(); }
 
 HRESULT Activator::Initialize() {
   HRESULT hr = MFCreateAttributes(&attributes_, 8);
@@ -29,7 +32,10 @@ HRESULT Activator::Initialize() {
   return S_OK;
 }
 
-Activator::~Activator() { source_.Reset(); }
+Activator::~Activator() {
+  source_.Reset();
+  ModuleRemoveLiveObject();
+}
 
 STDMETHODIMP Activator::ActivateObject(REFIID riid, void** object) {
   if (!object) return E_POINTER;
