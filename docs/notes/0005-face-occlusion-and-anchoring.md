@@ -95,7 +95,10 @@ also retries up to three times if a hold lands on a transient pause, and the hol
 helper waits 1 s before capture. The attempt count and the app-published vs
 native-fallback frame count of every attempt are written to `summary.json`
 (`virtualCamera.captureAttempts`) and the check log, and the final attempt still
-fails on a persistent fallback.
+fails on a persistent fallback. Before each processed capture, the expected
+preview mean is read only once the public status reports `render` and the
+throttled mean-RGB diagnostic has caught up, so a camera frame is never compared
+against the previous paused mean after an effect switch.
 
 ## Measured behavior (replay-based)
 
