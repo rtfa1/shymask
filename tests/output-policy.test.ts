@@ -1,11 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { FixtureInfo, FixtureMetadata } from '../src/core/bridge';
-import {
-  PAUSED_TITLE,
-  resolveOutput,
-  type PreviewState,
-} from '../src/core/output-policy';
+import type { FixtureInfo, FixtureMetadata, TrackerInfo } from '../src/core/bridge';
+import { PAUSED_TITLE, resolveOutput, type PreviewState } from '../src/core/output-policy';
+import { initialTrackingSnapshot, type TrackingSnapshot } from '../src/core/tracking';
 
 const METADATA: FixtureMetadata = {
   id: 'webcam-loop-v1',
@@ -27,18 +24,42 @@ const METADATA: FixtureMetadata = {
 const READY_FIXTURE: FixtureInfo = {
   state: 'ready',
   metadata: METADATA,
-  videoUrl: 'file:///C:/fixtures/cache/webcam-loop.webm',
+  videoUrl: 'shymask://app/fixture/webcam-loop.webm',
 };
+
+const READY_TRACKER: TrackerInfo = {
+  state: 'ready',
+  metadata: {
+    id: 'mediapipe-face-landmarker-float16-v1',
+    version: 'test',
+    fileName: 'face_landmarker.task',
+    sourceUrl: 'https://example.invalid/model.task',
+    license: 'Apache-2.0',
+    licenseUrl: 'https://www.apache.org/licenses/LICENSE-2.0',
+    attribution: 'Test',
+    sha256: 'b'.repeat(64),
+    bytes: 100,
+    notes: 'test',
+  },
+  wasmBaseUrl: 'shymask://app/tracker',
+  modelUrl: 'shymask://app/tracker/face_landmarker.task',
+};
+
+function tracking(overrides: Partial<TrackingSnapshot> = {}): TrackingSnapshot {
+  return { ...initialTrackingSnapshot(0), phase: 'tracking', lastGoodAtMs: 100, ...overrides };
+}
 
 function state(overrides: Partial<PreviewState> = {}): PreviewState {
   return {
     fixture: READY_FIXTURE,
+    tracker: READY_TRACKER,
     started: true,
     ready: true,
     manualPaused: false,
     effect: 'warm',
     processingHealthy: true,
     processingError: null,
+    tracking: tracking(),
     ...overrides,
   };
 }
@@ -58,11 +79,18 @@ test('started but waiting for the first frame stays paused with a starting reaso
   assert.equal(decision.title, PAUSED_TITLE);
 });
 
-test('a ready effect produces a render decision naming the treatment', () => {
+test('a ready effect produces a render decision naming the effect', () => {
   const decision = resolveOutput(state({ effect: 'cool' }));
   assert.equal(decision.mode, 'render');
   assert.match(decision.title, /Cool tint/);
   assert.doesNotMatch(decision.title, /Tracking paused/);
+});
+
+test('the rigid mask is a selectable effect with face-attachment wording', () => {
+  const decision = resolveOutput(state({ effect: 'mask' }));
+  assert.equal(decision.mode, 'render');
+  assert.match(decision.title, /Rigid mask/);
+  assert.match(decision.explanation, /tracked face/);
 });
 
 test('no active effect hides the output instead of passing the feed through', () => {
@@ -70,7 +98,7 @@ test('no active effect hides the output instead of passing the feed through', ()
   assert.equal(decision.mode, 'paused');
   assert.equal(decision.reason, 'no-effect');
   assert.equal(decision.title, PAUSED_TITLE);
-  assert.equal(decision.action, 'Choose a color treatment to restore the preview.');
+  assert.equal(decision.action, 'Choose an effect to restore the preview.');
 });
 
 test('manual pause persists and outranks the no-effect explanation', () => {
@@ -81,6 +109,16 @@ test('manual pause persists and outranks the no-effect explanation', () => {
   assert.equal(decision.title, PAUSED_TITLE);
   // Resolving again without resuming yields the same paused decision.
   assert.deepEqual(resolveOutput({ ...paused }), decision);
+});
+
+test('manual pause outranks automatic tracking recovery', () => {
+  // Tracking is healthy again, but the operator paused manually: the output
+  // must stay hidden until Resume.
+  const decision = resolveOutput(
+    state({ manualPaused: true, effect: 'mask', tracking: tracking({ phase: 'tracking' }) }),
+  );
+  assert.equal(decision.mode, 'paused');
+  assert.equal(decision.reason, 'manual-pause');
 });
 
 test('a missing fixture produces an actionable paused error', () => {
@@ -123,20 +161,70 @@ test('effect-processing failure hides output and recovers only when healthy', ()
   assert.equal(resolveOutput({ ...failed, processingHealthy: true, processingError: null }).mode, 'render');
 });
 
-test('a paused screen is never returned as a render decision', () => {
-  const pausedStates: PreviewState[] = [
-    state({ started: false }),
-    state({ ready: false }),
-    state({ manualPaused: true }),
-    state({ effect: 'none' }),
-    state({ processingHealthy: false }),
-    state({ fixture: { state: 'missing', metadata: METADATA, message: 'missing' } }),
-    state({ fixture: { state: 'invalid', metadata: METADATA, message: 'invalid' } }),
-  ];
-  for (const pausedState of pausedStates) {
-    const decision = resolveOutput(pausedState);
+test('a missing or corrupt tracker model hides output with an actionable error', () => {
+  for (const trackerState of ['missing', 'invalid'] as const) {
+    const decision = resolveOutput(
+      state({
+        tracker: {
+          state: trackerState,
+          metadata: null,
+          message: 'The face-tracker model is missing or corrupt.',
+          action: 'Run `npm run fetch:tracker`, then `npm run build`.',
+        },
+      }),
+    );
     assert.equal(decision.mode, 'paused');
-    assert.equal(decision.title, 'Tracking paused');
-    assert.equal(decision.action === undefined, false);
+    assert.equal(decision.reason, 'tracker-unavailable');
+    assert.equal(decision.title, PAUSED_TITLE);
+    assert.match(decision.action ?? '', /fetch:tracker/);
+  }
+});
+
+test('tracking readiness before the first detection pauses every selected effect', () => {
+  for (const effect of ['warm', 'cool', 'mono', 'mask'] as const) {
+    const decision = resolveOutput(state({ effect, tracking: initialTrackingSnapshot(0) }));
+    assert.equal(decision.mode, 'paused');
+    assert.equal(decision.reason, 'tracking-initializing');
+    assert.equal(decision.title, PAUSED_TITLE);
+  }
+});
+
+test('tracking loss pauses the existing color treatments as well as the mask', () => {
+  for (const effect of ['warm', 'cool', 'mono', 'mask'] as const) {
+    const decision = resolveOutput(state({ effect, tracking: tracking({ phase: 'lost', faceCount: 0 }) }));
+    assert.equal(decision.mode, 'paused');
+    assert.equal(decision.reason, 'tracking-lost');
+    assert.match(decision.explanation, /no face/i);
+  }
+});
+
+test('multiple faces pause the output and explain the one-person limit', () => {
+  const decision = resolveOutput(
+    state({ effect: 'mask', tracking: tracking({ phase: 'multiple-faces', faceCount: 2 }) }),
+  );
+  assert.equal(decision.mode, 'paused');
+  assert.equal(decision.reason, 'multiple-faces');
+  assert.match(decision.explanation, /one person at a time/i);
+  assert.match(decision.action ?? '', /automatically/i);
+});
+
+test('unreliable tracking pauses the output', () => {
+  const decision = resolveOutput(
+    state({ tracking: tracking({ phase: 'unreliable', faceCount: 1, hasTransform: false }) }),
+  );
+  assert.equal(decision.mode, 'paused');
+  assert.equal(decision.reason, 'tracking-unreliable');
+  assert.equal(decision.title, PAUSED_TITLE);
+});
+
+test('a tracking pause never renders even when the effect and frame are ready', () => {
+  const phases = ['initializing', 'lost', 'multiple-faces', 'unreliable'] as const;
+  for (const phase of phases) {
+    for (const effect of ['warm', 'mask'] as const) {
+      const decision = resolveOutput(state({ effect, tracking: tracking({ phase }) }));
+      assert.equal(decision.mode, 'paused');
+      assert.equal(decision.title, 'Tracking paused');
+      assert.notEqual(decision.action, undefined);
+    }
   }
 });

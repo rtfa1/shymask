@@ -7,17 +7,30 @@ import type { FixtureInfo, FixtureMetadata } from '../core/bridge';
 export const FIXTURE_METADATA_FILENAME = 'webcam-loop.json';
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
-const FETCH_ACTION =
-  'Run `npm run fetch:fixture` from the repository root, then press Recheck input. Shymask never opens a physical webcam as a fallback.';
 
 export interface LoadFixtureOptions {
   repoRoot: string;
   /** Directory holding the (gitignored) media file. */
   fixtureDir: string;
+  /**
+   * Manifest filename under `fixtures/`, or an absolute/relative path. The
+   * default recorded replay is `webcam-loop.json`; the public-workflow check
+   * selects the larger-motion clip through `SHYMASK_FIXTURE_MANIFEST`.
+   */
+  metadataFileName?: string;
+  /**
+   * Builds the URL the renderer hands to the <video> element. The app uses the
+   * local asset protocol; the default keeps this module usable outside Electron.
+   */
+  videoUrlForFile?: (fileName: string) => string;
+  /** Recovery command named in missing/invalid explanations. */
+  fetchCommand?: string;
 }
 
-function invalid(message: string, action = FETCH_ACTION): FixtureInfo {
-  return { state: 'invalid', metadata: null, message, action };
+function metadataPathFor(repoRoot: string, fileName: string): string {
+  if (path.isAbsolute(fileName)) return fileName;
+  if (fileName.includes('/') || fileName.includes('\\')) return path.resolve(repoRoot, fileName);
+  return path.join(repoRoot, 'fixtures', fileName);
 }
 
 function validateMetadata(value: unknown): value is FixtureMetadata {
@@ -56,22 +69,36 @@ function shortHash(hash: string): string {
  * Media bytes are never committed; the fetch script recreates them from the
  * documented source and verifies this same checksum.
  */
-export function loadFixture({ repoRoot, fixtureDir }: LoadFixtureOptions): FixtureInfo {
-  const metadataPath = path.join(repoRoot, 'fixtures', FIXTURE_METADATA_FILENAME);
+export function loadFixture({
+  repoRoot,
+  fixtureDir,
+  metadataFileName = FIXTURE_METADATA_FILENAME,
+  videoUrlForFile = (fileName) => pathToFileURL(fileName).href,
+  fetchCommand = 'npm run fetch:fixture',
+}: LoadFixtureOptions): FixtureInfo {
+  const metadataPath = metadataPathFor(repoRoot, metadataFileName);
+  const fetchAction = `Run \`${fetchCommand}\` from the repository root, then press Recheck input. Shymask never opens a physical webcam as a fallback.`;
+  const invalid = (message: string, action = fetchAction): FixtureInfo => ({
+    state: 'invalid',
+    metadata: null,
+    message,
+    action,
+  });
+
   let metadata: FixtureMetadata;
   try {
     const parsed: unknown = JSON.parse(readFileSync(metadataPath, 'utf8'));
     if (!validateMetadata(parsed)) {
       return invalid(
         `Fixture metadata at ${metadataPath} is present but does not contain the required fields.`,
-        'Restore fixtures/webcam-loop.json from the repository, or re-run `npm run fetch:fixture`.',
+        'Restore the fixture manifest from the repository, or re-run the documented fetch command.',
       );
     }
     metadata = parsed;
   } catch (error) {
     return invalid(
       `Fixture metadata at ${metadataPath} could not be read: ${(error as Error).message}`,
-      'Restore fixtures/webcam-loop.json from the repository, or re-run `npm run fetch:fixture`.',
+      'Restore the fixture manifest from the repository, or re-run the documented fetch command.',
     );
   }
 
@@ -84,7 +111,7 @@ export function loadFixture({ repoRoot, fixtureDir }: LoadFixtureOptions): Fixtu
       state: 'missing',
       metadata,
       message: `Replay fixture media is missing: ${videoPath}`,
-      action: FETCH_ACTION,
+      action: fetchAction,
     };
   }
 
@@ -93,7 +120,7 @@ export function loadFixture({ repoRoot, fixtureDir }: LoadFixtureOptions): Fixtu
       state: 'invalid',
       metadata,
       message: `Fixture size mismatch for ${videoPath}: expected ${metadata.bytes} bytes, found ${videoBytes} bytes. The cached clip is incomplete or was replaced.`,
-      action: `Delete the cached clip (${videoPath}) and ${FETCH_ACTION}`,
+      action: `Delete the cached clip (${videoPath}) and ${fetchAction}`,
     };
   }
 
@@ -103,13 +130,13 @@ export function loadFixture({ repoRoot, fixtureDir }: LoadFixtureOptions): Fixtu
       state: 'invalid',
       metadata,
       message: `Fixture checksum mismatch for ${videoPath}: expected ${shortHash(metadata.sha256)}, found ${shortHash(actualSha256)}. The cached clip is corrupt or was replaced.`,
-      action: `Delete the cached clip (${videoPath}) and ${FETCH_ACTION}`,
+      action: `Delete the cached clip (${videoPath}) and ${fetchAction}`,
     };
   }
 
   return {
     state: 'ready',
     metadata,
-    videoUrl: pathToFileURL(videoPath).href,
+    videoUrl: videoUrlForFile(metadata.fileName),
   };
 }

@@ -1,11 +1,13 @@
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, protocol } from 'electron';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import type { CameraFrame, CaptureResult, FixtureInfo, StartupInfo, VirtualCameraStatus } from '../core/bridge';
-import { loadFixture } from './fixture';
+import type { CameraFrame, CaptureResult, FixtureInfo, StartupInfo, TrackerInfo, VirtualCameraStatus } from '../core/bridge';
+import { createAssetHandler } from './asset-protocol';
+import { FIXTURE_METADATA_FILENAME, loadFixture } from './fixture';
+import { loadTracker } from './tracker';
 import { VirtualCameraPublisher } from './virtual-camera';
 
-// Electron's `app.getAppPath()` is the project root when launched with `electron .`;
+// `app.getAppPath()` is the project root when launched with `electron .`;
 // the Playwright check harness uses the same entry point.
 const repoRoot = app.getAppPath();
 const fixtureDir = process.env.SHYMASK_FIXTURE_DIR
@@ -14,8 +16,41 @@ const fixtureDir = process.env.SHYMASK_FIXTURE_DIR
 const evidenceDir = process.env.SHYMASK_EVIDENCE_DIR
   ? path.resolve(process.env.SHYMASK_EVIDENCE_DIR)
   : path.join(repoRoot, 'evidence');
+// The default recorded replay; the public-workflow check points this at the
+// documented larger-motion fixture to exercise real head turns and nods.
+const fixtureManifest = (process.env.SHYMASK_FIXTURE_MANIFEST ?? FIXTURE_METADATA_FILENAME).trim();
+const fixtureFetchCommand = fixtureManifest === FIXTURE_METADATA_FILENAME ? 'npm run fetch:fixture' : 'npm run fetch:motion-fixture';
+const rendererDir = path.join(repoRoot, 'dist', 'renderer');
+const trackerDir = process.env.SHYMASK_TRACKER_DIR
+  ? path.resolve(process.env.SHYMASK_TRACKER_DIR)
+  : path.join(rendererDir, 'tracker');
+const assetScheme = 'shymask';
+const assetBaseUrl = `${assetScheme}://app`;
+const fixtureUrlBase = `${assetBaseUrl}/fixture`;
+const trackerUrlBase = `${assetBaseUrl}/tracker`;
 
-let currentFixture: FixtureInfo = loadFixture({ repoRoot, fixtureDir });
+// The renderer, its WASM assets and the replay clip are served from a local
+// asset scheme so Fetch API/WASM and byte-range media work under a strict CSP.
+// The scheme is privileged before `app.whenReady()`; nothing leaves the machine.
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: assetScheme,
+    privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true, stream: true },
+  },
+]);
+
+let currentFixture: FixtureInfo = loadFixture({
+  repoRoot,
+  fixtureDir,
+  metadataFileName: fixtureManifest,
+  fetchCommand: fixtureFetchCommand,
+  videoUrlForFile: (fileName) => `${fixtureUrlBase}/${encodeURIComponent(fileName)}`,
+});
+let currentTracker: TrackerInfo = loadTracker({
+  repoRoot,
+  trackerDir,
+  wasmBaseUrl: trackerUrlBase,
+});
 let mainWindow: BrowserWindow | null = null;
 let virtualCamera: VirtualCameraPublisher | null = null;
 let quitting = false;
@@ -65,15 +100,21 @@ function createWindow(): void {
     mainWindow = null;
   });
 
-  void mainWindow.loadFile(path.join(repoRoot, 'dist', 'renderer', 'index.html'));
+  void mainWindow.loadURL(`${assetBaseUrl}/index.html`);
 }
 
 ipcMain.handle('shymask:startup-info', (): StartupInfo => {
-  return { fixture: currentFixture };
+  return { fixture: currentFixture, tracker: currentTracker };
 });
 
 ipcMain.handle('shymask:recheck-fixture', (): FixtureInfo => {
-  currentFixture = loadFixture({ repoRoot, fixtureDir });
+  currentFixture = loadFixture({
+    repoRoot,
+    fixtureDir,
+    metadataFileName: fixtureManifest,
+    fetchCommand: fixtureFetchCommand,
+    videoUrlForFile: (fileName) => `${fixtureUrlBase}/${encodeURIComponent(fileName)}`,
+  });
   return currentFixture;
 });
 
@@ -131,6 +172,10 @@ function broadcastVirtualCameraStatus(status: VirtualCameraStatus): void {
 }
 
 app.whenReady().then(() => {
+  protocol.handle(
+    assetScheme,
+    createAssetHandler({ rendererDir, trackerDir, fixtureDir }),
+  );
   createWindow();
   virtualCamera = new VirtualCameraPublisher({
     repoRoot,

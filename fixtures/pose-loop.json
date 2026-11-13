@@ -1,0 +1,16 @@
+{
+  "id": "pose-loop-v1",
+  "title": "Michael speaking Esperanto (Wikitongues) - 480p transcode",
+  "fileName": "pose-loop.webm",
+  "sourcePage": "https://commons.wikimedia.org/wiki/File:Michael_speaking_Esperanto.webm",
+  "originalUrl": "https://upload.wikimedia.org/wikipedia/commons/transcoded/9/9c/Michael_speaking_Esperanto.webm/Michael_speaking_Esperanto.webm.480p.vp9.webm",
+  "license": "CC0 1.0",
+  "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+  "attribution": "Wikitongues, Inc, CC0 1.0 (Wikimedia Commons 480p VP9 transcode of File:Michael speaking Esperanto.webm)",
+  "sha256": "f2f53b55b242eec9dea9d72e2705955dd1211377cda18f6db79ed24c8fe71a52",
+  "bytes": 6058649,
+  "durationSeconds": 49.628,
+  "width": 854,
+  "height": 481,
+  "notes": "Second recorded fixture used only by the public-workflow check (SHYMASK_FIXTURE_MANIFEST=pose-loop.json) to exercise real head turns, nods and leaning during mask tracking. The 8 s window starting at 41.6 s contains the largest measured pose swing (yaw about 25 deg, pitch about 27 deg, roll about 17 deg). Fetched from the Wikimedia transcode URL so the pinned SHA-256 is stable; the original upload is 1920x1080. One seated person facing the camera for the whole clip."
+}

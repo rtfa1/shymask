@@ -1,23 +1,28 @@
 #!/usr/bin/env node
 /**
- * Repeatable acquisition of the recorded replay fixture.
+ * Repeatable acquisition of a recorded replay fixture.
  *
  * The media bytes stay out of Git (fixtures/cache is ignored). This script
  * downloads the documented source, verifies the committed size and SHA-256,
  * and fails with an actionable message on any mismatch.
  *
  * Usage:
- *   npm run fetch:fixture            # download if missing, verify if present
- *   npm run fetch:fixture -- --force # re-download and re-verify
+ *   npm run fetch:fixture                          # default webcam-loop.json
+ *   npm run fetch:motion-fixture                   # larger-motion tracking clip
+ *   node scripts/fetch-fixture.mjs <manifest>      # any fixtures/*.json manifest
+ *   npm run fetch:fixture -- --force               # re-download and re-verify
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const metadataPath = path.join(root, 'fixtures', 'webcam-loop.json');
+const manifestArg = process.argv.slice(2).find((argument) => !argument.startsWith('--'));
+const metadataPath = manifestArg
+  ? path.resolve(root, manifestArg)
+  : path.join(root, 'fixtures', 'webcam-loop.json');
 const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
 const fixtureDir = process.env.SHYMASK_FIXTURE_DIR
   ? path.resolve(process.env.SHYMASK_FIXTURE_DIR)
@@ -25,6 +30,7 @@ const fixtureDir = process.env.SHYMASK_FIXTURE_DIR
 const targetPath = path.join(fixtureDir, metadata.fileName);
 const force = process.argv.includes('--force');
 const userAgent = 'ShymaskFixtureFetcher/0.1 (https://github.com/rtfa1/shymask; local development)';
+const commandName = manifestArg ? `node scripts/fetch-fixture.mjs ${path.relative(root, metadataPath).replace(/\\/g, '/')}` : 'npm run fetch:fixture';
 
 function sha256Of(buffer) {
   return createHash('sha256').update(buffer).digest('hex');
@@ -32,6 +38,7 @@ function sha256Of(buffer) {
 
 function describeSource() {
   return [
+    `manifest: ${path.relative(root, metadataPath)}`,
     `source page: ${metadata.sourcePage}`,
     `license: ${metadata.license} (${metadata.licenseUrl})`,
     `attribution: ${metadata.attribution}`,
@@ -50,8 +57,8 @@ function verify(buffer) {
   if (actualSha256 !== metadata.sha256) {
     throw new Error(
       `Downloaded fixture checksum mismatch: expected ${metadata.sha256}, received ${actualSha256}.\n` +
-        'The upstream file changed or the download was corrupted. Do not use this file; ' +
-        'update fixtures/webcam-loop.json only after reviewing the new source.',
+        `The upstream file changed or the download was corrupted. Do not use this file; ` +
+        `update ${path.relative(root, metadataPath)} only after reviewing the new source.`,
     );
   }
   return { bytes: actualBytes, sha256: actualSha256 };
@@ -91,7 +98,7 @@ async function main() {
     const verified = verify(existing);
     console.log(`Fixture already present and verified: ${targetPath}`);
     console.log(`  ${verified.bytes} bytes, sha256 ${verified.sha256}`);
-    console.log('Use `npm run fetch:fixture -- --force` to re-download.');
+    console.log(`Use \`${commandName} -- --force\` to re-download.`);
     return;
   }
 
@@ -118,7 +125,7 @@ main().catch((error) => {
   console.error(`Fixture fetch failed: ${error.message}`);
   console.error(describeSource());
   console.error(
-    'Fix the network/source problem and retry `npm run fetch:fixture`. The app shows an actionable paused error until a valid fixture is present.',
+    `Fix the network/source problem and retry \`${commandName}\`. The app shows an actionable paused error until a valid fixture is present.`,
   );
   process.exit(1);
 });

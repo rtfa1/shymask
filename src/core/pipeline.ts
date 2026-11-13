@@ -12,9 +12,11 @@ export interface FrameStats {
 }
 
 /**
- * The one canvas that produces every visible output frame. Processed frames
- * and the opaque paused screen are both drawn here; later slices capture this
- * same canvas for the virtual webcam instead of introducing a second path.
+ * The one canvas that produces every visible output frame. Processed frames,
+ * the rigid mask composite and the opaque paused screen are all drawn here; the
+ * virtual webcam publishes this same canvas instead of introducing a second
+ * path. Keeping the mask as an offscreen WebGL canvas that is composited with
+ * `drawImage` means the preview and camera cannot diverge.
  */
 export class PreviewPipeline {
   private readonly context: CanvasRenderingContext2D;
@@ -42,12 +44,28 @@ export class PreviewPipeline {
     return this.canvas.height;
   }
 
-  renderProcessedFrame(source: HTMLVideoElement, treatment: ColorTreatment): FrameStats {
+  /**
+   * Draws the replay frame with an optional declarative colour treatment and an
+   * optional transparent overlay (the rigid mask). Both effects share the same
+   * output canvas and the same single frame path.
+   */
+  renderProcessedFrame(
+    source: CanvasImageSource,
+    treatment: ColorTreatment | null,
+    overlay: HTMLCanvasElement | null = null,
+  ): FrameStats {
     const startedAt = performance.now();
     this.context.save();
-    this.context.filter = treatment.cssFilter;
+    this.context.filter = treatment?.cssFilter ?? 'none';
     this.context.drawImage(source, 0, 0, this.width, this.height);
     this.context.restore();
+
+    if (overlay) {
+      this.context.save();
+      this.context.filter = 'none';
+      this.context.drawImage(overlay, 0, 0, this.width, this.height);
+      this.context.restore();
+    }
     return this.finishFrame(startedAt);
   }
 
@@ -74,6 +92,18 @@ export class PreviewPipeline {
   readOutputRgba(): ArrayBuffer {
     const image = this.context.getImageData(0, 0, this.width, this.height);
     return image.data.buffer;
+  }
+
+  /** Reads one output pixel for public diagnostics/evidence (0,0 is top-left). */
+  readPixel(x: number, y: number): Rgb | null {
+    const px = Math.max(0, Math.min(this.width - 1, Math.round(x)));
+    const py = Math.max(0, Math.min(this.height - 1, Math.round(y)));
+    try {
+      const data = this.context.getImageData(px, py, 1, 1).data;
+      return { r: data[0] ?? 0, g: data[1] ?? 0, b: data[2] ?? 0 };
+    } catch {
+      return null;
+    }
   }
 
   private finishFrame(startedAt: number): FrameStats {
