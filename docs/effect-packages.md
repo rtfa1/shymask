@@ -133,6 +133,17 @@ camera). The mask is attached to the tracked face's facial transformation
 matrix — not to screen coordinates — using the same 63° vertical-field-of-view
 camera as the bundled mask, so position, rotation and scale are in that space.
 
+Every mask, bundled or imported, is rendered with the same depth-only canonical
+face occluder in the mask scene. Mask fragments behind the tracked face surface
+are hidden and the person's face shows through; the occluder does not deform for
+facial expressions (the mask is rigid). This is why the package's
+bounding-box-centre colour probe can legitimately be hidden at some poses: the
+renderer still reports the probe colour metadata, and the public check proves
+the packaged material is composited by counting its exact unlit colour in the
+preview and camera PNGs. See
+[note 0005](notes/0005-face-occlusion-and-anchoring.md) for the measured
+evidence and the remaining visual limits.
+
 The mask asset must be a **self-contained binary glTF 2.0 (`.glb`)**
 with triangle meshes (`mode: 4`) and embedded buffers/images (no external URIs).
 `KHR_materials_unlit` is supported (the sample mask uses one unlit material so
@@ -317,10 +328,10 @@ claim that every code is represented by a separate committed archive.
 - Expression reactions, blendshape-driven behavior, animations, skins,
   secondary motion and moving parts. These need explicit runtime support in a
   later schema version.
-- Occlusion refinement (the mask is composited over the face; hiding geometry
-  behind the face is a later issue).
 - Hand-over-mask occlusion, Unreal authoring, Snapchat Lens imports, and
-  full strand-level hair simulation.
+  full strand-level hair simulation. Face-based occlusion of mask geometry
+  behind the tracked face is supported for every mask; hand-over-mask occlusion
+  is out of scope.
 - `.gltf` plus external `.bin`/textures, Draco/meshopt compression, ZIP64,
   encryption, multiple or nested asset folders.
 - More than one complete effect at a time, or combining components from two
@@ -370,10 +381,13 @@ for #11's complexity budgets.
   through the **Import package…** control (only the OS file picker is stubbed in
   the main process; validation, storage, extraction, the local asset protocol and
   GLTFLoader parsing are the real paths), verifies preview and independent
-  camera-consumer frames contain the packaged mask/color treatment, verifies a
+  camera-consumer frames contain the packaged mask/color treatment (by exact
+  material-colour counts and the probe pixel when it is visible), verifies a
   mask-only package with a nonzero attachment, switching/manual-pause/tracking
   gates, rapid double switching, rejects the negative fixtures with actionable
-  codes, and verifies removal and restart persistence.
+  codes, and verifies removal and restart persistence. Scenario G additionally
+  holds a turned recorded frame and proves the same depth-only face occluder
+  changes the output for the bundled mask and for `guard-visor` and `rose-visor`.
 - Evidence (screenshots, camera PNGs, `summary.json`, logs) is written under the
   gitignored `evidence/check-<timestamp>/` directory; `summary.json` contains the
   tested head SHA, the import result messages (which include the displayed

@@ -34,7 +34,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inflateSync } from 'node:zlib';
 import { _electron as electron } from 'playwright-core';
-
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 /** Committed fixture cache; scenarios override the app's input via SHYMASK_FIXTURE_DIR. */
 const committedFixtureCacheDir = path.join(root, 'fixtures', 'cache');
@@ -820,6 +819,116 @@ function pngColorCount(file, target, tolerance = 20) {
   return count;
 }
 
+/**
+ * Counts pixels that differ between two saved PNGs. `rect` limits the count to
+ * the tracked face box (in canvas pixels) so face-occlusion evidence can show
+ * that the changed mask pixels are where the face is, not arbitrary video drift.
+ */
+function pngPixelDiff(fileA, fileB, tolerance = 4, rect = null) {
+  const a = decodePng(fileA);
+  const b = decodePng(fileB);
+  assert.equal(a.width, b.width, 'compared PNGs must have the same width');
+  assert.equal(a.height, b.height, 'compared PNGs must have the same height');
+  let count = 0;
+  let inside = 0;
+  for (let y = 0; y < a.height; y += 1) {
+    for (let x = 0; x < a.width; x += 1) {
+      const index = y * a.stride + x * a.channels;
+      const changed =
+        Math.abs(a.pixels[index] - b.pixels[index]) > tolerance ||
+        Math.abs(a.pixels[index + 1] - b.pixels[index + 1]) > tolerance ||
+        Math.abs(a.pixels[index + 2] - b.pixels[index + 2]) > tolerance;
+      if (!changed) continue;
+      count += 1;
+      if (
+        rect &&
+        x >= rect.x &&
+        x <= rect.x + rect.width &&
+        y >= rect.y &&
+        y <= rect.y + rect.height
+      ) {
+        inside += 1;
+      }
+    }
+  }
+  return { count, inside, width: a.width, height: a.height };
+}
+
+/**
+ * Uses the public Capture evidence frame control and copies the exact 1280x720
+ * output PNG into the run's screenshot folder, so a visual comparison is of the
+ * real canvas rather than a scaled page screenshot.
+ */
+async function captureOutputThroughControl(page, name) {
+  const previous = ((await page.locator('[data-testid="capture-result"]').textContent()) ?? '').trim();
+  await page.locator('[data-testid="capture"]').click();
+  const result = await waitFor(
+    `capture control to write ${name}`,
+    async () => {
+      const text = ((await page.locator('[data-testid="capture-result"]').textContent()) ?? '').trim();
+      if (!text.startsWith('Captured ') || text === previous) return null;
+      return text;
+    },
+    12000,
+    50,
+  );
+  const source = result.slice('Captured '.length).trim();
+  assert.ok(existsSync(source), `capture control must write a PNG at ${source}`);
+  const target = path.join(screenshotsDir, name);
+  copyFileSync(source, target);
+  return target;
+}
+
+/** Seeks the normal replay to a documented time and holds that processed frame. */
+async function holdReplayFrameAt(page, seconds) {
+  const seekSeconds = Math.max(0, seconds - 1);
+  await page.evaluate((target) => {
+    const video = document.querySelector('video');
+    if (!video) throw new Error('expected a replay video element');
+    video.currentTime = target;
+  }, seekSeconds);
+  // The motion-window sampling can leave the replay already past the target,
+  // so the media time must be observed *near the seek position* before the
+  // target wait; otherwise stale diagnostics from the end of the window would
+  // satisfy the target check and Hold would freeze the wrong pre-seek frame.
+  await waitFor(
+    `replay seek to ${seekSeconds}s to take effect`,
+    async () => {
+      const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+      const mediaMs = Number(timestamp.mediaMs ?? 0);
+      return mediaMs >= seekSeconds * 1000 - 400 && mediaMs <= seekSeconds * 1000 + 900 ? timestamp : null;
+    },
+    15000,
+    40,
+  );
+  await waitFor(
+    `replay to reach ${seconds}s`,
+    async () => {
+      const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+      return Number(timestamp.mediaMs ?? 0) >= seconds * 1000 ? timestamp : null;
+    },
+    15000,
+    40,
+  );
+  await page.locator('[data-testid="hold-frame"]').check();
+  await page.waitForTimeout(1000);
+}
+
+async function releaseReplayFrame(page) {
+  await page.locator('[data-testid="hold-frame"]').uncheck();
+  await page.waitForTimeout(300);
+}
+
+/**
+ * Resets the paired jitter counters through the public smoothing control. The
+ * toggles are the normal public diagnostic control; no private state is poked.
+ */
+async function resetPoseSmoothingMetrics(page) {
+  await page.locator('[data-testid="pose-smoothing"]').selectOption('raw');
+  await page.locator('[data-testid="pose-smoothing"]').selectOption('smoothed');
+  await page.waitForTimeout(150);
+}
+
 function pngSize(file) {
   const png = readFileSync(file);
   assert.equal(png.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', 'camera frame must be a PNG');
@@ -1287,6 +1396,11 @@ const MOTION_WINDOW_START_SECONDS = 41.6;
 const MOTION_WINDOW_SECONDS = 8;
 const MOTION_WINDOW_START_MS = MOTION_WINDOW_START_SECONDS * 1000;
 const MOTION_WINDOW_END_MS = MOTION_WINDOW_START_MS + MOTION_WINDOW_SECONDS * 1000;
+/**
+ * Documented side-view moment inside the motion window (yaw about -22° in the
+ * recorded clip) used for the deterministic occlusion A/B on a held frame.
+ */
+const OCCLUSION_CAPTURE_SECONDS = 47.7;
 
 async function readTracking(page) {
   return parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
@@ -1385,6 +1499,123 @@ function spread(values) {
   return values.length === 0 ? 0 : Math.max(...values) - Math.min(...values);
 }
 
+/**
+ * Public A/B occlusion evidence on a held replay frame:
+ *   on, on again (must be pixel-identical), off, back on.
+ * The output PNGs go through the same capture control users use. The diff must
+ * be substantial and must sit on the tracked face, which is where mask geometry
+ * behind the face is hidden.
+ */
+async function occlusionAbEvidence(page, label) {
+  const occlusionBefore = parseKeyValues(await readDiagnostic(page, 'diag-occlusion'));
+  assert.equal(occlusionBefore.enabled, 'true', `${label}: face occlusion must be on for normal output`);
+  assert.equal(occlusionBefore.mode, 'depth-only', `${label}: occlusion must use the depth-only mask scene path`);
+  assert.equal(occlusionBefore.vertices, '468', `${label}: canonical face occluder vertex count`);
+  assert.equal(occlusionBefore.triangles, '898', `${label}: canonical face occluder triangle count`);
+  assert.equal(occlusionBefore.colorWrite, 'false', `${label}: face occluder must not write colour`);
+  assert.equal(occlusionBefore.depthWrite, 'true', `${label}: face occluder must write depth`);
+  const maskBefore = await readMask(page);
+  const face = await readFace(page);
+  assert.equal(maskBefore.visible, 'true', `${label}: a tracked mask must be visible for the occlusion A/B`);
+  assert.equal(face.count, '1', `${label}: exactly one face must be tracked for the occlusion A/B`);
+  const on = await captureOutputThroughControl(page, `${label}-occlusion-on.png`);
+  await page.waitForTimeout(250);
+  const onRepeat = await captureOutputThroughControl(page, `${label}-occlusion-on-repeat.png`);
+  await page.locator('[data-testid="occlusion-toggle"]').uncheck();
+  await page.waitForTimeout(250);
+  const occlusionOff = parseKeyValues(await readDiagnostic(page, 'diag-occlusion'));
+  assert.equal(occlusionOff.enabled, 'false', `${label}: diagnostic control must disable only the occluder`);
+  const off = await captureOutputThroughControl(page, `${label}-occlusion-off.png`);
+  await page.locator('[data-testid="occlusion-toggle"]').check();
+  await page.waitForTimeout(250);
+  const maskAfter = await readMask(page);
+  // The held frame must not move between captures, otherwise a diff could be
+  // video drift rather than the occlusion change.
+  assert.equal(maskAfter.originX, maskBefore.originX, `${label}: held mask originX must not move during the A/B`);
+  assert.equal(maskAfter.originY, maskBefore.originY, `${label}: held mask originY must not move during the A/B`);
+  assert.equal(maskAfter.yaw, maskBefore.yaw, `${label}: held mask yaw must not move during the A/B`);
+
+  const rect = { x: Number(face.x), y: Number(face.y), width: Number(face.w), height: Number(face.h) };
+  const selfDiff = pngPixelDiff(on, onRepeat);
+  const change = pngPixelDiff(on, off, 4, rect);
+  const insideFraction = change.count === 0 ? 0 : change.inside / change.count;
+  assert.equal(
+    selfDiff.count,
+    0,
+    `${label}: two captures of the same held frame must be pixel-identical, got ${selfDiff.count} changed pixels`,
+  );
+  assert.ok(
+    change.count >= 1500,
+    `${label}: occlusion must visibly change the composited mask, changed ${change.count} pixels`,
+  );
+  assert.ok(
+    insideFraction >= 0.75,
+    `${label}: occlusion changes must be on the tracked face (inside fraction ${insideFraction.toFixed(2)}, ${change.inside}/${change.count})`,
+  );
+  return {
+    label,
+    occlusion: occlusionBefore,
+    mask: maskBefore,
+    face,
+    on,
+    onRepeat,
+    off,
+    selfDiffPixels: selfDiff.count,
+    changedPixels: change.count,
+    changedInsideFacePixels: change.inside,
+    insideFaceFraction: Number(insideFraction.toFixed(3)),
+  };
+}
+
+/**
+ * Virtual-camera half of the occlusion A/B: two app-published PNGs from the
+ * independent Media Foundation consumer in the same held state must match, and
+ * the on/off change must match the preview's occlusion change.
+ */
+async function occlusionCameraAbEvidence(page, label, rect) {
+  const preview = await readRgb(page);
+  const onRun = await captureCameraState(page, `${label}-occlusion-on`, 6);
+  assertProcessedFrames(onRun.frames, preview, `${label} occlusion on camera`);
+  const onPngs = onRun.frames
+    .filter((frame) => frame.png && frame.captureUnixMs > 0)
+    .map((frame) => frame.png);
+  assert.ok(onPngs.length >= 2, `${label}: expected two app-published camera PNGs in the on state, got ${onPngs.length}`);
+  await page.locator('[data-testid="occlusion-toggle"]').uncheck();
+  await page.waitForTimeout(300);
+  const offRun = await captureCameraState(page, `${label}-occlusion-off`, 6);
+  assertProcessedFrames(offRun.frames, preview, `${label} occlusion off camera`);
+  const offPng = offRun.frames.find((frame) => frame.png && frame.captureUnixMs > 0)?.png;
+  assert.ok(offPng, `${label}: expected an app-published camera PNG in the off state`);
+  await page.locator('[data-testid="occlusion-toggle"]').check();
+  await page.waitForTimeout(300);
+  const selfDiff = pngPixelDiff(onPngs[0], onPngs[1]);
+  const change = pngPixelDiff(onPngs[0], offPng, 4, rect);
+  const insideFraction = change.count === 0 ? 0 : change.inside / change.count;
+  assert.equal(
+    selfDiff.count,
+    0,
+    `${label}: two camera PNGs of the same held frame must match, got ${selfDiff.count} changed pixels`,
+  );
+  assert.ok(
+    change.count >= 1500,
+    `${label}: the camera must receive the same occlusion change, changed ${change.count} pixels`,
+  );
+  assert.ok(
+    insideFraction >= 0.75,
+    `${label}: camera occlusion changes must be on the tracked face (inside fraction ${insideFraction.toFixed(2)})`,
+  );
+  return {
+    preview,
+    onPng: onPngs[0],
+    onRepeatPng: onPngs[1],
+    offPng,
+    selfDiffPixels: selfDiff.count,
+    changedPixels: change.count,
+    changedInsideFacePixels: change.inside,
+    insideFaceFraction: Number(insideFraction.toFixed(3)),
+  };
+}
+
 function verifyFixtureManifest(manifestFileName) {
   const manifest = JSON.parse(readFileSync(path.join(root, 'fixtures', manifestFileName), 'utf8'));
   const file = path.join(committedFixtureCacheDir, manifest.fileName);
@@ -1463,6 +1694,27 @@ async function trackingMaskScenario() {
     pass(
       'Rigid mask is attached to the tracked face and composited into the output canvas',
       `origin=(${mask.originX},${mask.originY}) size=${mask.widthPx}x${mask.heightPx} probe=${JSON.stringify(probe)} ${maskShot}`,
+    );
+
+    // The depth-only canonical face is active for the bundled mask, and the
+    // bounded smoother is the normal path.
+    const occlusion = parseKeyValues(await readDiagnostic(page, 'diag-occlusion'));
+    assert.equal(occlusion.enabled, 'true');
+    assert.equal(occlusion.mode, 'depth-only');
+    assert.equal(occlusion.vertices, '468');
+    assert.equal(occlusion.triangles, '898');
+    const smoothing = await waitFor('smoothing metric frames', async () => {
+      const values = parseKeyValues(await readDiagnostic(page, 'diag-smoothing'));
+      return Number(values.samples) >= 30 ? values : null;
+    });
+    assert.equal(smoothing.mode, 'smoothed');
+    assert.equal(smoothing.baseAlpha, '0.45');
+    assert.ok(Number(smoothing.costMsP95) <= 1, `smoothing filter must stay cheap, got ${smoothing.costMsP95}ms`);
+    evidence.states.occlusion = occlusion;
+    evidence.states.smoothing = smoothing;
+    pass(
+      'Depth-only canonical face occluder and bounded pose smoothing are active for the bundled mask',
+      `occluder vertices=${occlusion.vertices} triangles=${occlusion.triangles} smoothing samples=${smoothing.samples} cost p95=${smoothing.costMsP95}ms`,
     );
 
     // Real recorded motion on the default clip is small; sample it to prove the
@@ -1696,10 +1948,15 @@ async function trackingMaskScenario() {
 async function recordedMotionScenario() {
   log('\n== Scenario G: recorded head turns, nods and leaning (larger-motion CC0 clip) ==');
   const motionMetadata = verifyFixtureManifest('pose-loop.json');
-  const evidence = { states: {}, motion: {}, timing: {} };
+  const evidence = { states: {}, motion: {}, smoothing: {}, occlusion: {}, timing: {} };
+  // Isolated package store so the imported-mask parity evidence in this
+  // scenario does not touch the developer's installed packages.
+  const motionPackageDir = path.join(evidenceDir, 'motion-effect-packages');
+  mkdirSync(motionPackageDir, { recursive: true });
   const { app, page, consoleErrors } = await launchApp({
     SHYMASK_EVIDENCE_DIR: evidenceDir,
     SHYMASK_FIXTURE_MANIFEST: 'pose-loop.json',
+    SHYMASK_PACKAGE_DIR: motionPackageDir,
   });
   try {
     await waitFor('motion fixture diagnostics', async () => {
@@ -1729,6 +1986,47 @@ async function recordedMotionScenario() {
       15000,
       100,
     );
+
+    // Low-motion part of the recorded window: the most sensitive place to
+    // measure tracking jitter, because real head acceleration is small there.
+    // Both raw and shadow-smoothed poses are measured over the same frames.
+    await resetPoseSmoothingMetrics(page);
+    await page.waitForTimeout(2000);
+    const restSmoothing = parseKeyValues(await readDiagnostic(page, 'diag-smoothing'));
+    assert.equal(restSmoothing.mode, 'smoothed');
+    log(`[smoothing low-motion] ${JSON.stringify(restSmoothing)}`);
+    const restRawOriginJitter = Number(restSmoothing.rawJitterOriginPxP95);
+    const restSmoothedOriginJitter = Number(restSmoothing.smoothedJitterOriginPxP95);
+    const restRawRotationJitter = Number(restSmoothing.rawJitterRotationDegP95);
+    const restSmoothedRotationJitter = Number(restSmoothing.smoothedJitterRotationDegP95);
+    assert.ok(Number(restSmoothing.samples) >= 40, `low-motion jitter needs enough frames, got ${restSmoothing.samples}`);
+    assert.ok(restRawOriginJitter > 0.5, `raw low-motion origin jitter must be measurable, got ${restRawOriginJitter}px`);
+    assert.ok(
+      restSmoothedOriginJitter <= restRawOriginJitter * 0.8,
+      `smoothing must reduce low-motion origin jitter, raw=${restRawOriginJitter}px smoothed=${restSmoothedOriginJitter}px`,
+    );
+    assert.ok(
+      restSmoothedRotationJitter <= restRawRotationJitter * 0.85,
+      `smoothing must reduce low-motion rotation jitter, raw=${restRawRotationJitter}deg smoothed=${restSmoothedRotationJitter}deg`,
+    );
+
+    // Re-enter the documented window so the motion samples cover the full
+    // turn/nod/lean range, and restart the paired counters for the motion pass.
+    await page.evaluate((startSeconds) => {
+      const video = document.querySelector('video');
+      if (!video) throw new Error('expected a replay video element');
+      video.currentTime = startSeconds;
+    }, MOTION_WINDOW_START_SECONDS);
+    await waitFor(
+      'motion window media time after jitter reset',
+      async () => {
+        const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+        return Number(timestamp.mediaMs ?? 0) >= MOTION_WINDOW_START_SECONDS * 1000 ? timestamp : null;
+      },
+      15000,
+      100,
+    );
+    await resetPoseSmoothingMetrics(page);
 
     const samples = [];
     const sampleShots = [];
@@ -1789,6 +2087,102 @@ async function recordedMotionScenario() {
       Math.max(originXRange, originYRange) >= 40,
       `recorded motion must move the mask origin, x=${originXRange} y=${originYRange}`,
     );
+    // Across the full turn/nod/lean window the adaptive gain prioritizes
+    // responsiveness, so this pass measures the added lag and filter cost
+    // rather than claiming jitter reduction during fast motion.
+    const motionSmoothing = await waitFor(
+      'pose-smoothing lag evidence over the motion window',
+      async () => {
+        const values = parseKeyValues(await readDiagnostic(page, 'diag-smoothing'));
+        return Number(values.samples) >= 100 ? values : null;
+      },
+      10000,
+      100,
+    );
+    assert.equal(motionSmoothing.mode, 'smoothed');
+    log(`[smoothing motion] ${JSON.stringify(motionSmoothing)}`);
+    assert.ok(
+      Number(motionSmoothing.lagOriginPxP95) <= 8,
+      `smoothing origin lag must stay bounded, got ${motionSmoothing.lagOriginPxP95}px`,
+    );
+    assert.ok(
+      Number(motionSmoothing.lagRotationDegP95) <= 4,
+      `smoothing rotation lag must stay bounded, got ${motionSmoothing.lagRotationDegP95}deg`,
+    );
+    assert.ok(
+      Number(motionSmoothing.rampLagMsP95) <= 100,
+      `smoothing constant-velocity delay must stay under the 100 ms processing budget, got ${motionSmoothing.rampLagMsP95}ms`,
+    );
+    assert.ok(
+      Number(motionSmoothing.costMsP95) <= 1,
+      `smoothing filter must stay cheap, got ${motionSmoothing.costMsP95}ms`,
+    );
+    evidence.smoothing = {
+      lowMotion: restSmoothing,
+      motion: motionSmoothing,
+      originJitterReductionLowMotion: Number((1 - restSmoothedOriginJitter / restRawOriginJitter).toFixed(3)),
+      rotationJitterReductionLowMotion: Number((1 - restSmoothedRotationJitter / restRawRotationJitter).toFixed(3)),
+    };
+    pass(
+      'Bounded pose smoothing reduces low-motion jitter; motion-window lag and cost stay bounded',
+      `low-motion jitter p95 origin ${restRawOriginJitter}->${restSmoothedOriginJitter}px (${(100 * (1 - restSmoothedOriginJitter / restRawOriginJitter)).toFixed(1)}% lower) rotation ${restRawRotationJitter}->${restSmoothedRotationJitter}deg; motion lag p95=${motionSmoothing.lagOriginPxP95}px/${motionSmoothing.lagRotationDegP95}deg ramp=${motionSmoothing.rampLagMsP95}ms cost=${motionSmoothing.costMsP95}ms`,
+    );
+
+    // Side-view occlusion A/B on a documented held frame. The capture control
+    // writes exact 1280x720 output PNGs; the on/off diff must sit on the face.
+    await holdReplayFrameAt(page, OCCLUSION_CAPTURE_SECONDS);
+    const heldTracking = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
+    assert.equal(heldTracking.phase, 'tracking', 'the held side-view frame must still be tracked');
+    const bundledOcclusion = await occlusionAbEvidence(page, '28-bundled-mask');
+    const bundledCameraOcclusion = await occlusionCameraAbEvidence(page, '28-bundled-mask-camera', {
+      x: Number(bundledOcclusion.face.x),
+      y: Number(bundledOcclusion.face.y),
+      width: Number(bundledOcclusion.face.w),
+      height: Number(bundledOcclusion.face.h),
+    });
+    evidence.occlusion = {
+      captureSeconds: OCCLUSION_CAPTURE_SECONDS,
+      bundled: bundledOcclusion,
+      camera: bundledCameraOcclusion,
+    };
+    pass(
+      'Face-based occlusion removes mask pixels on the turned face in the preview and camera',
+      `yaw=${bundledOcclusion.mask.yaw} changed=${bundledOcclusion.changedPixels}px (${(100 * bundledOcclusion.insideFaceFraction).toFixed(1)}% on face) camera=${bundledCameraOcclusion.changedPixels}px ${bundledOcclusion.on} ${bundledOcclusion.off}`,
+    );
+    pass(
+      'The virtual camera receives the same occlusion change on the same held frame',
+      `camera change=${bundledCameraOcclusion.changedPixels}px inside-face=${(100 * bundledCameraOcclusion.insideFaceFraction).toFixed(1)}% self-diff=${bundledCameraOcclusion.selfDiffPixels}px`,
+    );
+
+    // Imported masks use the same renderer and therefore the same occluder.
+    const guardImport = await importPackageThroughControl(app, page, path.join(PACKAGE_FIXTURES_DIR, 'guard-visor.zip'));
+    assert.equal(guardImport.state, 'success', `guard-visor import must succeed: ${guardImport.text}`);
+    await waitForEffectLoaded(page, GUARD_VISOR_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Guard visor/);
+    const guardOcclusion = await occlusionAbEvidence(page, '28-guard-visor');
+    evidence.occlusion.guardVisor = guardOcclusion;
+    pass(
+      'An imported package mask (guard-visor) uses the same face-based occlusion path',
+      `changed=${guardOcclusion.changedPixels}px (${(100 * guardOcclusion.insideFaceFraction).toFixed(1)}% on face) ${guardOcclusion.on} ${guardOcclusion.off}`,
+    );
+
+    const roseImport = await importPackageThroughControl(app, page, path.join(PACKAGE_FIXTURES_DIR, 'rose-visor.zip'));
+    assert.equal(roseImport.state, 'success', `rose-visor import must succeed: ${roseImport.text}`);
+    await waitForEffectLoaded(page, ROSE_VISOR_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Rose visor/);
+    const roseOcclusion = await occlusionAbEvidence(page, '28-rose-visor');
+    evidence.occlusion.roseVisor = roseOcclusion;
+    pass(
+      'A mask-only imported package with a nonzero attachment (rose-visor) uses the same occlusion path',
+      `changed=${roseOcclusion.changedPixels}px (${(100 * roseOcclusion.insideFaceFraction).toFixed(1)}% on face) ${roseOcclusion.on} ${roseOcclusion.off}`,
+    );
+
+    // Return to the bundled mask and the normal moving replay for the remaining
+    // camera/probe evidence.
+    await selectEffectThroughControl(page, 'mask');
+    await waitForStatusTitle(page, /Effect active: Rigid mask/);
+    await releaseReplayFrame(page);
+
     // The fixed local eye probe is exact only when the eye plate faces the
     // camera; at some large yaw/pitch poses the same view ray lands on the
     // surrounding shell. Wait for a frame in the continuing replay where the
@@ -1827,7 +2221,10 @@ async function recordedMotionScenario() {
     pass('Masked motion-window screenshots captured at three points in the turn', sampleShots.join(' '));
 
     const cameraPreview = await readRgb(page);
-    const cameraRun = await captureCameraState(page, 'motion-mask', 6);
+    // Give the renderer's 100 ms publish heartbeat time to replace any paused
+    // frame cached from the preceding effect switch before the consumer samples.
+    await page.waitForTimeout(500);
+    const cameraRun = await captureCameraState(page, 'motion-mask', 10);
     assertProcessedFrames(cameraRun.frames, cameraPreview, 'motion mask');
     const cameraPng = assertProcessedPng(cameraRun.frames, cameraPreview, 'motion mask');
     const eyePixels = pngColorCount(cameraPng.png, MASK_EYE_RGB, 24);
@@ -2027,11 +2424,12 @@ async function waitForPackageMask(page, label, expected = PACKAGE_MASK_RGB) {
     colorNear(expectedRgb, expected, 4),
     `${label}: the packaged unlit material colour must be reported as the probe colour, got ${expectedDiagnostic}`,
   );
-  assert.ok(
-    colorNear(probe, expected, 20),
-    `${label}: preview pixel at the packaged-mask probe must be the package material colour ${JSON.stringify(expected)}, got ${JSON.stringify(probe)}`,
-  );
-  return { mask, face, probe, expectedRgb };
+  // Face occlusion can legitimately hide the bounding-box-centre probe (the
+  // face is in front of that part of the mask). The caller proves the packaged
+  // material is composited by counting its exact colour in the preview/camera
+  // PNG, and only asserts the probe pixel when it is actually visible.
+  const probeVisible = colorNear(probe, expected, 20);
+  return { mask, face, probe, expectedRgb, probeVisible };
 }
 
 /**
@@ -2096,21 +2494,38 @@ async function effectPackageScenario() {
     );
     assert.ok(Number(guardLoaded.switchCount) >= 1);
     const guardPreview = await waitForPackageMask(page, 'imported guard visor');
+    const guardOcclusion = parseKeyValues(await readDiagnostic(page, 'diag-occlusion'));
+    assert.equal(guardOcclusion.enabled, 'true', 'face occlusion must stay active for an imported package mask');
+    assert.equal(guardOcclusion.vertices, '468');
+    assert.equal(guardOcclusion.triangles, '898');
     const guardRgb = await readRgb(page);
     const guardShot = await screenshotCanvas(page, '21-imported-guard-visor-preview.png');
+    // Exact 1280x720 canvas evidence through the public Capture control; the
+    // exact unlit material colour proves the package GLB is composited even if
+    // face occlusion hides the bounding-box-centre probe.
+    const guardMaterialPng = await captureOutputThroughControl(page, '21b-imported-guard-visor-material.png');
+    const guardMaterialPixels = pngColorCount(guardMaterialPng, PACKAGE_MASK_RGB, 28);
+    assert.ok(
+      guardMaterialPixels > 100,
+      `preview PNG must contain the package mask material, found ${guardMaterialPixels} pixels`,
+    );
     evidence.imports.guardVisor = {
       importMessage: guardImport.text,
       effect: guardLoaded,
       mask: guardPreview.mask,
       face: guardPreview.face,
       probe: guardPreview.probe,
+      probeVisible: guardPreview.probeVisible,
       preview: guardRgb,
+      previewMaterialPixels: guardMaterialPixels,
+      previewMaterialPng: guardMaterialPng,
       bundledPreview: bundledRgb,
+      occlusion: guardOcclusion,
       screenshot: guardShot,
     };
     pass(
       'A valid effect package imports through the public control and renders its mask + color treatment in preview',
-      `effect=${GUARD_VISOR_EFFECT_ID} probe=${JSON.stringify(guardPreview.probe)} switchingPausedFrames=${guardLoaded.switchingPausedFrames} ${guardShot}`,
+      `effect=${GUARD_VISOR_EFFECT_ID} probe=${JSON.stringify(guardPreview.probe)} probeVisible=${guardPreview.probeVisible} materialPixels=${guardMaterialPixels} switchingPausedFrames=${guardLoaded.switchingPausedFrames} ${guardShot}`,
     );
 
     // The independent camera consumer must receive the same packaged canvas.
@@ -2120,10 +2535,7 @@ async function effectPackageScenario() {
     const guardMaskPixels = pngColorCount(guardPng.png, PACKAGE_MASK_RGB, 28);
     assert.ok(guardMaskPixels > 100, `camera PNG must contain the package mask material, found ${guardMaskPixels} pixels`);
     const guardCameraPixel = pngPixel(guardPng.png, Number(guardPreview.probe.x), Number(guardPreview.probe.y));
-    assert.ok(
-      colorNear(guardCameraPixel, PACKAGE_MASK_RGB, 28),
-      `camera PNG pixel at the packaged mask probe must be the package material colour, got ${JSON.stringify(guardCameraPixel)}`,
-    );
+    const guardCameraProbeMatches = colorNear(guardCameraPixel, PACKAGE_MASK_RGB, 28);
     evidence.camera.guardVisor = {
       preview: guardRgb,
       camera: averageFrameRgb(guardCameraRun.frames),
@@ -2131,10 +2543,11 @@ async function effectPackageScenario() {
       pngRgb: guardPng.rgb,
       maskPixels: guardMaskPixels,
       cameraPixel: guardCameraPixel,
+      cameraProbeMatchesMaterial: guardCameraProbeMatches,
     };
     pass(
       'The virtual camera receives the same imported mask + treatment through the shared output path',
-      `camera=${JSON.stringify(evidence.camera.guardVisor.camera)} maskPixels=${guardMaskPixels} probePixel=${JSON.stringify(guardCameraPixel)} ${guardPng.png}`,
+      `camera=${JSON.stringify(evidence.camera.guardVisor.camera)} maskPixels=${guardMaskPixels} probePixel=${JSON.stringify(guardCameraPixel)} probeMatches=${guardCameraProbeMatches} ${guardPng.png}`,
     );
 
     // --- Import a color-treatment-only package -------------------------------
@@ -2188,24 +2601,34 @@ async function effectPackageScenario() {
     // not silently default them, before it parses the package GLB.
     assert.equal(roseLoaded.attachment, '2,3.5,0/0,0,12/1.1');
     const rosePreview = await waitForPackageMask(page, 'imported rose visor', ROSE_MASK_RGB);
+    const roseOcclusion = parseKeyValues(await readDiagnostic(page, 'diag-occlusion'));
+    assert.equal(roseOcclusion.enabled, 'true', 'face occlusion must stay active for a mask-only package');
+    assert.equal(roseOcclusion.vertices, '468');
     const roseRgb = await readRgb(page);
     const roseShot = await screenshotCanvas(page, '22b-imported-rose-visor-preview.png');
+    const roseMaterialPng = await captureOutputThroughControl(page, '22c-imported-rose-visor-material.png');
+    const roseMaterialPixels = pngColorCount(roseMaterialPng, ROSE_MASK_RGB, 28);
+    assert.ok(
+      roseMaterialPixels > 50,
+      `preview PNG must contain the rose mask material, found ${roseMaterialPixels} pixels`,
+    );
     const roseRun = await captureCameraState(page, 'imported-rose-visor', 6);
     assertProcessedFrames(roseRun.frames, roseRgb, 'imported rose visor');
     const rosePng = assertProcessedPng(roseRun.frames, roseRgb, 'imported rose visor');
     const roseMaskPixels = pngColorCount(rosePng.png, ROSE_MASK_RGB, 28);
     assert.ok(roseMaskPixels > 50, `camera PNG must contain the rose mask material, found ${roseMaskPixels} pixels`);
     const roseCameraPixel = pngPixel(rosePng.png, Number(rosePreview.probe.x), Number(rosePreview.probe.y));
-    assert.ok(
-      colorNear(roseCameraPixel, ROSE_MASK_RGB, 28),
-      `camera PNG pixel at the rose mask probe must be the package material colour, got ${JSON.stringify(roseCameraPixel)}`,
-    );
+    const roseCameraProbeMatches = colorNear(roseCameraPixel, ROSE_MASK_RGB, 28);
     evidence.imports.roseVisor = {
       importMessage: roseImport.text,
       effect: roseLoaded,
       mask: rosePreview.mask,
       probe: rosePreview.probe,
+      probeVisible: rosePreview.probeVisible,
       preview: roseRgb,
+      previewMaterialPixels: roseMaterialPixels,
+      previewMaterialPng: roseMaterialPng,
+      occlusion: roseOcclusion,
       screenshot: roseShot,
     };
     evidence.camera.roseVisor = {
@@ -2215,6 +2638,7 @@ async function effectPackageScenario() {
       pngRgb: rosePng.rgb,
       maskPixels: roseMaskPixels,
       cameraPixel: roseCameraPixel,
+      cameraProbeMatchesMaterial: roseCameraProbeMatches,
     };
     pass(
       'A mask-only package with nonzero attachment position/rotation/scale renders in preview and camera',
@@ -2284,7 +2708,11 @@ async function effectPackageScenario() {
     const stillPaused = await readStatus(page);
     assert.equal(stillPaused.mode, 'paused');
     assert.match(stillPaused.explanation, /paused manually/i);
-    const manualRun = await captureCameraState(page, 'imported-manual-pause', 4);
+    // Let the camera host report the new client and the renderer's 100 ms
+    // publish heartbeat run once before sampling, otherwise the consumer can
+    // read only the native pre-connection fallback frames.
+    await page.waitForTimeout(300);
+    const manualRun = await captureCameraState(page, 'imported-manual-pause', 6);
     assertAllPausedFrames(manualRun.frames, 'imported effect manual pause');
     const manualPng = assertPausedPng(manualRun.frames, 'imported effect manual pause');
     const manualShot = await screenshotCanvas(page, '23-imported-effect-manual-pause.png');
@@ -2384,12 +2812,21 @@ async function effectPackageScenario() {
       const statusAfterReject = await readStatus(page);
       assert.equal(statusAfterReject.mode, 'render', `${negative.name}: a rejected import must not change the active output`);
       assert.match(statusAfterReject.title, /Effect active: Guard visor/);
+      const rejectionMask = await readMask(page);
       const rejectionProbe = await readMaskProbe(page);
+      const rejectionColour = parseKeyValues(await readDiagnostic(page, 'diag-mask-color'));
+      assert.equal(rejectionMask.visible, 'true', `${negative.name}: the previous packaged mask must stay visible`);
       assert.ok(
-        colorNear(rejectionProbe, PACKAGE_MASK_RGB, 20),
-        `${negative.name}: the previous packaged effect must keep rendering, got probe ${JSON.stringify(rejectionProbe)}`,
+        colorNear(rejectionColour, PACKAGE_MASK_RGB, 4),
+        `${negative.name}: the previous packaged effect must keep rendering, got material colour ${JSON.stringify(rejectionColour)}`,
       );
-      evidence.negative.push({ name: negative.name, expectedCode: negative.code, message: result.text.slice(0, 400) });
+      evidence.negative.push({
+        name: negative.name,
+        expectedCode: negative.code,
+        message: result.text.slice(0, 400),
+        maskVisible: rejectionMask.visible,
+        maskProbe: rejectionProbe,
+      });
     }
     await page.screenshot({ path: path.join(screenshotsDir, '25-package-import-error.png') });
     const afterNegatives = await readEffectDiagnostic(page);
@@ -2600,6 +3037,7 @@ async function main() {
         resolution: `${motionManifest.width}x${motionManifest.height}`,
         windowStartSeconds: MOTION_WINDOW_START_SECONDS,
         windowSeconds: MOTION_WINDOW_SECONDS,
+        occlusionCaptureSeconds: OCCLUSION_CAPTURE_SECONDS,
       },
     },
     measuredBoundaries: [
@@ -2611,7 +3049,11 @@ async function main() {
       'The camera path adds the app canvas readback, an IPC copy, a loopback TCP hop, RGB32 conversion and the native media source; each is inside the measured latency, but no camera sensor or call application is involved.',
       'No physical-camera behavior, real Zoom/Meet/OBS compatibility, laptop or integrated-graphics suitability is measured.',
       'Tracker inference cost is performance.now() around one MediaPipe detectForVideo call; the first warm-up inference is reported separately and excluded from the p95.',
-      'Mask placement/orientation is derived from the MediaPipe facial transformation matrix using its documented 63 degree vertical-FOV camera assumption; it is a rigid attachment, not occlusion-aware.',
+      'Mask placement/orientation is derived from the MediaPipe facial transformation matrix using its documented 63 degree vertical-FOV camera assumption; it is a rigid attachment.',
+      'Face occlusion renders a depth-only copy of MediaPipe\'s 468-vertex canonical face model (898 triangles) with the same tracked matrix into the mask scene; mask fragments behind the reconstructed face fail the depth test and the underlying video shows through.',
+      'Occlusion A/B evidence holds one documented recorded side-view frame (47.7 s in the motion clip) via the diagnostic Hold replay frame control and captures exact 1280x720 output PNGs through the public Capture control. The held canvas is deterministic: two captures in the same state must be pixel-identical.',
+      'Raw and smoothed pose jitter are measured over the same presented frames in the low-motion part of the recorded window, where tracking noise dominates; across the full turn/nod/lean window the reported p95 raw-vs-smoothed offset and the filter\'s implied constant-velocity delay measure the added lag.',
+      'Smoothing is a bounded exponential filter (base gain 0.45 at rest, rising toward 1 as measured face speed approaches 360 deg/s or 60 cm/s) with hard 4 cm / 8 degree lag caps. It is not a prediction filter and the recorded frames are replay input.',
       'Tracking-loss, multiple-face and unreliable-tracking policy states in Scenario F are produced by the labelled diagnostic injection control; the real detector path is used for the normal tracking and recorded-motion states. The recorded-motion clip is real recorded video from a second CC0 fixture, positioned by seeking to a documented window.',
       'Effect-package evidence uses an isolated SHYMASK_PACKAGE_DIR and stubs only the Electron OS file picker in the main process; validation, archive safety checks, storage, asset protocol loading and GLTFLoader parsing are the real paths. A rejected dialog cancellation is not exercised.',
       'The sample packages are committed generated fixtures (deterministic GLB writer + `npm run build:packages`), not Blender output; the contract and validator are what the later Blender/AI authoring slice will use.',
@@ -2619,6 +3061,7 @@ async function main() {
     ],
     commands: {
       build: 'npm run build',
+      buildFaceOccluder: 'npm run build:face-occluder',
       buildNative: 'npm run build:native',
       buildPackages: 'npm run build:packages',
       installCamera: 'npm run vcam:install',
@@ -2656,7 +3099,23 @@ async function main() {
         bytes: trackerMetadata.bytes,
       },
       mask:
-        'bundled procedural low-poly helmet/visor attached to the face facial transformation matrix; MediaPipe 63 degree vertical FOV camera; occlusion refinement is a later issue',
+        'bundled procedural low-poly helmet/visor attached to the face facial transformation matrix; MediaPipe 63 degree vertical FOV camera; a depth-only canonical face occluder in the same scene hides mask fragments behind the tracked face',
+      occlusion: {
+        approach:
+          'depth-only canonical MediaPipe face mesh rendered first with the same tracked facial transformation matrix; colorWrite=false, depthWrite=true; applies to bundled and imported package masks because both live under the same mask group',
+        vertices: 468,
+        triangles: 898,
+        source: 'MediaPipe face_geometry canonical_face_model.obj (Apache-2.0), committed via npm run build:face-occluder',
+        evidence: recordedMotion.occlusion,
+      },
+      poseSmoothing: {
+        approach:
+          'bounded exponential pose filter: base gain 0.45 at rest, adaptive gain toward 1 by measured speed, hard 4 cm / 8 degree lag caps; quaternion rotation smoothing with shortest-arc slerp',
+        baseAlpha: 0.45,
+        referenceFrameMs: Number((1000 / 24).toFixed(2)),
+        maxRampLagMs: Number((((1 - 0.45) / 0.45) * (1000 / 24)).toFixed(1)),
+        evidence: recordedMotion.smoothing,
+      },
       thresholds: {
         minFaceDetectionConfidence: 0.5,
         minFacePresenceConfidence: 0.5,
@@ -2678,8 +3137,7 @@ async function main() {
         defaultClip: trackingMask,
         recordedMotion,
         trackerModel,
-      },
-    },
+      },    },
     effectPackages: {
       contract: {
         schemaVersion: 1,
@@ -2714,7 +3172,7 @@ async function main() {
       'Camera latency is measured against canvas capture time in the same process tree; camera-sensor and call-network delay are out of scope.',
       'Tracking is demonstrated on recorded video (the default clip and a second larger-motion CC0 clip); there is no physical-camera or live-human tracking evidence in this slice.',
       'Tracking loss, multiple faces and unreliable tracking are exercised through a labelled diagnostic injection; the detected-face path is authoritative when the control is on normal. The policy cannot detect every possible tracking or rendering defect.',
-      'The rigid mask has no occlusion refinement and no secondary motion; those are later issues. The mask is composited as one procedural low-poly effect.',
+      'The mask has face-based occlusion and bounded pose smoothing; secondary motion is a later issue. The canonical face occluder does not deform for facial expressions, and hand-over-mask occlusion is out of scope.',
       'Measured on this development desktop with a discrete GPU; laptop integrated-graphics behavior is unverified.',
       'Color treatments use canvas CSS filters in this spike; a later effect-package slice may replace the implementation.',
       'No CI or branch protection exists; these local checks are the validation gate.',
@@ -2738,6 +3196,12 @@ async function main() {
   log(`mask render + composite p95: ${trackingMask.timing.renderCostP95Ms}ms`);
   log(`default-clip mask motion:    origin x=${trackingMask.maskMotion.defaultClip?.originXSpread}px y=${trackingMask.maskMotion.defaultClip?.originYSpread}px yaw=${trackingMask.maskMotion.defaultClip?.yawSpread?.toFixed?.(1) ?? '?'} pitch=${trackingMask.maskMotion.defaultClip?.pitchSpread?.toFixed?.(1) ?? '?'}`);
   log(`recorded turns/nods window:  ${MOTION_WINDOW_START_SECONDS}s of ${motionManifest.id}: yaw=${recordedMotion.motion.yawRange.toFixed(1)} pitch=${recordedMotion.motion.pitchRange.toFixed(1)} roll=${recordedMotion.motion.rollRange.toFixed(1)} origin=${recordedMotion.motion.originXRange}x${recordedMotion.motion.originYRange}px (${recordedMotion.motion.trackedSamples}/18 tracked)`);
+  log(`pose smoothing (rest):      origin jitter p95 ${recordedMotion.smoothing.lowMotion.rawJitterOriginPxP95}->${recordedMotion.smoothing.lowMotion.smoothedJitterOriginPxP95}px rotation ${recordedMotion.smoothing.lowMotion.rawJitterRotationDegP95}->${recordedMotion.smoothing.lowMotion.smoothedJitterRotationDegP95}deg`);
+  log(`smoothing added lag/cost:    origin p95=${recordedMotion.smoothing.motion.lagOriginPxP95}px rotation p95=${recordedMotion.smoothing.motion.lagRotationDegP95}deg ramp p95=${recordedMotion.smoothing.motion.rampLagMsP95}ms filter p95=${recordedMotion.smoothing.motion.costMsP95}ms`);
+  log(`occlusion A/B (bundled):     ${recordedMotion.occlusion.bundled.changedPixels}px changed, ${(100 * recordedMotion.occlusion.bundled.insideFaceFraction).toFixed(1)}% on face, self-diff ${recordedMotion.occlusion.bundled.selfDiffPixels}px`);
+  log(`occlusion A/B (guard):       ${recordedMotion.occlusion.guardVisor.changedPixels}px changed, ${(100 * recordedMotion.occlusion.guardVisor.insideFaceFraction).toFixed(1)}% on face`);
+  log(`occlusion A/B (rose):        ${recordedMotion.occlusion.roseVisor.changedPixels}px changed, ${(100 * recordedMotion.occlusion.roseVisor.insideFaceFraction).toFixed(1)}% on face`);
+  log(`occlusion A/B (camera):      ${recordedMotion.occlusion.camera.changedPixels}px changed, ${(100 * recordedMotion.occlusion.camera.insideFaceFraction).toFixed(1)}% on face, self-diff ${recordedMotion.occlusion.camera.selfDiffPixels}px`);
   log(`tracker model:               ${trackerMetadata.id} sha256=${trackerMetadata.sha256.slice(0, 12)}…`);
   log('These numbers are replay-derived. They do not establish physical-camera tracking, laptop suitability,');
   log('or the 720p/30 FPS / 100 ms target, and the policy cannot detect every possible visual defect.');

@@ -61,6 +61,11 @@ Measured pose range in the 8 s window starting at **41.6 s** (see
 clip in 0.4 s steps and maximizing the pose spread, then pinned in the check as
 `MOTION_WINDOW_START_SECONDS`.
 
+The public check also pins **47.7 s** (`OCCLUSION_CAPTURE_SECONDS`) as a
+side-view moment inside that window (yaw about −21 degrees). It holds that
+recorded frame and captures occlusion-on/off output PNGs for the bundled mask,
+`guard-visor` and `rose-visor`, plus the independent virtual-camera consumer.
+
 Gaps still relevant to later slices:
 
 - No second person (multiple-face policy uses the labelled diagnostic injection).

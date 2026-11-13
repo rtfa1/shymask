@@ -7,6 +7,7 @@
   "main": "dist/src/main/main.js",
   "scripts": {
     "build": "node scripts/build.mjs",
+    "build:face-occluder": "node scripts/build-face-occluder.mjs",
     "build:packages": "node scripts/build-package-fixtures.mjs",
     "validate:package": "node scripts/validate-package.mjs",
     "typecheck": "tsc -p tsconfig.json",
