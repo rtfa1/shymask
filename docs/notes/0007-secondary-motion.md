@@ -90,6 +90,9 @@ parsed and applies `restQuaternion × axisAngle(angle)` to each node per frame.
 A missing or ambiguous node fails the effect load, which uses the shared paused
 output — it never falls back to the raw frame. `src/renderer/renderer.ts` owns
 the simulator instance, the per-effect declaration key and the metrics.
+The bundled procedural mask stays rigid; the issue's language is packaged masks,
+so the demonstration and the movable-part contract are package-only. A future
+bundled mask could reuse the same renderer hooks without a schema change.
 
 ### Deliberate resets (no impulse)
 
@@ -157,20 +160,20 @@ Covered by `npm test` and `npm run check` scenario J:
   `reactive-ears.zip` through **Import package…**, selects it automatically,
   verifies preview and independent camera PNGs contain the package's exact unlit
   material, and samples the documented 8 s turn/nod/lean window: 17/18 frames
-  tracked, per-part angle ranges 45.3°/45.3°/43.6° across recent runs, maximum
-  observed 28.76° (all inside the declared 32/32/35° bounds). Three screenshots
+  tracked, per-part angle ranges 59.7°/59.7°/42.0° in the cited run, maximum
+  observed 30.75° (all inside the declared 32/32/35° bounds). Three screenshots
   are saved.
 - **Post-turn settling:** a separate documented window starts at 25.0 s for
   1.9 s (the recorded head turn around 25.9 s is followed by about a second of
   low head angular velocity). In the cited run the live window measured a spring
-  peak of 13.92°, still 6.99° after head angular speed fell to 5.4°/s, and a
-  near-rest 2.05° 650 ms after the peak (14.7% of peak). The recorded person
+  peak of 17.71°, still 7.90° after head angular speed fell to 8.5°/s, and a
+  near-rest 2.73° 833 ms after the peak (15.4% of peak). The recorded person
   keeps producing small head motion later, so this live window reports the
   residual and a near-rest sample rather than asserting a monotonic tail.
 - **Held-frame settling (strict):** after the A/B, the replay stays held at the
   documented 47.7 s post-turn frame and the diagnostic **Settle held frame**
   control advances the same simulator with the stationary accepted pose. In the
-  cited run the retained 21.88° decayed to 0.02° (0.1% of the retained angle)
+  cited run the retained 8.70° decayed to 0.03° (0.3% of the retained angle)
   over about 2.9 s, and the minimum after one second was 0.02°. This is the
   deterministic post-turn decay evidence; the head is stopped by the hold, so
   the spring's continued motion and settling are unambiguous.
@@ -181,9 +184,11 @@ Covered by `npm test` and `npm run check` scenario J:
   reset the spring (angles exactly rest), and recovery resumed from rest; the
   first reported recovery sample was 4.78° (bounded, driven by the new pose).
 - **Published-output A/B:** on the held 47.7 s post-turn frame the retained
-  angle was 21.88°; simulated vs rest changed 3,469 pixels, all inside the mask
+  angle was 8.70°; simulated vs rest changed 1,864 pixels, all inside the mask
   rectangle, with 0 same-state self-diff for ON and OFF. The independent camera
-  PNG changed by the identical 3,469 pixels.
+  PNG changed by the identical 1,864 pixels. The retained held angle varies with
+  the exact held frame (8–24° across recent runs); the assertion requires at
+  least 5° and at least 800 changed pixels.
 - **Paused-output policy:** manual pause, injected tracking loss, injected
   multiple faces, simulated processing failure, an async package switch and
   explicit `No effect` all hide the output. Manual pause, tracking loss and
@@ -196,14 +201,16 @@ Covered by `npm test` and `npm run check` scenario J:
   rejected as `secondary-motion-invalid`, keep the current effect rendering, and
   cause no renderer console error.
 - **Replay-based workload:** the pure spring update measured about 0.1 ms p95
-  (timer granularity, main thread only); the full render p95 was 5.3 ms with the
-  simulated pose versus 5.7 ms with the authored rest pose, and the presented
-  frame interval p95 was 41.8 ms versus 41.8 ms in two sequential 2.2 s windows.
+  (timer granularity, main thread only); the full render p95 was 5.8 ms with the
+  simulated pose versus 5.8 ms with the authored rest pose, and the presented
+  frame interval p95 was 44.3 ms versus 44.3 ms in two sequential 2.2 s windows.
   The OFF state still runs the simulation but draws rest, so these deltas are
   observed run variation, not an isolated simulation cost.
 
-The run's `summary.json` records the tested head SHA, the exact run directory
-(gitignored) and every value above; values vary run to run under desktop load.
+The cited run is `evidence/check-2026-11-13T22-22-14-119Z/summary.json` at code
+head `7a087d7ddaacf900657ba71a84f037dd4ebb2dd6` (94/94 checks). A later
+documentation-only commit does not change the validated behavior; values vary
+run to run under desktop load.
 
 ## Supported parameters for the later AI creator skill
 

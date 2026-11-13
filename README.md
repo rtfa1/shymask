@@ -158,7 +158,8 @@ an explanation. Closing Shymask stops its camera output.
   **Secondary motion** diagnostic reports the per-part angles, bounds, head speed, reset reason and
   simulation cost; the held-frame diagnostic toggle proves preview and camera contain the simulated
   angle. There is no canned movement clip, package code, skeleton, strand-level hair, collision or
-  Blender-physics conversion. See
+  Blender-physics conversion. The bundled procedural mask stays rigid; the demonstration and the
+  contract are package-only. See
   [`docs/notes/0007-secondary-motion.md`](docs/notes/0007-secondary-motion.md).
 - **Declarative effects.** Color treatments, the bundled rigid mask and the bounded face distortion
   and secondary-motion parameters are data/ids (`src/core/treatments.ts`,
@@ -458,7 +459,7 @@ independent camera consumer (94/94 checks passed in the latest full run at this 
     **Secondary motion** diagnostic reports `parts=3`, the three node names, `axes=y:yaw,y:yaw,x:pitch`
     and per-part bounds.
 42. On the recorded turn/nod/lean window, the two ears (yaw) and hair tuft (pitch) move within their
-    declared bounds: 17/18 frames tracked, per-part angle ranges around 46–59°, maximum observed
+    declared bounds: 17/18 frames tracked, per-part angle ranges around 42–60°, maximum observed
     ~29–31° against 32/32/35° bounds. Three moving screenshots are saved.
 43. A separate documented 25.0 s post-turn window reports live spring settling: the recorded turn
     drives a peak angle, the spring is still deflected after head angular speed drops, and the angle
@@ -601,20 +602,21 @@ rules and measured values are in
 
 ### Measured secondary-motion baseline (replay-based)
 
-From the same full `npm run check` run (scenario J; `evidence/check-<timestamp>/summary.json` under
-`secondaryMotion`, replay-based development desktop). These are observations for the later
-complete-effect benchmark, not performance targets.
+From the full `npm run check` run at code head `7a087d7d` (`evidence/check-2026-11-13T22-22-14-119Z/summary.json`,
+`secondaryMotion`; replay-based development desktop; 94/94 checks). A later documentation-only
+commit does not change behavior. These are observations for the later complete-effect benchmark,
+not performance targets.
 
 | Measurement | Value |
 | --- | --- |
-| Secondary-motion package output | schema v3 `reactive-ears` imports through the public control; its exact unlit material colour (RGB 150,90,240) covers 78,056 preview and 107,465 camera pixels in exact 1280×720 PNGs (enforced >20,000) |
-| Recorded-motion window (41.6–49.6 s) | 17/18 sampled frames tracked; per-part angle ranges 45.3°/45.3°/43.6°; maximum observed 28.76° inside the declared 32/32/35° bounds; three screenshots saved |
-| Live post-turn residual (25.0–26.9 s) | peak 13.92° (head 2.2°/s at the sampled peak), still 6.99° after head speed fell to 5.4°/s, near-rest 2.05° 650 ms after the peak (14.7% of peak). Oscillatory and run-dependent; reported as residual + near-rest, not a monotonic claim |
-| Held-frame settling (47.7 s) | retained 21.88° decayed to 0.02° (0.1%) in 2,866 ms through the same simulator with the accepted pose held stationary; minimum after one second 0.02°; two screenshots saved |
-| Published-output A/B (held 47.7 s) | 3,469 pixels changed, all on the packaged mask, two ON and two OFF captures pixel-identical (0 self-diff); the independent Media Foundation camera PNG changed by the identical 3,469 pixels |
+| Secondary-motion package output | schema v3 `reactive-ears` imports through the public control; its exact unlit material colour (RGB 150,90,240) covers 78,546 preview and 107,615 camera pixels in exact 1280×720 PNGs (enforced >20,000) |
+| Recorded-motion window (41.6–49.6 s) | 17/18 sampled frames tracked; per-part angle ranges 59.7°/59.7°/42.0°; maximum observed 30.75° inside the declared 32/32/35° bounds; three screenshots saved |
+| Live post-turn residual (25.0–26.9 s) | peak 17.71° (head 3.4°/s at the sampled peak), still 7.90° after head speed fell to 8.5°/s, near-rest 2.73° 833 ms after the peak (15.4% of peak). Oscillatory and run-dependent; reported as residual + near-rest, not a monotonic claim |
+| Held-frame settling (47.7 s) | retained 8.70° decayed to 0.03° (0.3%) in 2,913 ms through the same simulator with the accepted pose held stationary; minimum after one second 0.02°; two screenshots saved |
+| Published-output A/B (held 47.7 s) | 1,864 pixels changed, all on the packaged mask, two ON and two OFF captures pixel-identical (0 self-diff); the independent Media Foundation camera PNG changed by the identical 1,864 pixels. The retained held angle varies (8–24° across recent runs); the gates are ≥5° and ≥800 changed pixels |
 | Simulation cost, p95 | ~0.1 ms (timer granularity) for the pure spring update per accepted pose; main thread only |
-| Render + composite, p95 | 5.3 ms with the simulated pose vs 5.7 ms with the authored rest pose in the run's sequential 2.2 s windows; the OFF state still runs the simulator, so the difference is observed run variation, not an isolated cost |
-| Presented-frame interval, p95 | 41.8 ms vs 41.8 ms in the run's sequential 2.2 s windows; not isolated and not attributed to the simulation |
+| Render + composite, p95 | 5.8 ms with the simulated pose vs 5.8 ms with the authored rest pose in the run's sequential 2.2 s windows; the OFF state still runs the simulator, so the difference is observed run variation, not an isolated cost |
+| Presented-frame interval, p95 | 44.3 ms vs 44.3 ms in the run's sequential 2.2 s windows; not isolated and not attributed to the simulation |
 | Paused-output captures | manual pause, tracking loss and processing failure delivered the opaque paused canvas in preview and camera (≈12,15,20); multiple faces (10,13,18) and no-effect were preview-asserted; removal fell back to no-effect |
 
 Replay-derived tracking measurements from the same run are documented in
