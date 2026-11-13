@@ -180,9 +180,10 @@ Covered by `npm test` and `npm run check` scenario J:
   of low head angular velocity). In the 22-22 run the live window measured a
   spring peak of 17.71° at head speed 3.4°/s and a residual 7.90° at 8.5°/s, so
   that run's sampled peak does not show a monotonic speed fall (the recorded
-  person keeps moving); the head-matched 23-12 run measured peak 27.8° → 4.9°
-  at 4.9°/s → near-rest 2.5° and 23-06 measured 12.6° at 36.3°/s → 4.84° at
-  11.5°/s → 2.83° at 4.8°/s. The recorded person does not actually stop, so
+  person keeps moving); the head-matched 23-12 run measured peak 18.51° at head
+  27.8°/s → residual 7.93° at 4.9°/s → near-rest 2.47° at 6.1°/s (post-peak
+  coverage 850 ms), and 23-06 measured 12.6° at 36.3°/s → 4.84° at 11.5°/s →
+  2.83° at 4.8°/s (coverage 833 ms). The recorded person does not actually stop, so
   this live window is a **residual/near-rest observation**, not a demonstration
   of a monotonic stop; the strict decay evidence is the held-frame settle
   below. A second camera-captured sequence spans the same window and must
