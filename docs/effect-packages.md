@@ -217,8 +217,17 @@ the ellipse centre is the box centre plus `centerOffset`, and the radii are
 recorded face's position and distance instead of being a static screen overlay.
 Everything outside the ellipse is the same source frame, so only the face region
 is warped. The public **Face distortion** diagnostic reports the face box, the
-resolved ellipse, the offscreen warp cost and a low-resolution measurement of
-the actual changed pixels inside versus outside the ellipse.
+resolved ellipse, the main-thread warp submission time and a low-resolution
+measurement of the actual changed pixels inside versus outside the ellipse. That
+same-texture measurement is a diagnostic, not published-output proof. The
+published-output proof is a held-frame A/B through the public controls: the
+effect stays active while a diagnostic toggle draws the same uploaded frame
+through the identity shader, and exact 1280×720 ON/OFF captures through the
+public Capture control must differ inside the ellipse derived from the
+independent tracking diagnostic, be ~zero outside it, be pixel-identical for
+same-state repeats, and match in the independent camera. The A/B is repeated at
+a second held pose with a different face position to show the changed region
+follows the tracked face.
 
 What a package **can** express: one of two whole-face radial warps with bounded
 strength, size and offset.
@@ -279,7 +288,7 @@ authoring output.
 
 Validation reports `PackageComplexity` measurements (archive/manifest/mask bytes,
 entry count, triangle/mesh/material/node/texture counts, declared behavior count,
-color parameter count and distortion parameter count) from the pure validator
+color parameter count and a 0/1 distortion-component flag) from the pure validator
 and in the `validate:package` output, so #11 can turn measurements into budgets
 without changing the contract. No triangle or mesh **threshold** is enforced
 here. `summary.json` records the import result messages, which include the
@@ -389,7 +398,7 @@ stops the camera output. No Blender or AI process is involved in playback.
 | `glb-external-resource` | GLB references an external buffer/image; embed everything. |
 | `glb-unsupported-extension` | A required glTF extension other than `KHR_materials_unlit`. |
 | `glb-unsupported-feature` | Cameras, lights, or a non-triangle primitive mode. |
-| `unknown-field` | Warning: an unknown top-level manifest field or `author` field is ignored by v1. |
+| `unknown-field` | Warning: an unknown top-level manifest field or `author` field is ignored by this schema. |
 
 All messages name the field or archive path and the expected form. Multiple
 independent issues may be reported; the app shows the first and a count.
@@ -476,16 +485,21 @@ for #11's complexity budgets.
   gates, rapid double switching, rejects the negative fixtures with actionable
   codes, and verifies removal and restart persistence. The same scenario imports
   the schema v2 `face-distortion` sample, asserts the public distortion
-  diagnostic's face-following ellipse and measured pixel change, captures
-  matching preview and camera frames, exercises every paused-output case for the
+  diagnostic against the independent tracking face box, runs a held-frame warp
+  ON/OFF A/B through the public Capture control (published preview and
+  independent camera PNGs, ellipse-localized change, 0 same-state self-diff),
+  repeats the A/B at a second documented pose to show the changed region follows
+  the face, injects a WebGL context loss and asserts the hidden output plus
+  recovery after a browser restore, exercises every paused-output case for the
   distortion (manual pause, tracking loss, multiple faces, processing failure,
   switching, no-effect and removal), rejects the distortion negative fixtures,
-  and records replay-based warp/render/frame-pacing timing for the later
-  benchmark. Scenario G adds recorded-motion evidence: the warp ellipse follows
-  the tracked face box across the documented turn/nod/lean window, with
-  screenshots. Scenario G additionally holds a turned recorded frame and proves
-  the same depth-only face occluder changes the output for the bundled mask and
-  for `guard-visor` and `rose-visor`.
+  and records replay-based warp-submission/render/frame-pacing timing for the
+  later benchmark. Scenario G adds recorded-motion evidence: the warp ellipse
+  follows the tracked face box across the documented turn/nod/lean window, with
+  screenshots and the two-pose published-output A/B. Scenario G additionally
+  holds a turned recorded frame and proves the same depth-only face occluder
+  changes the output for the bundled mask and for `guard-visor` and
+  `rose-visor`.
 - Evidence (screenshots, camera PNGs, `summary.json`, logs) is written under the
   gitignored `evidence/check-<timestamp>/` directory; `summary.json` contains the
   tested head SHA, the import result messages (which include the displayed

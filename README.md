@@ -137,7 +137,8 @@ an explanation. Closing Shymask stops its camera output.
   or per-frame displacement. The offscreen warp canvas is drawn through the same
   `src/core/pipeline.ts` output canvas, so preview and camera share one frame path; outside the
   ellipse the source pixels are untouched. The public **Face distortion** diagnostic reports the
-  face box, ellipse, warp cost and a measured inside/outside change ratio. See
+  face box, ellipse, main-thread warp submission time and a measured inside/outside change ratio;
+  the published-output proof is a held-frame warp ON/OFF A/B in preview and camera. See
   [`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md).
 - **Declarative effects.** Color treatments, the bundled rigid mask and the bounded face distortion
   are data/ids (`src/core/treatments.ts`, `src/core/effect-package-contract.ts`); an imported effect
@@ -397,14 +398,18 @@ independent camera consumer (79/79 checks passed in the latest run at this head)
     active imported effect leaves the paused no-effect output, and another imported package still
     renders after an app restart.
 36. The schema v2 `face-distortion` sample imports through **Import package…**, appears in the Effect
-    selector, is selected, and reports `mode=bulge`, `strength=0.6`, `radiusScale=1.35` and the
-    tracked face box in the public **Face distortion** diagnostic. The warp ellipse's centre follows
-    the face box centre and its radii scale with the face box; the same-frame 64×36 warp-delta
-    measurement shows pixels changed inside the ellipse and (near) none outside it. An exact
-    1280×720 preview PNG and an independent camera PNG both show processed (non-paused) content.
+    selector, is selected, and reports `mode=bulge`, `strength=0.6`, `radiusScale=1.35` and an ellipse
+    that matches the independent `diag-face` tracking box (rendering each sampled frame). A held-frame
+    public A/B then turns only the warp off: exact 1280×720 ON/OFF PNGs captured through the public
+    **Capture evidence frame** control differ by 32,036 px, all inside the independently derived
+    tracked-face ellipse and none outside, with two same-state captures pixel-identical (0 self-diff)
+    and the independent camera receiving the identical change. This is the published-output proof;
+    the 64×36 same-texture warp delta remains a diagnostic only.
 37. On the recorded turn/nod/lean window, the distortion ellipse's centre moves at least 30 px with
-    the tracked face, every sampled frame passes the inside/outside change gates, and three
-    screenshots are saved. This distinguishes a face-following distortion from a static overlay.
+    the tracked face, every sampled frame passes the independent `diag-face` geometry check and the
+    inside/outside change gates, and three screenshots are saved. The published A/B is repeated at the
+    held 47.7 s and 16.0 s poses: the changed-region centroid moves 117.8 px with a 108.2 px face move,
+    so the change is anchored to the tracked face rather than a fixed screen-space overlay.
 38. The distortion follows every paused-output rule in preview and camera: manual pause, injected
     tracking loss, injected multiple faces, injected processing failure, switching to an imported
     mask (paused while it loads) and back, explicit `No effect`, and removal of the active package
@@ -412,10 +417,15 @@ independent camera consumer (79/79 checks passed in the latest run at this head)
     clears. The four distortion negative fixtures (v1 declaration, unsupported mode, out-of-range
     strength, unknown field) are rejected with `schema-version-unsupported` or `distortion-invalid`
     and leave the previous effect rendering.
-39. Replay-based timing for the distortion path is recorded at 1280×720: the offscreen warp cost, the
-    full render/composite cost and the presented-frame interval, plus a color-only package baseline
-    on the same fixture. These are observations for the later complete-effect benchmark, not the
-    final performance target.
+39. Replay-based timing for the distortion path is recorded at 1280×720: main-thread warp submission
+    time (no GPU sync/readback), the full render/composite cost and the presented-frame interval,
+    plus a color-only package baseline on the same fixture. The render-cost and frame-interval
+    differences are sequential-window observations, not isolated distortion costs. These are
+    observations for the later complete-effect benchmark, not the final performance target.
+40. Injecting a WebGL context loss on the distortion renderer through the public diagnostic control
+    makes it non-drawable; the 250 ms undrawable guard shows the opaque paused screen in preview and
+    camera (never a stale or raw frame). The diagnostic reports `drawable=false`/`contextLost=true`,
+    and a browser restore returns `drawable=true` and resumes the effect.
 
 Artifacts are written to the gitignored `evidence/check-<timestamp>/` directory: per-state canvas
 screenshots, the full app window (including import-error feedback), captured output frames,
@@ -439,8 +449,10 @@ time to the first dark frame's receive time), and the validated run recorded a 1
 
 ### Measured baseline (replay-based, virtual camera)
 
-From a passing `npm run check` run on 2026-11-13 (the head SHA validated by the latest full check run
-is recorded in `evidence/check-<timestamp>/summary.json`, `evidence/vcam-check/summary.json`, and
+From a passing `npm run check` run on 2026-11-13 at head `0e0e1a8c6e417ff73b6f14de83afc48735788746`
+(`evidence/check-2026-11-13T21-25-31-655Z/summary.json`, 83/83 checks, all values below are from that
+run unless marked as earlier-run observations; the head SHA validated by the latest full check run is
+recorded in `evidence/check-<timestamp>/summary.json`, `evidence/vcam-check/summary.json`, and
 `evidence/logs/*-final.log`; later documentation-only commits do not change the validated behavior),
 source clip 3.379 s:
 
@@ -471,11 +483,13 @@ source clip 3.379 s:
 | Smoothing added lag / cost | p95 raw-vs-smoothed offset 3.6–4.3 px origin and 1.7–1.9° rotation; implied constant-velocity delay p95 60.2–61.6 ms; filter cost 0.1 ms p95. The ~50.9 ms reference-interval figure is not a global maximum (effective alpha ~0.34 at the observed ~35 ms interval) |
 | Occlusion A/B at two turned frames (47.7 s about −20° to −22°, 16.0 s about +9° to +14°) | bundled mask 15,705–17,414 px changed (89–94% inside the tracked-face bbox); `guard-visor` 5,319–5,700 px (92–96.5%); `rose-visor` 2,257–2,306 px (100%); same-state repeats pixel-identical. ON reveal is proved by exact colour: package material ≥97% of changed pixels in OFF and ≤3% in ON (observed 0.3–1.5%); bundled dominant palette ≥90% coverage and ≤1% reappearance in ON (observed ≤0.1%, including 4 px in one opposite-view run) |
 | Occlusion camera A/B | the independent consumer received the same change on the held frame: total and inside-bbox pixel counts are asserted equal to the preview's for the bundled mask and `guard-visor`, with 0 same-state self-diff |
-| Face-distortion warp pass, p95 | 0.4 ms at 1280×720 (offscreen WebGL radial-warp pass, rolling p95 after warm-up) |
-| Face-distortion render + composite, p95 | 14.9–15.3 ms across recent runs, with the color-only baseline 13.8–15.1 ms on the same fixture (observed sequential delta 0.1–1.5 ms, including the diagnostics sampling) |
-| Face-distortion presented-frame interval, p95 | ~65–76 ms vs ~49–56 ms in sequential comparisons; the observed delta (16–27 ms) exceeds the 0.4 ms warp cost and the two windows are not isolated, so it is reported as observed run variation, not attributed added cost |
-| Face-distortion pixel evidence (default clip) | about 70–73% of inside-ellipse samples changed vs 0.0% outside; warp delta about 0.8–1.1 (0–255 mean absolute); the exact 1280×720 preview PNG and the camera PNG both show non-paused processed content |
-| Face-distortion recorded-motion following | 18/18 sampled frames tracked on `pose-loop-v1`; warp centre moved about 91–97 × 67–80 px with the tracked face box; inside-ellipse change about 56–61% (every sample passes the ≥8% inside / ≤3% outside gates) |
+| Face-distortion main-thread warp submission, p95 | 0.4 ms at 1280×720 (`performance.now()` around `renderer.render()` of the fixed radial shader, rolling p95 after warm-up). This is submission cost only: there is no GPU sync or readback, so the GPU/compositor cost lands later in the composite and is **not** included |
+| Face-distortion render + composite, p95 | 14.6 ms with the color-only baseline 14.0 ms on the same fixture in the cited run (observed sequential delta 0.6 ms, including the diagnostics sampling); earlier runs observed 14.9–15.4 ms vs 13.8–15.1 ms. This is not an isolated distortion cost |
+| Face-distortion presented-frame interval, p95 | 69.5 ms vs 48.7 ms in the cited run's sequential 2.2 s windows (observed delta 20.8 ms); earlier runs observed 62.5–76.5 ms vs 48.7–56 ms. The windows are not isolated and the delta is not attributed to the warp |
+| Face-distortion published-output A/B (held default-clip frame at 1.5 s) | 32,036 pixels changed, 100% inside the ellipse derived from the independent `diag-face` tracking box and 0 outside; two ON and two OFF captures are each pixel-identical (0 self-diff); the independent Media Foundation camera PNG changed by the identical 32,036 pixels |
+| Face-distortion recorded-motion following | 18/18 sampled frames tracked on `pose-loop-v1` in the cited run (enforced ≥12 of 18); warp centre moved 93 × 68 px with the tracked face box; inside-ellipse change 55.7–71.6% (every sample passes the ≥8% inside / ≤3% outside gates) |
+| Face-distortion face-following A/B (two held poses) | at 47.7 s and 16.0 s the published change was 62,598 and 62,763 px, all inside the independent `diag-face` ellipse and 0 outside, with the camera receiving the identical change and 0 same-state self-diff; the changed-region centroid moved 117.8 px with a 108.2 px face move |
+| Face-distortion WebGL context loss | public `WEBGL_lose_context` injection made the renderer non-drawable (`drawable=false`, `contextLost=true`); the 250 ms undrawable guard showed the opaque paused screen in preview (10,13,18) and camera (12,15,20). A browser restore returned `drawable=true` and the effect resumed (preview 143,54,47) |
 | Loop cycles observed | 3 seam crossings inside an 8.36–8.60 s sampling window |
 | Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
 | Replay pacing ratio | 0.99–1.005 processing time / wall time across recent runs |
@@ -492,12 +506,19 @@ the exact material-colour count is always asserted.
 `rose-visor` is a mask-only sample with nonzero `position`/`rotationDeg`/`scale` whose distinct
 material colour (RGB 32,196,128) is asserted in both preview and camera (about 38,000–40,000 pixels;
 enforced >25,000), and a rapid double switch must leave only the later package's mask committed.
-`face-distortion` is a 415-byte schema v2 distortion-only archive whose public diagnostic reports the
-tracked face box and the resolved ellipse; a same-texture identity-vs-warped comparison changed about
-70–73% of inside-ellipse samples and 0.0% outside, and both the preview PNG and the independent camera PNG
-showed non-paused processed content. The schema v2 sample and the four distortion negative fixtures
-are generated by `npm run build:packages`; replay-based timing for the distortion path is recorded
-for the later complete-effect benchmark (see the table below and
+`face-distortion` is a 415-byte schema v2 distortion-only archive. Its offscreen identity-vs-warped
+diagnostic changed 72.5% of inside-ellipse samples and 0.0% outside in the cited run; that same-texture
+comparison is a diagnostic, not published-output proof. The published-output proof is a held-frame A/B
+through the public controls: the effect stays active while a diagnostic toggle draws the same uploaded
+frame through the identity shader, and exact 1280×720 ON/OFF captures through the public Capture control
+differ by 32,036 pixels, all inside the ellipse derived from the independent `diag-face` tracking box and
+none outside, with same-state repeats pixel-identical and the independent camera receiving the identical
+change. Repeating the A/B at the 47.7 s and 16.0 s `pose-loop-v1` poses moved the changed-region centroid
+117.8 px with a 108.2 px face move, so the change is anchored to the tracked face rather than a fixed
+screen-space overlay. A regression that drops the warp makes ON == OFF; the identity pass still comes
+from the effect renderer canvas, never from the raw video element. The schema v2 sample and the four
+distortion negative fixtures are generated by `npm run build:packages`; replay-based timing for the
+distortion path is recorded for the later complete-effect benchmark (see the table above and
 [`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md)).
 Package complexity is reported, not budgeted; no triangle/mesh threshold is asserted.
 
@@ -517,7 +538,11 @@ transport. The mask has face-based occlusion and bounded face anchoring but no s
 canonical face occluder is rigid, has no hair/ears/neck or full head silhouette, and does not deform
 with expressions, and the policy cannot detect every possible visual defect. The packaged face
 distortion is a bounded whole-face radial warp (`bulge`/`pinch`) whose ellipse follows the tracked
-face box; it is not a per-landmark/expression warp or a 3D mesh deformation. See
+face box; it is not a per-landmark/expression warp or a 3D mesh deformation. Its renderer treats a
+lost WebGL context as non-drawable, so the undrawable guard hides both outputs instead of publishing
+a stale or raw frame; the check exercises that through a public `WEBGL_lose_context` injection and
+asserts that a browser restore resumes the effect. The distortion's timing figures measure main-thread
+submission only, not GPU/compositor cost. See
 `docs/notes/0001-preview-stack-and-loop.md`,
 `docs/notes/0002-windows-virtual-camera-spike.md`,
 `docs/notes/0003-face-tracking-and-mask.md`,

@@ -94,6 +94,15 @@ single output policy before any frame is drawn:
 - Removing the active distortion package falls back to **No effect**, which is
   the opaque paused screen. Selecting **No effect** does the same. Switching
   away to a mask package paints the paused screen while the mask loads.
+- **WebGL context loss** marks the distortion renderer non-drawable instead of
+  letting three.js silently return from `render()`. The processed-frame path
+  then returns false, the existing 250 ms undrawable guard hides the whole
+  output in preview and camera, and no stale or raw frame is composited. The
+  public diagnostic control injects the loss with `WEBGL_lose_context`; the
+  extension is cached before the loss (WebGL returns null from `getExtension()`
+  once a context is lost), so unchecking can request a browser restore. A
+  restored context re-initialises three.js and the effect resumes; a context
+  the browser refuses to restore stays hidden.
 
 ### Diagnostics
 
@@ -101,6 +110,7 @@ The public **Face distortion** diagnostic reports:
 
 ```
 active=true mode=bulge strength=0.6 radiusScale=1.35 centerOffset=0,0
+warpEnabled=true drawable=true contextLost=false
 faceX=... faceY=... faceW=... faceH=...
 centerX=... centerY=... radiusX=... radiusY=...
 costMsLast=... costMsP95=...
@@ -111,9 +121,38 @@ warpDelta=... changedInsidePct=... changedOutsidePct=...
 passes over the **same uploaded frame texture**: one identity blit and one
 warped pass. Because both use the same texture and resolution, the
 outside-ellipse difference is zero apart from GPU rounding and the inside
-difference is the warp itself. They prove the pipeline really changed output
-pixels and that the change is localized to the tracked face region; they are a
-diagnostic, not a per-pixel quality metric.
+difference is the warp itself. That makes it a useful, deterministic
+**diagnostic**, but it is not published-output proof: it compares the
+renderer's own identity and warp passes, so a pipeline that dropped the warp
+after this comparison (or a warp applied to a texture the preview never shows)
+would still pass it. The published-output proof is the separate A/B below.
+
+The diagnostic's `faceX/faceY/faceW/faceH` are the renderer's own input. The
+check therefore asserts the ellipse against the independent `diag-face` face
+box (populated from the detector's `faceBbox`) with a small rounding tolerance;
+the motion samples use the same cross-check.
+
+### Published-output A/B
+
+The check holds a documented frame, keeps the distortion effect selected, and
+uses the public **Apply face-distortion warp (diagnostic A/B)** control. Turning
+it off draws the same uploaded frame through the identity shader, so the output
+still comes from the effect renderer canvas, not the raw video element, and
+every paused-output rule still applies. Exact 1280×720 ON and OFF PNGs are
+captured through the public **Capture evidence frame** control and compared:
+
+- the change is substantial and sits inside the ellipse derived independently
+  from `diag-face` and the manifest's `radiusScale`/`centerOffset`;
+- it is ~zero outside that ellipse;
+- two ON captures and two OFF captures of the same held frame are
+  pixel-identical (0 self-diff), so the comparison is not video drift;
+- the independent Media Foundation camera receives the identical change; and
+- the A/B is repeated at a second documented held pose with a different face
+  position; the changed-region centroid must move with the face.
+
+A regression that drops the warp makes ON == OFF; a fixed screen-space overlay
+falls outside the tracked ellipse at one of the two poses. This is stronger
+than the offscreen warp delta and is reported as the published-output evidence.
 
 ## Evidence (replay-based, this development desktop)
 
@@ -126,25 +165,34 @@ Covered by `npm test` and `npm run check`:
   `faceDistortion` is rejected; invalid mode/strength/radius/offset/unknown
   field are rejected as `distortion-invalid`; optional fields default; the warp
   ellipse follows the face box translation and scale, respects `centerOffset`,
-  and reverses for pinch; the pure mapping clamps out-of-bounds input.
+  and reverses for pinch; the pure mapping clamps out-of-bounds input; the
+  drawability predicate is false for a disposed or context-lost renderer (the
+  WebGL integration itself is exercised through the public injection below).
 - Scenario I (default recorded clip) imports `face-distortion.zip` through the
   public **Import package…** control, selects it automatically, asserts the
-  active distortion diagnostic and its face-following ellipse, captures a
-  processed preview PNG plus an independent Media Foundation camera PNG, and
+  active distortion diagnostic against the independent `diag-face` box, captures
+  a processed preview PNG plus an independent Media Foundation camera PNG, runs
+  the held-frame warp ON/OFF A/B in preview and camera, injects a WebGL context
+  loss and asserts the hidden output plus recovery after a browser restore, and
   exercises every paused-output case (manual pause, tracking loss, multiple
   faces, processing failure, switching, no-effect and removal) in preview and
   camera. It also rejects the four distortion negative fixtures with their
   documented codes and keeps the previous effect rendering.
 - Scenario G (recorded `pose-loop-v1` clip, documented 8 s turn/nod/lean
   window): the warp ellipse's centre follows the tracked face box and moves at
-  least 30 px across the window; each sampled frame passes the inside/outside
-  pixel-change gates; three screenshots are saved. This is the motion evidence
-  for the face-following requirement.
-- Timing (default clip, replay-derived): the offscreen warp pass, the full
-  render/composite cost and the presented-frame interval are recorded while the
-  distortion is active, with a color-only package on the same fixture as the
-  baseline. These are observations for the later complete-effect benchmark
-  (#10/#11), not a performance target.
+  least 30 px across the window; each sampled frame passes the independent
+  `diag-face` geometry check and the inside/outside pixel-change gates; three
+  screenshots are saved. It then runs the published-output A/B on the held
+  47.7 s pose (preview and camera) and repeats it on the opposite 16.0 s pose,
+  asserting that the changed-region centroid moves with the face.
+- Timing (default clip, replay-derived): the main-thread warp submission time,
+  the full render/composite cost and the presented-frame interval are recorded
+  while the distortion is active, with a color-only package on the same fixture
+  as the baseline. Submission time is `performance.now()` around
+  `renderer.render()` only, with no GPU sync/readback; the render-cost and
+  frame-interval differences are sequential-window observations, not isolated
+  distortion costs. These are observations for the later complete-effect
+  benchmark (#10/#11), not a performance target.
 
 ### Measured values (replay-based, this run)
 
@@ -152,28 +200,40 @@ Hardware and source are the same development desktop and fixtures as note 0005
 (i7-11700K, RTX 3070 Ti, 31.8 GiB, Windows 11 Pro 26100; MediaPipe Face
 Landmarker 0.10.21 GPU delegate; Three.js 0.180.0). The distortion sample is the
 415-byte `fixtures/packages/face-distortion.zip` (1 entry, 496-byte schema v2
-manifest, no mask asset). The public check's run recorded:
+manifest, no mask asset). The cited run is
+`evidence/check-2026-11-13T21-25-31-655Z/summary.json` at head
+`0e0e1a8c6e417ff73b6f14de83afc48735788746` (83/83 checks); all values below are
+from that run unless marked as earlier-run observations:
 
 | Measurement | Value |
 | --- | --- |
-| Default-clip warp change | about 70–73% of inside-ellipse samples changed, 0.0% outside, warp delta about 0.8–1.1 (0-255 mean absolute) |
-| Distortion preview PNG | exact 1280×720 captured output, non-paused (mean RGB about 138–140,51–52,43–46 across recent runs) |
-| Distortion camera PNG | independent Media Foundation consumer mean matched the preview within the check's tolerance |
-| Offscreen warp pass, p95 | 0.4 ms at 1280×720 (rolling p95 after warm-up) |
-| Render + composite + diagnostics, p95 | 14.9–15.3 ms across recent runs, with the color-only baseline 13.8–15.1 ms on the same fixture (observed sequential delta 0.1–1.5 ms) |
-| Presented-frame interval, p95 | ~65–76 ms vs ~49–56 ms in sequential comparisons; the observed delta (16–27 ms) exceeds the 0.4 ms warp cost and the two 2.2 s windows are not isolated, so it is reported as observed run variation, not attributed added cost |
-| Recorded-motion window | 18/18 samples tracked on `pose-loop-v1`; warp centre moved about 91–97×67–80 px with the face box; inside-ellipse change about 56–61% (every sample passes the ≥8% inside / ≤3% outside gates) |
-| Paused-output camera captures | manual pause, tracking loss, multiple faces, processing failure, no-effect and removal all delivered the opaque paused canvas (mean ≈ 12,15,20) |
+| Default-clip offscreen warp change (diagnostic) | 72.5% of inside-ellipse samples changed, 0.0% outside, warp delta 0.86 (0-255 mean absolute); earlier runs 68.9–72.5% |
+| Distortion preview PNG | exact 1280×720 captured output, non-paused (mean RGB 140,51,43 for the PNG; live mean 143,53,45) |
+| Distortion camera PNG | independent Media Foundation consumer mean 139,51,43; matched the preview within the check's tolerance |
+| Main-thread warp submission, p95 | 0.4 ms at 1280×720 (rolling p95 after warm-up). `performance.now()` around `renderer.render()` only: no GPU sync or readback, so the GPU/compositor cost is not included |
+| Render + composite + diagnostics, p95 | 14.6 ms, with the color-only baseline 14.0 ms on the same fixture (observed sequential delta 0.6 ms); earlier runs 14.9–15.4 ms vs 13.8–15.1 ms. Not an isolated distortion cost |
+| Presented-frame interval, p95 | 69.5 ms vs 48.7 ms in the cited run's sequential 2.2 s windows (observed delta 20.8 ms); earlier runs 62.5–76.5 ms vs 48.7–56 ms. The windows are not isolated, so the delta is reported as observed run variation, not attributed added cost |
+| Published-output A/B, default clip | held 1.5 s frame: 32,036 changed pixels, 100% inside the independent `diag-face` ellipse, 0 outside; two ON and two OFF captures each 0 self-diff; camera PNG changed by the identical 32,036 pixels |
+| Recorded-motion window | 18/18 samples tracked on `pose-loop-v1` (enforced ≥12 of 18); warp centre moved 93×68 px with the face box; inside-ellipse change 55.7–71.6% (every sample passes the ≥8% inside / ≤3% outside gates) |
+| Published-output A/B, two poses | held 47.7 s: 62,598 changed pixels (100% inside the independent ellipse, 0 outside); held 16.0 s: 62,763 changed pixels (100% inside, 0 outside); camera identical to preview and 0 same-state self-diff at both; changed-region centroid moved 117.8 px with a 108.2 px face move |
+| Paused-output camera captures | manual pause, tracking loss, multiple faces, processing failure, context loss, no-effect and removal all delivered the opaque paused canvas (mean ≈ 12,15,20) |
+| WebGL context loss | diagnostic `drawable=false`, `contextLost=true`; opaque paused output in preview (10,13,18) and camera (12,15,20); browser restore returned `drawable=true` and the effect resumed (preview 143,54,47) |
 
-The measured inside/outside split is what distinguishes a face-following warp
-from a static overlay: outside the ellipse the shader is an identity pass, so
-the same-frame comparison changes 0.2% of outside samples (resampling noise) but
-69.6% inside. The pixel-change metric is diagnostic evidence, not a visual
+The offscreen inside/outside split is a deterministic diagnostic, not the
+published-output proof. The distinction matters: the same-frame comparison uses
+the renderer's own identity and warp passes, so it cannot by itself show that the
+preview and camera received the warp. The published-output proof is the A/B:
+with the effect still active, the identity pass removes only the warp term, and
+the exact 1280×720 ON/OFF PNGs differ by tens of thousands of pixels, all inside
+the independently derived tracked-face ellipse and none outside, with zero
+same-state self-diff and an identical camera change. Across two documented poses
+the changed region moved with the face. The pixel-change metric is not a visual
 quality score; the saved PNGs show the resulting frames.
 
 See the measured values in the run's `summary.json`
-(`effectPackages.faceDistortion`, `effectPackages.evidence.distortion` and
-`tracking.evidence.recordedMotion.distortion`) and
+(`effectPackages.faceDistortion.evidence`, including `ab`, `abOpposite`,
+`faceFollowingPoses` and `contextLoss`, and
+`effectPackages.faceDistortion.motionFollowing`) and
 `evidence/logs/check-final.log`.
 
 ## Supported limits and remaining limitations
@@ -195,9 +255,20 @@ See the measured values in the run's `summary.json`
 - **Desktop only.** Measured on the RTX 3070 Ti development desktop; laptop
   integrated-graphics behavior is unverified.
 - **Not a benchmark.** The timing numbers are main-thread measurements on a
-  recorded clip with a virtual camera. They do not establish the parent
-  spec's 720p/30 FPS / ≤100 ms target, and they exclude a target call/stream
+  recorded clip with a virtual camera. The 0.4 ms figure is WebGL submission
+  time only (no GPU sync/readback); the render-cost and frame-interval deltas
+  are sequential-window observations. They do not establish the parent spec's
+  720p/30 FPS / ≤100 ms target, and they exclude a target call/stream
   application.
+- **Failure coverage.** Context loss is injected with `WEBGL_lose_context`; a
+  real driver/GPU reset is not reproduced, and a context the browser refuses to
+  restore stays hidden until the tracker renderer is rebuilt. Effect-switch
+  pauses are asserted by the public `switchingPausedFrames` counter and status
+  text; a separate camera capture while a switch is in flight is not taken
+  (the same shared output policy and the camera paused captures in the other
+  states cover the camera path). A combined mask+distortion package is supported
+  by the contract and unit-tested through effect resolution, but this slice has
+  no committed combined sample or end-to-end check for it.
 - **Policy unchanged.** The distortion is not an anonymity feature and not a
   fallback path; failure handling still hides the whole output rather than
   passing the raw feed through.
