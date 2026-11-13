@@ -45,6 +45,12 @@ export interface EffectOption {
   label: string;
 }
 
+/**
+ * Canonical bundled selector ids/labels. `effects.ts` builds the behavioural
+ * registry (`BUNDLED_EFFECT_DEFINITIONS`) from these labels plus the treatment
+ * data, so the selector list is not duplicated; `getEffectLabel` is also the
+ * output-policy fallback for a bundled id.
+ */
 export const EFFECT_OPTIONS: readonly EffectOption[] = [
   { id: 'none', label: 'No effect' },
   { id: 'mask', label: 'Rigid mask' },

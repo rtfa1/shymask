@@ -1256,9 +1256,12 @@ async function missingFixtureCameraScenario() {
 const MASK_EYE_RGB = { r: 103, g: 232, b: 249 };
 /** Exact unlit material colour of the committed sample mask GLB (guard-visor). */
 const PACKAGE_MASK_RGB = { r: 225, g: 29, b: 154 };
+/** Exact unlit material colour of the second sample mask GLB (rose-visor). */
+const ROSE_MASK_RGB = { r: 32, g: 196, b: 128 };
 const PACKAGE_FIXTURES_DIR = path.join(root, 'fixtures', 'packages');
 const PACKAGE_NEGATIVE_DIR = path.join(PACKAGE_FIXTURES_DIR, 'negative');
 const GUARD_VISOR_EFFECT_ID = 'package:shymask.guard-visor';
+const ROSE_VISOR_EFFECT_ID = 'package:shymask.rose-visor';
 const VERDANT_TINT_EFFECT_ID = 'package:shymask.verdant-tint';
 /**
  * Required negative package fixtures and the actionable code each must produce.
@@ -1274,6 +1277,9 @@ const NEGATIVE_PACKAGE_CASES = [
   { name: 'oversized-entry', code: 'entry-too-large' },
   { name: 'executable-file', code: 'executable-content' },
   { name: 'unsupported-gltf-extension', code: 'glb-unsupported-extension' },
+  { name: 'glb-missing-component-type', code: 'glb-invalid' },
+  { name: 'glb-missing-accessor-type', code: 'glb-invalid' },
+  { name: 'glb-camera', code: 'glb-unsupported-feature' },
 ];
 /** Window with the largest recorded pose swing in fixtures/pose-loop.json. */
 const MOTION_WINDOW_START_SECONDS = 41.6;
@@ -1992,7 +1998,7 @@ function colorNear(actual, expected, tolerance = 16) {
   );
 }
 
-async function waitForPackageMask(page, label) {
+async function waitForPackageMask(page, label, expected = PACKAGE_MASK_RGB) {
   const mask = await waitFor(`${label} mask projection`, async () => {
     const values = await readMask(page);
     return values.visible === 'true' ? values : null;
@@ -2003,21 +2009,21 @@ async function waitForPackageMask(page, label) {
     `${label}: packaged mask origin must sit on the tracked face: mask=${JSON.stringify(mask)} face=${JSON.stringify(face)}`,
   );
   const probe = await readMaskProbe(page);
-  const expected = await readDiagnostic(page, 'diag-mask-color');
-  const expectedRgb = parseKeyValues(expected);
+  const expectedDiagnostic = await readDiagnostic(page, 'diag-mask-color');
+  const expectedRgb = parseKeyValues(expectedDiagnostic);
   assert.ok(
-    colorNear(expectedRgb, PACKAGE_MASK_RGB, 4),
-    `${label}: the packaged unlit material colour must be reported as the probe colour, got ${expected}`,
+    colorNear(expectedRgb, expected, 4),
+    `${label}: the packaged unlit material colour must be reported as the probe colour, got ${expectedDiagnostic}`,
   );
   assert.ok(
-    colorNear(probe, PACKAGE_MASK_RGB, 20),
-    `${label}: preview pixel at the packaged-mask probe must be the package material colour ${JSON.stringify(PACKAGE_MASK_RGB)}, got ${JSON.stringify(probe)}`,
+    colorNear(probe, expected, 20),
+    `${label}: preview pixel at the packaged-mask probe must be the package material colour ${JSON.stringify(expected)}, got ${JSON.stringify(probe)}`,
   );
   return { mask, face, probe, expectedRgb };
 }
 
 /**
- * Scenario G: import validated effect packages through the public control, select
+ * Scenario I: import validated effect packages through the public control, select
  * them as complete effects, and prove preview + independent camera output, the
  * paused-output switching policy, negative imports and removal/persistence.
  */
@@ -2156,6 +2162,53 @@ async function effectPackageScenario() {
       `preview=${JSON.stringify(verdantRgb)} camera=${JSON.stringify(evidence.camera.verdantTint.camera)} ${verdantShot} ${verdantPng.png}`,
     );
 
+    // --- A mask-only package with a nonzero attachment ------------------------
+    const roseImport = await importPackageThroughControl(app, page, path.join(PACKAGE_FIXTURES_DIR, 'rose-visor.zip'));
+    assert.equal(roseImport.state, 'success', `valid mask-only import must succeed: ${roseImport.text}`);
+    assert.match(roseImport.text, /Imported "Rose visor" v1\.0\.0/);
+    const optionsAfterRose = await effectOptionValues(page);
+    assert.ok(optionsAfterRose.includes(ROSE_VISOR_EFFECT_ID));
+    const roseLoaded = await waitForEffectLoaded(page, ROSE_VISOR_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Rose visor/);
+    assert.equal(roseLoaded.mask, 'gltf');
+    assert.equal(roseLoaded.treatment, 'no');
+    // The renderer must receive the manifest's nonzero position/rotation/scale,
+    // not silently default them, before it parses the package GLB.
+    assert.equal(roseLoaded.attachment, '2,3.5,0/0,0,12/1.1');
+    const rosePreview = await waitForPackageMask(page, 'imported rose visor', ROSE_MASK_RGB);
+    const roseRgb = await readRgb(page);
+    const roseShot = await screenshotCanvas(page, '22b-imported-rose-visor-preview.png');
+    const roseRun = await captureCameraState(page, 'imported-rose-visor', 6);
+    assertProcessedFrames(roseRun.frames, roseRgb, 'imported rose visor');
+    const rosePng = assertProcessedPng(roseRun.frames, roseRgb, 'imported rose visor');
+    const roseMaskPixels = pngColorCount(rosePng.png, ROSE_MASK_RGB, 28);
+    assert.ok(roseMaskPixels > 50, `camera PNG must contain the rose mask material, found ${roseMaskPixels} pixels`);
+    const roseCameraPixel = pngPixel(rosePng.png, Number(rosePreview.probe.x), Number(rosePreview.probe.y));
+    assert.ok(
+      colorNear(roseCameraPixel, ROSE_MASK_RGB, 28),
+      `camera PNG pixel at the rose mask probe must be the package material colour, got ${JSON.stringify(roseCameraPixel)}`,
+    );
+    evidence.imports.roseVisor = {
+      importMessage: roseImport.text,
+      effect: roseLoaded,
+      mask: rosePreview.mask,
+      probe: rosePreview.probe,
+      preview: roseRgb,
+      screenshot: roseShot,
+    };
+    evidence.camera.roseVisor = {
+      preview: roseRgb,
+      camera: averageFrameRgb(roseRun.frames),
+      png: rosePng.png,
+      pngRgb: rosePng.rgb,
+      maskPixels: roseMaskPixels,
+      cameraPixel: roseCameraPixel,
+    };
+    pass(
+      'A mask-only package with nonzero attachment position/rotation/scale renders in preview and camera',
+      `attachment=${roseLoaded.attachment} probe=${JSON.stringify(rosePreview.probe)} maskPixels=${roseMaskPixels} ${roseShot}`,
+    );
+
     // --- Switching: bundled -> imported -> imported, with paused output ------
     await page.locator('[data-testid="effect-select"]').selectOption('mask');
     await waitForEffectLoaded(page, 'mask');
@@ -2177,6 +2230,35 @@ async function effectPackageScenario() {
     pass(
       'Switching between bundled and imported effects completes without raw passthrough',
       `switchCount=${afterRoundTrip.switchCount} switchingPausedFrames=${afterRoundTrip.switchingPausedFrames}`,
+    );
+
+    // --- Rapid double switch: only the latest load may publish ----------------
+    await selectEffectThroughControl(page, VERDANT_TINT_EFFECT_ID);
+    await page.locator('[data-testid="effect-select"]').selectOption(ROSE_VISOR_EFFECT_ID);
+    // Do not wait for the rose load: selecting a different package immediately
+    // leaves the first parse in flight. Its token must be stale when it resolves.
+    await page.locator('[data-testid="effect-select"]').selectOption(GUARD_VISOR_EFFECT_ID);
+    const rapidLatest = await waitForEffectLoaded(page, GUARD_VISOR_EFFECT_ID);
+    await page.waitForTimeout(700);
+    const rapidSettled = await readEffectDiagnostic(page);
+    assert.equal(rapidSettled.id, GUARD_VISOR_EFFECT_ID, 'the later selection must stay active');
+    assert.equal(rapidSettled.switching, 'false');
+    assert.equal(rapidSettled.error, 'no');
+    assert.equal(
+      rapidSettled.maskProbe,
+      `${PACKAGE_MASK_RGB.r},${PACKAGE_MASK_RGB.g},${PACKAGE_MASK_RGB.b}`,
+      `a stale rose load must not replace the guard mask summary: ${JSON.stringify(rapidSettled)}`,
+    );
+    const rapidMask = await waitForPackageMask(page, 'rapid double switch', PACKAGE_MASK_RGB);
+    assert.equal(await page.locator('[data-testid="effect-select"]').inputValue(), GUARD_VISOR_EFFECT_ID);
+    evidence.switching.rapidDoubleSwitch = {
+      latest: rapidLatest,
+      settled: rapidSettled,
+      probe: rapidMask.probe,
+    };
+    pass(
+      'Two rapid package selections commit only the latest mask (stale load discarded)',
+      `id=${rapidSettled.id} probe=${JSON.stringify(rapidMask.probe)} switchCount=${rapidSettled.switchCount}`,
     );
 
     // --- Manual pause persists across a switch -------------------------------

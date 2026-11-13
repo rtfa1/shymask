@@ -144,8 +144,6 @@ export interface VirtualCameraStatus {
 export interface ShymaskBridge {
   getStartupInfo(): Promise<StartupInfo>;
   recheckFixture(): Promise<FixtureInfo>;
-  /** Re-read validated packages from the persisted store (survives restart). */
-  getEffectPackages(): Promise<EffectPackageList>;
   /** Opens the OS file picker, validates and stores the chosen package. */
   importEffectPackage(): Promise<ImportEffectPackageResult>;
   /** Removes an imported package from the persisted store. */

@@ -141,39 +141,45 @@ export interface EffectPackageManifestV1 {
 export type PackageIssueSeverity = 'error' | 'warning';
 
 /**
- * Stable validation codes. Each code has a documented actionable message and is
- * covered by tests or a negative fixture (docs/effect-packages.md).
+ * Stable validation codes. Each code has a documented, actionable message and
+ * is exercised by the unit suite (`tests/validation-coverage.test.ts`) or a
+ * committed negative fixture; `tests/validation-coverage.test.ts` fails if a
+ * code in this list is never produced. `PackageIssueCode` is derived from this
+ * runtime list so the documentation/coverage guard and the type cannot drift.
  */
-export type PackageIssueCode =
-  | 'archive-too-large'
-  | 'archive-unreadable'
-  | 'entry-count-exceeded'
-  | 'entry-too-large'
-  | 'entry-compression-unsupported'
-  | 'entry-encrypted'
-  | 'entry-duplicate'
-  | 'entry-path-unsafe'
-  | 'entry-symlink'
-  | 'entry-not-allowed'
-  | 'executable-content'
-  | 'manifest-missing'
-  | 'manifest-too-large'
-  | 'manifest-not-utf8'
-  | 'manifest-invalid-json'
-  | 'manifest-schema-invalid'
-  | 'schema-version-unsupported'
-  | 'identity-invalid'
-  | 'empty-effect'
-  | 'unsupported-behavior'
-  | 'unsupported-asset-type'
-  | 'missing-asset'
-  | 'color-parameter-out-of-range'
-  | 'attachment-invalid'
-  | 'glb-invalid'
-  | 'glb-external-resource'
-  | 'glb-unsupported-extension'
-  | 'glb-unsupported-feature'
-  | 'unknown-field';
+export const PACKAGE_ISSUE_CODES = [
+  'archive-too-large',
+  'archive-unreadable',
+  'entry-count-exceeded',
+  'entry-too-large',
+  'entry-compression-unsupported',
+  'entry-encrypted',
+  'entry-duplicate',
+  'entry-path-unsafe',
+  'entry-symlink',
+  'entry-not-allowed',
+  'executable-content',
+  'manifest-missing',
+  'manifest-too-large',
+  'manifest-not-utf8',
+  'manifest-invalid-json',
+  'manifest-schema-invalid',
+  'schema-version-unsupported',
+  'identity-invalid',
+  'empty-effect',
+  'unsupported-behavior',
+  'unsupported-asset-type',
+  'missing-asset',
+  'color-parameter-out-of-range',
+  'attachment-invalid',
+  'glb-invalid',
+  'glb-external-resource',
+  'glb-unsupported-extension',
+  'glb-unsupported-feature',
+  'unknown-field',
+] as const;
+
+export type PackageIssueCode = (typeof PACKAGE_ISSUE_CODES)[number];
 
 export interface PackageIssue {
   severity: PackageIssueSeverity;

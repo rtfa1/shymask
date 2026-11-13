@@ -77,6 +77,12 @@ The second committed sample, `fixtures/packages/verdant-tint.zip`, has no
 `mask` and only a `colorTreatment`, demonstrating a valid color-only complete
 effect.
 
+The third committed sample, `fixtures/packages/rose-visor.zip`, is a mask-only
+effect with a **nonzero** `position`, `rotationDeg` and `scale` attachment. The
+public check imports it to prove that a nonzero declarative attachment reaches
+the renderer (the displayed `diag-effect` attachment is asserted) and that a
+mask-only package renders through the same preview/camera path.
+
 Regenerate the committed sample and negative fixtures with:
 
 ```powershell
@@ -184,9 +190,12 @@ authoring output.
 
 Validation reports `PackageComplexity` measurements (archive/manifest/mask bytes,
 entry count, triangle/mesh/material/node/texture counts, declared behavior count,
-color parameter count) in the import result and the check harness summary, so
-#11 can turn measurements into budgets without changing the contract. No
-triangle or mesh **threshold** is enforced here.
+color parameter count) from the pure validator and in the `validate:package`
+output, so #11 can turn measurements into budgets without changing the contract.
+No triangle or mesh **threshold** is enforced here. `summary.json` records the
+import result messages, which include the complexity subset the app displays
+(triangles, meshes, materials and archive bytes), not the full
+`PackageComplexity` record.
 
 ## Archive safety
 
@@ -198,15 +207,23 @@ before decompressing anything:
 - **Symlinks** (Unix external attributes) are rejected (`entry-symlink`).
 - **Encryption** and unsupported compression are rejected
   (`entry-encrypted`, `entry-compression-unsupported`).
-- **Declared sizes** are enforced before decompression, then the inflated size
-  and CRC are verified (`entry-too-large`, `archive-unreadable`).
+- **Declared sizes** are enforced before decompression. Deflate output is then
+  inflated into a preallocated `cap + 1` byte buffer: fflate never resizes a
+  caller-provided buffer, so real output past the cap is clipped instead of
+  materialized and the entry is rejected as `entry-too-large`. A central
+  directory that understates its size therefore cannot force an unbounded
+  allocation. The inflated size and CRC are verified afterwards
+  (`entry-too-large`, `archive-unreadable`).
 - **Duplicate names** (case-insensitive) and ZIP64 archives are rejected
   (`entry-duplicate`, `archive-unreadable`).
 - **Executable/script content** (`.js`, `.mjs`, `.exe`, `.dll`, `.ps1`, `.bat`,
   `.wasm`, `.html`, `.svg`, `.py`, …) is rejected (`executable-content`), even if
   it were reachable another way.
-- Only the manifest and the declared `.glb` are extracted, using the same
-  traversal guard as the local `shymask://app/packages/...` asset protocol.
+- Only the manifest and the declared `.glb` are extracted, using the shared
+  `src/main/safe-path.ts` guard (the same containment check as the local
+  `shymask://app/packages/...` asset protocol). Extraction realpath-checks the
+  parent directory, so a symlinked `assets` directory cannot write outside the
+  package store.
 
 The renderer never receives archive bytes or executable content. It receives
 plain validated descriptor data over IPC and fetches only the `.glb` from the
@@ -287,6 +304,13 @@ stops the camera output. No Blender or AI process is involved in playback.
 All messages name the field or archive path and the expected form. Multiple
 independent issues may be reported; the app shows the first and a count.
 
+Every code in this table is exercised by the unit suite
+(`tests/validation-coverage.test.ts` synthesizes the remaining headers/entries)
+or a committed negative fixture imported through the public check. The coverage
+test fails if a stable code is added without a scenario. The public check
+imports the negative fixtures that are practical end-to-end cases; it is not a
+claim that every code is represented by a separate committed archive.
+
 ## Explicitly unsupported in v1
 
 - Arbitrary executable or script effect code, WASM, HTML/SVG assets.
@@ -336,20 +360,25 @@ for #11's complexity budgets.
 ## Validation and evidence
 
 - Unit tests: `npm test` covers schema/version rejection, color bounds, archive
-  safety (zip-slip, absolute paths, symlinks, duplicates, oversized entries,
-  CRC/corruption), GLB feature rejection, effect resolution and the extended
-  output policy.
-- Public workflow: `npm run check` scenario G imports the generated samples
+  safety (zip-slip, absolute paths including directory entries, symlinks,
+  duplicates, oversized declared entries, a lying-size inflate bomb, CRC and
+  corruption, encryption and unsupported compression), GLB feature rejection
+  (including missing accessor `componentType`/`type`), effect resolution,
+  nonzero mask attachment conversion, and the extended output policy. Every
+  stable validation code is asserted by `tests/validation-coverage.test.ts`.
+- Public workflow: `npm run check` scenario I imports the generated samples
   through the **Import package…** control (only the OS file picker is stubbed in
   the main process; validation, storage, extraction, the local asset protocol and
   GLTFLoader parsing are the real paths), verifies preview and independent
-  camera-consumer frames contain the packaged mask/color treatment, verifies
-  switching/manual-pause/tracking gates, rejects the negative fixtures with
-  actionable codes, and verifies removal and restart persistence.
+  camera-consumer frames contain the packaged mask/color treatment, verifies a
+  mask-only package with a nonzero attachment, switching/manual-pause/tracking
+  gates, rapid double switching, rejects the negative fixtures with actionable
+  codes, and verifies removal and restart persistence.
 - Evidence (screenshots, camera PNGs, `summary.json`, logs) is written under the
   gitignored `evidence/check-<timestamp>/` directory; `summary.json` contains the
-  tested head SHA, package complexity measurements and the negative-import
-  results.
+  tested head SHA, the import result messages (which include the displayed
+  complexity subset: triangles, meshes, materials and archive bytes), the
+  negative-import results, and the rapid-switch/attachment evidence.
 
 Sample packages are generated deterministically by
 `scripts/build-package-fixtures.mjs` (a small procedural GLB writer plus fixed

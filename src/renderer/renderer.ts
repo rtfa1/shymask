@@ -25,6 +25,7 @@ import {
 } from '../core/output-policy';
 import { PreviewPipeline, type FrameStats } from '../core/pipeline';
 import { ReplayTimeline, type ReplayFrameTimestamp } from '../core/replay-clock';
+import { SwitchGeneration } from '../core/switch-generation';
 import {
   acceptsDetectedPose,
   initialTrackingSnapshot,
@@ -168,7 +169,7 @@ let effectError: string | null = null;
 let switchingActive = false;
 let switchingPausedFrames = 0;
 let switchCount = 0;
-let switchToken = 0;
+const switchGeneration = new SwitchGeneration();
 let importInFlight = false;
 let removeInFlight = false;
 let loadedMaskKey: string | null = null;
@@ -194,6 +195,7 @@ void bootstrap();
 // requestVideoFrameCallback cannot fire when the decoder silently stops
 // presenting frames, so a real timer is the only watchdog for that stall.
 window.setInterval(checkDecodeStall, WATCHDOG_POLL_MS);
+window.addEventListener('beforeunload', disposeMaskRenderer);
 
 // Republish the current output on a slow heartbeat. The canvas is always either
 // a processed frame or the exact opaque paused screen, so this keeps a newly
@@ -279,6 +281,11 @@ function syncEffectState(): void {
   state.effectLabel = activeEffect.label;
   state.effectHasMask = effectHasMask(activeEffect);
   state.effectHasTreatment = effectHasTreatment(activeEffect);
+  // Selection is normalized before it reaches this state: `selectEffect` and
+  // `applyPackageList` fall back to an explicit no-effect paused output when an
+  // id no longer resolves. The output policy keeps its `effect-invalid` branch
+  // as a defensive, unit-tested fallback, but the current renderer cannot
+  // produce it.
   state.effectValid = true;
   state.effectError = effectError;
   state.switching = switchingActive;
@@ -355,11 +362,11 @@ function bindControls(): void {
 /**
  * Selects one complete effect. An imported effect's GLB loads asynchronously,
  * and the output is the opaque paused screen for the whole switch: the previous
- * or raw frame is never shown. A stale switch is cancelled by a newer token, so
- * rapid selections cannot apply an older result.
+ * or raw frame is never shown. A stale switch is cancelled by a newer
+ * generation, so rapid selections cannot apply an older result.
  */
 async function selectEffect(id: string): Promise<void> {
-  const token = ++switchToken;
+  const token = switchGeneration.begin();
   const next = resolveEffect(id, installedPackages);
   if (!next) {
     // Invalid/stale selection: fall back to the explicit no-effect paused
@@ -385,13 +392,17 @@ async function selectEffect(id: string): Promise<void> {
 
 /** Reloads the active effect's mask content, invalidating any in-flight switch. */
 async function reloadActiveMask(): Promise<void> {
-  const token = ++switchToken;
+  const token = switchGeneration.begin();
   await ensureMaskContent(token);
 }
 
 async function ensureMaskContent(token: number): Promise<void> {
   const mask = activeEffect.mask;
   if (!mask) {
+    // A no-mask selection supersedes any in-flight package load; its stale
+    // generation is discarded, so the switch state must not stay paused.
+    switchingActive = false;
+    effectError = null;
     // Keep the last loaded package summary cached: diagnostics hide it while a
     // no-mask effect is active, and returning to an already-loaded package mask
     // should still report its mesh/probe summary without reloading.
@@ -404,6 +415,7 @@ async function ensureMaskContent(token: number): Promise<void> {
   if (!maskRenderer) {
     // The tracker/WebGL renderer is not ready yet. Startup/tracker policy keeps
     // the output paused; initializeTracker retries the load when it exists.
+    switchingActive = false;
     syncEffectState();
     renderNow();
     return;
@@ -413,6 +425,10 @@ async function ensureMaskContent(token: number): Promise<void> {
       ? MASK_LOAD_BUNDLED_KEY
       : `${activeEffect.id}:${activeEffect.packageRevision ?? ''}:${mask.assetUrl}`;
   if (loadedMaskKey === desiredKey) {
+    // The desired content is already live (possibly because a newer selection
+    // superseded an in-flight load); this selection owns the output again.
+    switchingActive = false;
+    effectError = null;
     refreshMaskProjection();
     syncEffectState();
     renderNow();
@@ -436,18 +452,32 @@ async function ensureMaskContent(token: number): Promise<void> {
         throw new Error(`the local asset request returned HTTP ${response.status}`);
       }
       const data = await response.arrayBuffer();
-      if (token !== switchToken) return;
-      maskSummary = await maskRenderer.loadGltfModel(data, mask.attachment);
-      loadedMaskKey = desiredKey;
+      if (!switchGeneration.isCurrent(token)) return;
+      // Parse detached; the live scene is only swapped after the generation is
+      // re-checked. This closes the window where an older load could resolve
+      // after a newer selection and publish the wrong effect.
+      const renderer = maskRenderer;
+      const parsed = await renderer.parseGltfModel(data, mask.attachment);
+      const committed = switchGeneration.settle(
+        token,
+        parsed,
+        (value) => {
+          renderer.commitGltfModel(value);
+          maskSummary = value.summary;
+          loadedMaskKey = desiredKey;
+        },
+        (value) => renderer.discardGltfModel(value),
+      );
+      if (!committed) return;
     }
-    if (token !== switchToken) return;
+    if (!switchGeneration.isCurrent(token)) return;
     switchingActive = false;
     effectError = null;
     syncEffectState();
     refreshMaskProjection();
     renderNow();
   } catch (error) {
-    if (token !== switchToken) return;
+    if (!switchGeneration.isCurrent(token)) return;
     switchingActive = false;
     loadedMaskKey = null;
     maskSummary = null;
@@ -517,7 +547,7 @@ async function removeSelectedEffectPackage(): Promise<void> {
   removeInFlight = true;
   removePackageButton.disabled = true;
   // Cancel any in-flight switch so its result cannot re-apply after removal.
-  switchToken += 1;
+  switchGeneration.invalidate();
   try {
     const result = await window.shymask.removeEffectPackage(selected.id);
     applyPackageList(result.list.packages, result.list.warnings);
@@ -559,6 +589,8 @@ async function initializeTracker(info: TrackerInfo): Promise<void> {
   trackerPreparing = true;
   try {
     faceTracker = await FaceTracker.create(info);
+    // A retry must not leave a previous WebGL renderer/scene alive.
+    disposeMaskRenderer();
     maskRenderer = new MaskRenderer(pipeline.width, pipeline.height);
     trackerReady = true;
     tracking.reset(performance.now());
@@ -572,7 +604,7 @@ async function initializeTracker(info: TrackerInfo): Promise<void> {
   } catch (error) {
     trackerReady = false;
     faceTracker = null;
-    maskRenderer = null;
+    disposeMaskRenderer();
     state.tracker = {
       state: 'error',
       metadata: info.metadata,
@@ -771,6 +803,21 @@ function disposeVideo(): void {
   element.removeAttribute('src');
   element.load();
   element.remove();
+}
+
+/**
+ * Releases the mask renderer's geometries/materials/textures and its WebGL
+ * context. Called when tracker initialization is retried or the window tears
+ * down, so package/bundled content does not outlive the renderer that owns it.
+ */
+function disposeMaskRenderer(): void {
+  if (!maskRenderer) return;
+  maskRenderer.dispose();
+  maskRenderer = null;
+  loadedMaskKey = null;
+  maskSummary = null;
+  lastMaskProjection = EMPTY_MASK_PROJECTION;
+  lastPoseMatrix = null;
 }
 
 async function startPreview(): Promise<void> {
@@ -1143,7 +1190,7 @@ function updateDiagnostics(now: number): void {
   setDiag('diag-loop', `loops=${timeline.loops} seams=${timeline.seams}`);
   setDiag(
     'diag-effect',
-    `id=${activeEffect.id} source=${activeEffect.source} mask=${activeEffect.mask ? activeEffect.mask.kind : 'none'} treatment=${activeEffect.treatment ? 'yes' : 'no'} switching=${switchingActive} switchingPausedFrames=${switchingPausedFrames} switchCount=${switchCount} error=${effectError ? 'yes' : 'no'} package=${activeEffect.source === 'package' ? `${activeEffect.packageVersion ?? '?'} loaded=${activeEffect.mask ? (loadedMaskKey !== null ? 'yes' : 'no') : 'n/a'}` : 'n/a'} maskProbe=${activeEffect.mask && maskSummary?.probeColor ? `${maskSummary.probeColor.r},${maskSummary.probeColor.g},${maskSummary.probeColor.b}` : 'none'} meshes=${activeEffect.mask ? (maskSummary?.meshes ?? 0) : 0}`,
+    `id=${activeEffect.id} source=${activeEffect.source} mask=${activeEffect.mask ? activeEffect.mask.kind : 'none'} attachment=${activeEffect.mask?.kind === 'gltf' ? `${activeEffect.mask.attachment.position.join(',')}/${activeEffect.mask.attachment.rotationDeg.join(',')}/${activeEffect.mask.attachment.scale}` : 'default'} treatment=${activeEffect.treatment ? 'yes' : 'no'} switching=${switchingActive} switchingPausedFrames=${switchingPausedFrames} switchCount=${switchCount} error=${effectError ? 'yes' : 'no'} package=${activeEffect.source === 'package' ? `${activeEffect.packageVersion ?? '?'} loaded=${activeEffect.mask ? (loadedMaskKey !== null ? 'yes' : 'no') : 'n/a'}` : 'n/a'} maskProbe=${activeEffect.mask && maskSummary?.probeColor ? `${maskSummary.probeColor.r},${maskSummary.probeColor.g},${maskSummary.probeColor.b}` : 'none'} meshes=${activeEffect.mask ? (maskSummary?.meshes ?? 0) : 0}`,
   );
   setDiag(
     'diag-packages',

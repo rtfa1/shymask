@@ -26,6 +26,28 @@ const GLB_VERSION = 2;
 const CHUNK_JSON = 0x4e4f534a; // 'JSON'
 const CHUNK_BIN = 0x004e4942; // 'BIN\0'
 const SUPPORTED_REQUIRED_EXTENSIONS = new Set(['KHR_materials_unlit']);
+/** Valid glTF 2.0 accessor componentType values and their byte widths. */
+const ACCESSOR_COMPONENT_BYTES = new Map<number, number>([
+  [5120, 1], // BYTE
+  [5121, 1], // UNSIGNED_BYTE
+  [5122, 2], // SHORT
+  [5123, 2], // UNSIGNED_SHORT
+  [5125, 4], // UNSIGNED_INT
+  [5126, 4], // FLOAT
+]);
+/** Valid glTF 2.0 accessor type strings and their component counts. */
+const ACCESSOR_TYPE_COMPONENTS = new Map<string, number>([
+  ['SCALAR', 1],
+  ['VEC2', 2],
+  ['VEC3', 3],
+  ['VEC4', 4],
+  ['MAT2', 4],
+  ['MAT3', 9],
+  ['MAT4', 16],
+]);
+/** Index accessors may only use the integer component types glTF allows. */
+const INDEX_COMPONENT_TYPES = new Set([5121, 5123, 5125]);
+const FLOAT_COMPONENT_TYPE = 5126;
 const utf8 = new TextDecoder('utf-8', { fatal: true });
 
 function error(code: PackageIssue['code'], message: string, path?: string): PackageIssue {
@@ -35,6 +57,9 @@ function error(code: PackageIssue['code'], message: string, path?: string): Pack
 interface GltfAccessor {
   count?: unknown;
   bufferView?: unknown;
+  byteOffset?: unknown;
+  componentType?: unknown;
+  type?: unknown;
 }
 
 interface GltfPrimitive {
@@ -271,9 +296,53 @@ export function inspectGlb(bytes: Uint8Array): GlbInspection {
     if (!isRecord(accessor) || !isNonNegativeInteger(accessor.count)) {
       return { ok: false, issues: [error('glb-invalid', `accessors[${index}] must declare a non-negative count.`)] };
     }
+    // glTF requires both fields on every accessor. Validating them here means a
+    // damaged export is rejected at import instead of failing later in
+    // GLTFLoader (which would surface as an effect-load error at selection).
+    if (
+      typeof accessor.componentType !== 'number' ||
+      !ACCESSOR_COMPONENT_BYTES.has(accessor.componentType)
+    ) {
+      return {
+        ok: false,
+        issues: [
+          error(
+            'glb-invalid',
+            `accessors[${index}] must declare a supported componentType (5120, 5121, 5122, 5123, 5125 or 5126).`,
+          ),
+        ],
+      };
+    }
+    if (typeof accessor.type !== 'string' || !ACCESSOR_TYPE_COMPONENTS.has(accessor.type)) {
+      return {
+        ok: false,
+        issues: [
+          error(
+            'glb-invalid',
+            `accessors[${index}] must declare a supported type (SCALAR, VEC2, VEC3, VEC4, MAT2, MAT3 or MAT4).`,
+          ),
+        ],
+      };
+    }
     if (accessor.bufferView !== undefined) {
       if (!isNonNegativeInteger(accessor.bufferView) || accessor.bufferView >= bufferViews.length) {
         return { ok: false, issues: [error('glb-invalid', `accessors[${index}] refers to a missing bufferView.`)] };
+      }
+      const byteOffset = accessor.byteOffset === undefined ? 0 : accessor.byteOffset;
+      if (!isNonNegativeInteger(byteOffset)) {
+        return { ok: false, issues: [error('glb-invalid', `accessors[${index}] has an invalid byteOffset.`)] };
+      }
+      const view = bufferViews[accessor.bufferView];
+      if (isRecord(view) && isNonNegativeInteger(view.byteLength)) {
+        const elementBytes =
+          (ACCESSOR_COMPONENT_BYTES.get(accessor.componentType) as number) *
+          (ACCESSOR_TYPE_COMPONENTS.get(accessor.type) as number);
+        if (byteOffset + elementBytes * accessor.count > view.byteLength) {
+          return {
+            ok: false,
+            issues: [error('glb-invalid', `accessors[${index}] extends past its bufferView.`)],
+          };
+        }
       }
     }
   }
@@ -312,6 +381,18 @@ export function inspectGlb(bytes: Uint8Array): GlbInspection {
           ],
         };
       }
+      const positionAccessor = accessors[position] as GltfAccessor;
+      if (positionAccessor.type !== 'VEC3' || positionAccessor.componentType !== FLOAT_COMPONENT_TYPE) {
+        return {
+          ok: false,
+          issues: [
+            error(
+              'glb-invalid',
+              `meshes[${meshIndex}].primitives[${primitiveIndex}] POSITION must be a FLOAT VEC3 accessor.`,
+            ),
+          ],
+        };
+      }
       let vertexOrIndexCount: number;
       if (primitive.indices !== undefined) {
         if (!isNonNegativeInteger(primitive.indices) || primitive.indices >= accessors.length) {
@@ -321,10 +402,24 @@ export function inspectGlb(bytes: Uint8Array): GlbInspection {
           };
         }
         const accessor = accessors[primitive.indices] as GltfAccessor;
+        if (
+          accessor.type !== 'SCALAR' ||
+          typeof accessor.componentType !== 'number' ||
+          !INDEX_COMPONENT_TYPES.has(accessor.componentType)
+        ) {
+          return {
+            ok: false,
+            issues: [
+              error(
+                'glb-invalid',
+                `meshes[${meshIndex}].primitives[${primitiveIndex}] indices must be an unsigned-integer SCALAR accessor.`,
+              ),
+            ],
+          };
+        }
         vertexOrIndexCount = accessor.count as number;
       } else {
-        const accessor = accessors[position] as GltfAccessor;
-        vertexOrIndexCount = accessor.count as number;
+        vertexOrIndexCount = positionAccessor.count as number;
       }
       triangles += Math.floor(vertexOrIndexCount / 3);
     }

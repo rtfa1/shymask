@@ -320,17 +320,21 @@ independent camera consumer:
 32. Switching bundled → imported → imported paints the opaque paused output first and completes;
     manual pause persists across a switch and keeps the camera paused; an imported effect honors
     tracking-loss/multiple-face/unreliable gates and recovers automatically; an invalid/removed
-    selection falls back to the no-effect paused output.
+    selection falls back to the no-effect paused output. A rapid double switch commits only the
+    later package's mask, and a mask-only package (`rose-visor`) with nonzero position/rotation/scale
+    renders in preview and camera.
 33. Malformed JSON, unsupported schemaVersion, unsupported behavior, missing asset, invalid color,
-    zip-slip, oversized entry, executable content and an unsupported glTF extension are each rejected
-    with their documented actionable code, keep the previous effect rendering, and cause no crash or
-    renderer console error. Removing the active imported effect leaves the paused no-effect output, and
-    another imported package still renders after an app restart.
+    zip-slip, oversized entry, executable content, an unsupported glTF extension, a glTF camera and
+    missing accessor `componentType`/`type` are each rejected with their documented actionable code,
+    keep the previous effect rendering, and cause no crash or renderer console error. Removing the
+    active imported effect leaves the paused no-effect output, and another imported package still
+    renders after an app restart.
 
 Artifacts are written to the gitignored `evidence/check-<timestamp>/` directory: per-state canvas
 screenshots, the full app window (including import-error feedback), captured output frames,
 camera-consumer PNGs under `camera-frames/`, and `summary.json` with the derived base SHA, timing
-baseline, tracking/model evidence, effect-package import/validation/complexity evidence, hardware,
+baseline, tracking/model evidence, effect-package import/negative/rapid-switch/attachment evidence
+(including the displayed complexity subset in each import message), hardware,
 workload, measured boundaries, commands, validation-gate facts and the tested head SHA. The check uses
 an evidence-local `SHYMASK_PACKAGE_DIR`, so it never edits installed packages; the committed sample and
 negative package fixtures are regenerated with `npm run build:packages`.
@@ -381,6 +385,9 @@ Effect-package evidence from the same run (replay-based): the committed `guard-v
 triangles, 1 mesh, 1 material and 1 node; `verdant-tint` is a 397-byte color-only archive. The
 imported mask's unlit material colour (RGB 225,29,154) is the exact preview probe pixel and appears
 in the independent camera-consumer PNG, so the packaged asset is composited through the shared path.
+`rose-visor` is a mask-only sample with nonzero `position`/`rotationDeg`/`scale` whose distinct
+material colour (RGB 32,196,128) is asserted in both preview and camera, and a rapid double switch
+must leave only the later package's probe colour committed.
 Package complexity is reported, not budgeted; no triangle/mesh threshold is asserted.
 
 Replay-derived tracking measurements from the same run are documented in

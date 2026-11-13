@@ -5,9 +5,12 @@
  * This reader parses the central directory first, rejects unsafe names
  * (traversal, absolute paths, backslashes, control characters), symlink and
  * encryption entries, unsupported compression and ZIP64 before inflating, and
- * enforces the package safety caps on *declared* sizes before decompression so
- * a ZIP bomb cannot allocate unbounded memory. Only then does it inflate each
- * entry with fflate (a pure-JS dependency) and verify the CRCs.
+ * enforces the package safety caps on *declared* sizes before decompression.
+ * Inflating a deflate entry is itself bounded: fflate writes into a
+ * preallocated `cap + 1` byte output buffer that it never resizes, so a central
+ * directory that lies about its size still cannot allocate unbounded memory;
+ * output past the cap is rejected as `entry-too-large`. Accepted entries are
+ * then size- and CRC-verified.
  *
  * Nothing is ever written to disk here: the validators return an in-memory
  * name->bytes map, and the main process extracts only the entries a validated
@@ -61,6 +64,48 @@ function crc32(data: Uint8Array): number {
 
 function error(code: PackageIssue['code'], message: string, path?: string): PackageIssue {
   return { severity: 'error', code, message, ...(path ? { path } : {}) };
+}
+
+/**
+ * Thrown while inflating an entry whose real output exceeds the per-entry cap.
+ * Distinct from `archive-unreadable` so a size lie is reported with the
+ * documented over-cap code instead of a generic corruption message.
+ */
+class EntryOutputTooLargeError extends Error {
+  constructor(readonly limit: number) {
+    super(`Decompressed output exceeds the ${limit}-byte per-entry safety limit.`);
+    this.name = 'EntryOutputTooLargeError';
+  }
+}
+
+/**
+ * Inflates one raw-deflate entry with a hard output bound.
+ *
+ * fflate is given a preallocated `limit + 1` byte output buffer. With a caller
+ * buffer (`st.i === 2`) fflate never resizes it, so the allocation cannot grow
+ * with the decompressed stream; the extra byte is enough to distinguish "at the
+ * cap" from "past the cap". Over-cap writes are clipped by the typed array and
+ * the returned length reveals the overrun. Decompression CPU time is still
+ * bounded by the compressed entry cap enforced before this call.
+ */
+function inflateBounded(input: Uint8Array, limit: number): Uint8Array {
+  // fflate returns the caller buffer unchanged for an empty input; treat it as
+  // an empty (and therefore mismatched) result instead of a cap overrun.
+  if (input.length === 0) return new Uint8Array(0);
+  let output: Uint8Array;
+  try {
+    output = inflateSync(input, { out: new Uint8Array(limit + 1) });
+  } catch (cause) {
+    // Stored deflate blocks use `TypedArray.set`, which throws instead of
+    // clipping when the fixed buffer is too small; that also means the output
+    // passed the cap.
+    if (cause instanceof RangeError) throw new EntryOutputTooLargeError(limit);
+    throw cause;
+  }
+  if (output.length > limit) throw new EntryOutputTooLargeError(limit);
+  // `output` is a subarray of the limit-sized scratch buffer; copy it so an
+  // accepted entry does not retain that buffer for the archive's lifetime.
+  return output.slice();
 }
 
 function fail(issues: PackageIssue[]): ZipReadResult {
@@ -222,11 +267,12 @@ export function readZip(bytes: Uint8Array): ZipReadResult {
         ),
       ]);
     }
-    if (rawName.endsWith('/')) {
-      // Directory entry: harmless, and it still counts toward the entry cap.
-      continue;
-    }
-    const name = normalizeArchivePath(rawName);
+    const isDirectory = rawName.endsWith('/');
+    // Directory entries count toward the entry cap but are otherwise ignored.
+    // Normalize and duplicate-check them before skipping: an unsafe
+    // `../evil/` or `/absolute/` directory entry must be rejected exactly like
+    // an unsafe file entry, not silently accepted.
+    const name = normalizeArchivePath(isDirectory ? rawName.slice(0, -1) : rawName);
     if (!name) {
       return fail([
         error(
@@ -236,7 +282,7 @@ export function readZip(bytes: Uint8Array): ZipReadResult {
         ),
       ]);
     }
-    const key = name.toLowerCase();
+    const key = `${isDirectory ? 'dir:' : 'file:'}${name.toLowerCase()}`;
     if (seenNames.has(key)) {
       return fail([
         error(
@@ -247,6 +293,7 @@ export function readZip(bytes: Uint8Array): ZipReadResult {
       ]);
     }
     seenNames.add(key);
+    if (isDirectory) continue;
 
     if ((versionMadeBy >> 8) === UNIX_HOST && (((externalAttributes >>> 16) & 0xf000) === SYMLINK_MODE_MASK)) {
       return fail([
@@ -350,12 +397,30 @@ export function readZip(bytes: Uint8Array): ZipReadResult {
       data =
         entry.method === 0
           ? new Uint8Array(bytes.subarray(dataStart, dataEnd))
-          : inflateSync(bytes.subarray(dataStart, dataEnd));
+          : inflateBounded(bytes.subarray(dataStart, dataEnd), PACKAGE_SAFETY_LIMITS.maxEntryUncompressedBytes);
     } catch (cause) {
+      if (cause instanceof EntryOutputTooLargeError) {
+        return fail([
+          error(
+            'entry-too-large',
+            `Archive entry "${entry.name}" expands beyond the ${PACKAGE_SAFETY_LIMITS.maxEntryUncompressedBytes}-byte per-entry safety limit while decompressing. Remove large media from the package.`,
+            entry.name,
+          ),
+        ]);
+      }
       return fail([
         error(
           'archive-unreadable',
           `Archive entry "${entry.name}" could not be decompressed: ${(cause as Error).message}`,
+          entry.name,
+        ),
+      ]);
+    }
+    if (data.length > PACKAGE_SAFETY_LIMITS.maxEntryUncompressedBytes) {
+      return fail([
+        error(
+          'entry-too-large',
+          `Archive entry "${entry.name}" expands to ${data.length} bytes; the per-entry safety limit is ${PACKAGE_SAFETY_LIMITS.maxEntryUncompressedBytes}.`,
           entry.name,
         ),
       ]);

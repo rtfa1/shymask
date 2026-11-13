@@ -17,18 +17,26 @@ human participant, Blender process or AI harness is used here.
   are typed and documented.
 - **Pure validation** (`src/core/effect-package.ts`, `src/core/zip.ts`,
   `src/core/glb.ts`): no Electron/Node I/O. The ZIP reader parses the central
-  directory first, rejects traversal/absolute/backslash/control paths, symlinks,
-  encryption, unsupported compression, duplicate names, ZIP64 and declared
-  oversized entries before decompressing, then verifies inflated size and CRC.
-  The GLB inspector requires a self-contained glTF 2.0 binary with triangle
-  geometry and rejects external resources, unsupported required extensions,
+  directory first, rejects traversal/absolute/backslash/control paths (including
+  directory entries), symlinks, encryption, unsupported compression, duplicate
+  names, ZIP64 and declared oversized entries before decompressing. Deflate
+  output is inflated into a preallocated `cap + 1` buffer (fflate does not
+  resize a caller buffer), so a size lie is clipped and rejected as
+  `entry-too-large` instead of forcing an unbounded allocation; the inflated
+  size and CRC are verified afterwards. The GLB inspector requires a
+  self-contained glTF
+  2.0 binary with triangle geometry and valid accessor `componentType`/`type`
+  metadata, and rejects external resources, unsupported required extensions,
   animations, skins, cameras and lights. Every failure is a structured
   `{ severity, code, message, path? }`; unknown top-level manifest fields are
   warnings.
 - **Persistent store** (`src/main/effect-packages.ts`): imports are validated,
   then stored as `package.zip` + extracted declared assets + `import.json` under
   Electron `userData/effect-packages/<id>`. The archive is revalidated on every
-  launch (tamper detection with one validator). The store is reachable at the
+  launch (tamper detection with one validator); declared assets are extracted
+  once at import and restored only if missing or size-mismatched, and
+  crash-leftover `.import-*` temp directories are cleaned at first use. The store
+  is reachable at the
   local `shymask://app/packages/<id>/assets/...` protocol route; only validated,
   declared `.glb` bytes are served, never archive or executable content.
 - **Import UX**: an **Import package…** control opens the OS dialog; the result
@@ -44,15 +52,22 @@ human participant, Blender process or AI harness is used here.
   treatment and draws the mask over it.
 - **Switching policy**: selecting an imported mask starts an async load and
   immediately paints the opaque "Tracking paused" screen (`effect-switching`);
-  stale switches are cancelled by a token. A load failure leaves the output
-  hidden with an explanation (`effect-unavailable`). Manual pause outranks
-  switching and persists. Unknown/stale selections fall back to explicit
-  `no-effect` (`effect-invalid`), never raw passthrough.
+  the load is parsed into a detached scene and committed only if its generation
+  is still current, so a stale rapid switch is discarded. A load failure leaves
+  the output hidden with an explanation (`effect-unavailable`). Manual pause
+  outranks switching and persists. Unknown/stale selections fall back to the
+  explicit `no-effect` paused output, never raw passthrough; the policy's
+  `effect-invalid` branch is a defensive, unit-tested fallback that the current
+  selector cannot produce because selection is normalized before it reaches the
+  policy.
 - **Reproducible fixtures**: `scripts/build-package-fixtures.mjs` writes the
-  sample packages (`guard-visor`, `verdant-tint`) with a deterministic
-  procedural GLB writer and fixed-timestamp/deflate ZIPs, plus one negative
-  package per error code. `npm run validate:package -- <zip>` exposes the same
-  validator to creators and the later AI harness.
+  sample packages (`guard-visor` mask+treatment, `rose-visor` mask-only with a
+  nonzero attachment, `verdant-tint` color-only) with a deterministic procedural
+  GLB writer and fixed-timestamp/deflate ZIPs. It also writes the negative
+  fixtures used by the public check; the unit suite synthesizes the remaining
+  header/entry cases so every stable code is covered
+  (`tests/validation-coverage.test.ts`). `npm run validate:package -- <zip>`
+  exposes the same validator to creators and the later AI harness.
 
 ## Why these choices
 
@@ -85,7 +100,7 @@ contract.
 
 ## Evidence (replay-based, this development desktop)
 
-Covered by `npm test` and `npm run check` scenario G:
+Covered by `npm test` and `npm run check` scenario I:
 
 - Valid `guard-visor.zip` imports through the public control, appears in the
   selector and renders its package GLB mask plus declared color treatment in the
@@ -94,16 +109,25 @@ Covered by `npm test` and `npm run check` scenario G:
   the preview pixel at the mask probe and the camera PNG pixel match, so the
   packaged asset (not just the bundled mask) is composited through the shared
   path.
+- Valid `rose-visor.zip` (mask only) uses nonzero `position`, `rotationDeg` and
+  `scale`; the check asserts the renderer diagnostic carries those values and
+  that the rose material colour reaches both preview and camera PNG. A unit test
+  asserts the degrees-to-radians attachment transform.
 - Valid `verdant-tint.zip` (color only) renders its green-shifted treatment in
   preview and camera.
 - Switching bundled → imported → imported paints the paused output first
-  (`switchingPausedFrames` increments) and completes; manual pause persists
+  (`switchingPausedFrames` increments) and completes; a rapid double switch
+  leaves only the later package's mask probe committed; manual pause persists
   across the switch and the camera stays on the paused canvas; tracking loss
   hides the imported effect and recovery is automatic.
 - The negative fixtures (malformed JSON, schema v2, unsupported behavior,
   missing asset, invalid color, zip-slip, oversized entry, executable file,
-  unsupported glTF extension) are each rejected with their documented code,
-  keep the previous effect rendering, and produce no renderer console errors.
+  unsupported glTF extension, missing accessor `componentType`/`type`, and a
+  glTF camera) are each rejected with their documented code, keep the previous
+  effect rendering, and produce no renderer console errors. Unit scenarios cover
+  the codes that are impractical to ship as archive fixtures (encryption,
+  unsupported compression, directory-path safety, manifest size/UTF-8/schema,
+  identity, entry-not-allowed).
 - Removing the active imported effect falls back to the no-effect opaque paused
   output in preview and camera; another imported package survives an app restart
   and still renders.
@@ -127,6 +151,10 @@ packages are generated fixtures, not Blender output (#9).
 - Import cancellation is handled in the app but not driven by the public check;
   unknown-effect fallback and manual-pause precedence are unit-tested, while the
   removal path is exercised end-to-end.
+- The switch-pause assertion for an imported mask is the public status reason
+  and the `switchingPausedFrames` counter plus the shared-canvas policy; the
+  external camera consumer takes longer to start than the small GLB takes to
+  load, so no camera PNG is captured during that transient state.
 - The package store is per-user `userData`; the check uses an isolated directory.
   No signing, trust store, sandboxing of GLB parsing beyond the structural
   validator, or multi-user separation is implemented. This is a local

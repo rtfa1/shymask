@@ -65,6 +65,32 @@ test('absolute entry paths are rejected', () => {
   assert.ok(codes(result).includes('entry-path-unsafe'));
 });
 
+test('unsafe directory entries are rejected instead of skipped', () => {
+  for (const directory of ['../escape/', '/absolute/', 'C:/drive/']) {
+    const result = readZip(
+      zip({
+        'manifest.json': new TextEncoder().encode('{}'),
+        [directory]: new Uint8Array(),
+      }),
+    );
+    assert.equal(result.ok, false, `${directory} must be rejected`);
+    assert.deepEqual(codes(result), ['entry-path-unsafe'], `${directory} must report entry-path-unsafe`);
+  }
+});
+
+test('a safe directory entry is still counted and ignored', () => {
+  const result = readZip(
+    zip({
+      'manifest.json': new TextEncoder().encode('{}'),
+      'assets/': new Uint8Array(),
+      'assets/mask.glb': new Uint8Array([1]),
+    }),
+  );
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(result.entries.map((entry) => entry.name), ['manifest.json', 'assets/mask.glb']);
+});
+
 test('symbolic links are rejected using the Unix external attributes', () => {
   const result = readZip(readFileSync(path.join(PACKAGE_DIR, 'negative', 'symlink.zip')));
   assert.equal(result.ok, false);

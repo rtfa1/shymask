@@ -24,22 +24,14 @@ import {
   type InstalledEffectPackage,
   type RemoveEffectPackageResult,
 } from '../core/effect-package-contract';
+import { safeJoinForWrite } from './safe-path';
 
 const PACKAGE_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{1,62}$/;
+const IMPORT_TEMP_PREFIX = '.import-';
 
 interface ImportMetadata {
   importedAt: string;
   sourceFileName: string;
-}
-
-function safeJoin(root: string, segments: readonly string[]): string | null {
-  for (const segment of segments) {
-    if (segment.length === 0 || segment === '.' || segment === '..' || /[\\/]/.test(segment)) return null;
-  }
-  const resolvedRoot = path.resolve(root);
-  const resolved = path.resolve(resolvedRoot, ...segments);
-  if (resolved !== resolvedRoot && !resolved.startsWith(resolvedRoot + path.sep)) return null;
-  return resolved;
 }
 
 function readImportMetadata(directory: string): ImportMetadata {
@@ -56,6 +48,9 @@ function readImportMetadata(directory: string): ImportMetadata {
 }
 
 export class EffectPackageStore {
+  /** Crash-leftover temp directories are removed once per store lifetime. */
+  private cleanedStaleImports = false;
+
   constructor(
     readonly rootDir: string,
     private readonly assetUrlBase: string,
@@ -63,9 +58,13 @@ export class EffectPackageStore {
 
   /**
    * Re-reads and re-validates every stored package. A package that no longer
-   * validates is ignored with a warning instead of being loaded.
+   * validates is ignored with a warning instead of being loaded. Declared
+   * assets are extracted once at import; a list call only restores one whose
+   * size no longer matches, so a normal list does not rewrite the extracted
+   * files.
    */
   list(): EffectPackageList {
+    this.cleanStaleImports();
     const warnings: string[] = [];
     const packages: InstalledEffectPackage[] = [];
     if (!existsSync(this.rootDir)) return { packages, warnings };
@@ -105,7 +104,7 @@ export class EffectPackageStore {
         continue;
       }
       try {
-        this.extractAssets(directory, validation.package.assets);
+        this.ensureAssets(directory, validation.package.assets);
       } catch (cause) {
         warnings.push(`Imported effect "${entry.name}" could not be staged: ${(cause as Error).message}`);
         continue;
@@ -146,12 +145,15 @@ export class EffectPackageStore {
 
     const manifest = validation.package.manifest;
     const existed = existsSync(path.join(this.rootDir, manifest.id, 'package.zip'));
-    const tempDirectory = path.join(this.rootDir, `.import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    const tempDirectory = path.join(
+      this.rootDir,
+      `${IMPORT_TEMP_PREFIX}${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    );
     const targetDirectory = path.join(this.rootDir, manifest.id);
     try {
       mkdirSync(tempDirectory, { recursive: true });
       writeFileSync(path.join(tempDirectory, 'package.zip'), bytes);
-      this.extractAssets(tempDirectory, validation.package.assets);
+      this.ensureAssets(tempDirectory, validation.package.assets);
       const metadata: ImportMetadata = {
         importedAt: new Date().toISOString(),
         sourceFileName: path.basename(filePath),
@@ -224,16 +226,60 @@ export class EffectPackageStore {
     };
   }
 
-  /** Writes only the validated, declared asset entries under `<dir>/assets`. */
-  private extractAssets(directory: string, assets: ReadonlyMap<string, Uint8Array>): void {
+  /**
+   * Ensures the validated, declared asset entries exist under `<dir>/assets`.
+   * Extraction happens once at import; a list/revalidation only restores an
+   * asset whose size no longer matches (missing, truncated or replaced), so a
+   * normal call never rewrites the store.
+   */
+  private ensureAssets(directory: string, assets: ReadonlyMap<string, Uint8Array>): void {
     const assetsRoot = path.join(directory, 'assets');
-    rmSync(assetsRoot, { recursive: true, force: true });
     mkdirSync(assetsRoot, { recursive: true });
     for (const [name, data] of assets) {
-      const target = safeJoin(directory, name.split('/'));
+      const target = safeJoinForWrite(directory, name.split('/'));
       if (!target) throw new Error(`Refusing to extract unsafe asset path "${name}".`);
       mkdirSync(path.dirname(target), { recursive: true });
+      let existingBytes = -1;
+      try {
+        existingBytes = statSync(target).size;
+      } catch {
+        // Missing assets are written below.
+      }
+      if (existingBytes === data.length) continue;
       writeFileSync(target, data);
+    }
+    // A re-import may declare a different asset file; drop anything else so the
+    // store keeps exactly the validated, declared assets.
+    const declared = new Set([...assets.keys()].map((name) => path.basename(name)));
+    for (const entry of readdirSync(assetsRoot, { withFileTypes: true })) {
+      if (entry.isFile() && declared.has(entry.name)) continue;
+      rmSync(path.join(assetsRoot, entry.name), { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Removes `.import-*` directories left by a crash between temp creation and
+   * the atomic rename. The store is single-process, so any such directory at
+   * first use is stale rather than an in-flight import.
+   */
+  private cleanStaleImports(): void {
+    if (this.cleanedStaleImports) return;
+    this.cleanedStaleImports = true;
+    if (!existsSync(this.rootDir)) return;
+    let entries;
+    try {
+      entries = readdirSync(this.rootDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.name.startsWith(IMPORT_TEMP_PREFIX)) continue;
+      try {
+        rmSync(path.join(this.rootDir, entry.name), { recursive: true, force: true });
+      } catch {
+        // A stale temp directory that cannot be removed is reported by the
+        // normal store warnings only if it later affects an import.
+      }
     }
   }
 

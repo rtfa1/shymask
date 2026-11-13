@@ -1,5 +1,6 @@
-import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { resolveRealFile } from './safe-path';
 
 /**
  * Local asset protocol for the Electron app.
@@ -49,16 +50,6 @@ const ROUTES = {
   packages: 'packageDir',
 } as const;
 
-function safeJoin(root: string, segments: string[]): string | null {
-  for (const segment of segments) {
-    if (segment.length === 0 || segment === '.' || segment === '..' || /[\\/]/.test(segment)) return null;
-  }
-  const resolvedRoot = path.resolve(root);
-  const resolved = path.resolve(resolvedRoot, ...segments);
-  if (resolved !== resolvedRoot && !resolved.startsWith(resolvedRoot + path.sep)) return null;
-  return resolved;
-}
-
 /** Maps `shymask://app/<pathname>` to a file inside one of the allowed roots. */
 export function resolveAssetPath(roots: AssetRoots, pathname: string): ResolvedAsset | null {
   let decoded: string;
@@ -83,20 +74,11 @@ export function resolveAssetPath(roots: AssetRoots, pathname: string): ResolvedA
   }
   if (relative.length === 0) return null;
 
-  const file = safeJoin(root, relative);
-  if (!file) return null;
-  // `safeJoin` rejects `..` segments, but a symlink inside a root could still
-  // point outside it. Compare real paths so the documented "only files under
-  // the configured roots" boundary holds for links too.
-  let realFile: string;
-  let realRoot: string;
-  try {
-    realRoot = realpathSync(root);
-    realFile = realpathSync(file);
-  } catch {
-    return null;
-  }
-  if (realFile !== realRoot && !realFile.startsWith(realRoot + path.sep)) return null;
+  // `resolveRealFile` rejects `..` segments and also compares real paths, so a
+  // symlink inside a root cannot point outside it. The documented "only files
+  // under the configured roots" boundary therefore holds for links too.
+  const realFile = resolveRealFile(root, relative);
+  if (!realFile) return null;
   if (!statSync(realFile).isFile()) return null;
   const extension = path.extname(realFile).toLowerCase();
   return { file: realFile, mime: MIME_TYPES[extension] ?? 'application/octet-stream' };

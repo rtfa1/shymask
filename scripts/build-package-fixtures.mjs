@@ -3,8 +3,13 @@
  * Reproducibly generates the committed effect-package fixtures:
  *
  *   fixtures/packages/guard-visor.zip    valid: rigid GLB mask + color treatment
+ *   fixtures/packages/rose-visor.zip     valid: mask-only GLB with nonzero attachment
  *   fixtures/packages/verdant-tint.zip   valid: declarative color treatment only
- *   fixtures/packages/negative/*.zip     one invalid package per validation code
+ *   fixtures/packages/negative/*.zip     invalid packages for public-workflow codes
+ *
+ * The negative fixtures cover the public-workflow rejection cases; the unit
+ * suite synthesizes the remaining stable codes (see
+ * tests/validation-coverage.test.ts).
  *
  * The mask GLB is written by a tiny deterministic glTF 2.0 binary writer below
  * (a small procedural box-built visor with one unlit material), so the repo
@@ -178,9 +183,9 @@ function boxGeometry(boxes) {
 }
 
 /**
- * @param {{boxes: number[][], colorSrgb: [number, number, number], document?: object, embedBin?: boolean}} options
+ * @param {{boxes: number[][], colorSrgb: [number, number, number], document?: object, mutateDocument?: (document: object) => void, embedBin?: boolean}} options
  */
-function buildGlb({ boxes, colorSrgb, document = {}, embedBin = true }) {
+function buildGlb({ boxes, colorSrgb, document = {}, mutateDocument, embedBin = true }) {
   const geometry = boxGeometry(boxes);
   const positionBytes = geometry.positions.length * 4;
   const indexBytes = geometry.indices.length * 2;
@@ -241,6 +246,7 @@ function buildGlb({ boxes, colorSrgb, document = {}, embedBin = true }) {
     buffers: embedBin ? [{ byteLength: binLength }] : [{ uri: 'mask.bin', byteLength: binLength }],
   };
 
+  if (mutateDocument) mutateDocument(gltf);
   mergeDocument(gltf, document);
 
   const jsonBytes = Buffer.from(JSON.stringify(gltf), 'utf8');
@@ -294,6 +300,8 @@ const GUARD_VISOR_BOXES = [
 ];
 /** Distinct, exact sRGB colour; not used by any bundled mask material. */
 const GUARD_VISOR_COLOR = [225, 29, 154];
+/** Second mask sample uses a different exact colour and a nonzero attachment. */
+const ROSE_VISOR_COLOR = [32, 196, 128];
 
 const guardVisorManifest = {
   schemaVersion: 1,
@@ -311,6 +319,23 @@ const guardVisorManifest = {
     attachment: { position: [0, 0, 0], rotationDeg: [0, 0, 0], scale: 1 },
   },
   colorTreatment: { saturation: 1.15, hueRotateDeg: -8, contrast: 1.05 },
+};
+
+const roseVisorManifest = {
+  schemaVersion: 1,
+  id: 'shymask.rose-visor',
+  name: 'Rose visor',
+  version: '1.0.0',
+  description: 'Rigid unlit visor with a nonzero position, rotation and scale attachment.',
+  author: {
+    name: 'Shymask sample author',
+    attribution: 'Generated reproducibly by scripts/build-package-fixtures.mjs',
+    license: 'CC0-1.0',
+  },
+  mask: {
+    asset: 'assets/rose-visor.glb',
+    attachment: { position: [2, 3.5, 0], rotationDeg: [0, 0, 12], scale: 1.1 },
+  },
 };
 
 const verdantManifest = {
@@ -344,8 +369,44 @@ function writeNegative(name, files) {
   console.log(`wrote ${path.relative(root, target)}`);
 }
 
+/**
+ * Rewrites one central-directory uncompressed-size field so a fixture can lie
+ * about its declared size while keeping a valid ZIP structure. The bounded
+ * reader must still reject it from the real inflated length.
+ */
+function patchCentralUncompressedSize(archive, entryName, declaredSize) {
+  const buffer = Buffer.from(archive);
+  let eocd = -1;
+  for (let offset = buffer.length - 22; offset >= 0; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === 0x06054b50) {
+      eocd = offset;
+      break;
+    }
+  }
+  if (eocd < 0) throw new Error('generated ZIP has no end-of-central-directory record');
+  const total = buffer.readUInt16LE(eocd + 10);
+  let cursor = buffer.readUInt32LE(eocd + 16);
+  for (let index = 0; index < total; index += 1) {
+    if (buffer.readUInt32LE(cursor) !== 0x02014b50) throw new Error('generated ZIP has a malformed central entry');
+    const nameLength = buffer.readUInt16LE(cursor + 28);
+    const extraLength = buffer.readUInt16LE(cursor + 30);
+    const commentLength = buffer.readUInt16LE(cursor + 32);
+    const name = buffer.subarray(cursor + 46, cursor + 46 + nameLength).toString('utf8');
+    if (name === entryName) {
+      buffer.writeUInt32LE(declaredSize, cursor + 24);
+      return buffer;
+    }
+    cursor += 46 + nameLength + extraLength + commentLength;
+  }
+  throw new Error(`generated ZIP has no entry named ${entryName}`);
+}
+
 function validMaskGlb() {
   return buildGlb({ boxes: GUARD_VISOR_BOXES, colorSrgb: GUARD_VISOR_COLOR });
+}
+
+function roseMaskGlb() {
+  return buildGlb({ boxes: GUARD_VISOR_BOXES, colorSrgb: ROSE_VISOR_COLOR });
 }
 
 function mutateManifest(base, mutate) {
@@ -363,6 +424,10 @@ function main() {
   writePackage('guard-visor.zip', {
     'manifest.json': manifestBytes(guardVisorManifest),
     'assets/guard-visor.glb': glb,
+  });
+  writePackage('rose-visor.zip', {
+    'manifest.json': manifestBytes(roseVisorManifest),
+    'assets/rose-visor.glb': roseMaskGlb(),
   });
   writePackage('verdant-tint.zip', {
     'manifest.json': manifestBytes(verdantManifest),
@@ -408,6 +473,17 @@ function main() {
     'assets/guard-visor.glb': glb,
     'assets/huge.glb': new Uint8Array(4 * 1024 * 1024 + 1),
   });
+  // A central directory that understates its uncompressed size: the reader must
+  // bound the inflation at the per-entry cap and reject it as entry-too-large.
+  const inflateBomb = writeDeflatedZip({
+    'manifest.json': manifestBytes(guardVisorManifest),
+    'assets/bomb.glb': new Uint8Array(4 * 1024 * 1024 + 1024),
+  });
+  writeFileSync(
+    path.join(negativeDir, 'inflate-bomb.zip'),
+    patchCentralUncompressedSize(inflateBomb, 'assets/bomb.glb', 64),
+  );
+  console.log(`wrote ${path.relative(root, path.join(negativeDir, 'inflate-bomb.zip'))}`);
   writeNegative('executable-file', {
     'manifest.json': manifestBytes(guardVisorManifest),
     'assets/guard-visor.glb': glb,
@@ -440,6 +516,38 @@ function main() {
       boxes: GUARD_VISOR_BOXES,
       colorSrgb: GUARD_VISOR_COLOR,
       document: { animations: [{ channels: [], samplers: [] }] },
+    }),
+  });
+  // Damaged accessor metadata: GLTFLoader would fail only after import, so the
+  // structural validator must reject these at import time (glb-invalid).
+  writeNegative('glb-missing-component-type', {
+    'manifest.json': manifestBytes(guardVisorManifest),
+    'assets/guard-visor.glb': buildGlb({
+      boxes: GUARD_VISOR_BOXES,
+      colorSrgb: GUARD_VISOR_COLOR,
+      mutateDocument: (document) => {
+        delete document.accessors[0].componentType;
+      },
+    }),
+  });
+  writeNegative('glb-missing-accessor-type', {
+    'manifest.json': manifestBytes(guardVisorManifest),
+    'assets/guard-visor.glb': buildGlb({
+      boxes: GUARD_VISOR_BOXES,
+      colorSrgb: GUARD_VISOR_COLOR,
+      mutateDocument: (document) => {
+        delete document.accessors[0].type;
+      },
+    }),
+  });
+  writeNegative('glb-camera', {
+    'manifest.json': manifestBytes(guardVisorManifest),
+    'assets/guard-visor.glb': buildGlb({
+      boxes: GUARD_VISOR_BOXES,
+      colorSrgb: GUARD_VISOR_COLOR,
+      mutateDocument: (document) => {
+        document.cameras = [{ type: 'perspective', perspective: { yfov: 1, znear: 0.1 } }];
+      },
     }),
   });
   writeNegative('external-resource', {

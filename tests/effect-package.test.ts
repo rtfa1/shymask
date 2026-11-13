@@ -159,3 +159,37 @@ test('a non-ZIP file and an oversized archive produce actionable archive errors'
   expectError(new TextEncoder().encode('this is not a zip archive at all'), 'archive-unreadable');
   expectError(new Uint8Array(8 * 1024 * 1024 + 1), 'archive-too-large');
 });
+
+test('a GLB accessor missing componentType or type is rejected at import, not at selection', () => {
+  for (const name of ['glb-missing-component-type', 'glb-missing-accessor-type']) {
+    const result = validateEffectPackage(negativeBytes(name));
+    assert.equal(result.ok, false, `${name} must be rejected at import`);
+    if (result.ok) continue;
+    const issue = result.errors.find((entry) => entry.code === 'glb-invalid');
+    assert.ok(issue, `${name} must report glb-invalid, got ${result.errors.map((entry) => entry.code).join(', ')}`);
+    assert.equal(issue.path, 'assets/guard-visor.glb');
+    assert.match(issue.message, /componentType|type/);
+  }
+});
+
+test('a GLB camera is rejected as an unsupported feature at import', () => {
+  const result = validateEffectPackage(negativeBytes('glb-camera'));
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.ok(result.errors.some((entry) => entry.code === 'glb-unsupported-feature'));
+});
+
+test('nonzero mask attachment position, rotation and scale survive validation', () => {
+  const bytes = mutateManifest(fixtureBytes('guard-visor.zip'), (manifest) => {
+    const mask = manifest.mask as { attachment: Record<string, unknown> };
+    mask.attachment = { position: [12, -7, 3], rotationDeg: [15, -30, 45], scale: 2.5 };
+  });
+  const result = validateEffectPackage(bytes);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(result.package.manifest.mask?.attachment, {
+    position: [12, -7, 3],
+    rotationDeg: [15, -30, 45],
+    scale: 2.5,
+  });
+});

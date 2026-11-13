@@ -21,7 +21,7 @@ function installed(overrides: Partial<InstalledEffectPackage> = {}): InstalledEf
     mask: {
       asset: 'assets/guard-visor.glb',
       assetUrl: 'shymask://app/packages/studio.guard-visor/assets/guard-visor.glb',
-      attachment: { position: [0, 1, 0], rotationDeg: [0, 0, 0], scale: 1.5 },
+      attachment: { position: [12, -7, 3], rotationDeg: [15, -30, 45], scale: 2.5 },
     },
     complexity: {
       archiveBytes: 1000,
@@ -55,7 +55,7 @@ test('a package becomes one complete effect combining a mask and a color treatme
     kind: 'gltf',
     packageId: 'studio.guard-visor',
     assetUrl: 'shymask://app/packages/studio.guard-visor/assets/guard-visor.glb',
-    attachment: { position: [0, 1, 0], rotationDeg: [0, 0, 0], scale: 1.5 },
+    attachment: { position: [12, -7, 3], rotationDeg: [15, -30, 45], scale: 2.5 },
   });
   assert.equal(effect.treatment?.cssFilter, 'saturate(1.2) hue-rotate(-10deg)');
 });

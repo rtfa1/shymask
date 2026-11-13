@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import type { MaskAttachment } from '../core/effect-package-contract';
+import { maskAttachmentTransform } from '../core/mask-attachment';
 import { poseFromColumnMajorMatrix, type TrackingPose } from '../core/tracking';
 
 /**
@@ -20,9 +21,9 @@ import { poseFromColumnMajorMatrix, type TrackingPose } from '../core/tracking';
  * matrix), which is what makes a mask land on the face instead of merely near
  * it.
  *
- * One renderer is created for the renderer process lifetime (the mask canvas is
- * part of the single output path), so there is deliberately no `dispose()`:
- * closing Shymask tears down the window and its WebGL context.
+ * The bundled geometry is built once and re-added on every switch. Replaced
+ * GLTF content is disposed before it leaves the scene, and `dispose()` releases
+ * the scene and WebGL resources when the app window tears down.
  */
 
 export interface MaskProjection {
@@ -47,6 +48,18 @@ export interface MaskProjection {
 export interface PackageMaskSummary {
   meshes: number;
   materials: number;
+  probeColor: { r: number; g: number; b: number } | null;
+}
+
+/**
+ * A fully parsed package mask that has not touched the live scene yet. The
+ * caller can discard it (stale switch) or commit it atomically (current switch).
+ */
+export interface ParsedPackageMask {
+  /** Detached holder group; the caller owns it until commit/discard. */
+  group: THREE.Group;
+  summary: PackageMaskSummary;
+  probeKind: ProbeKind;
   probeColor: { r: number; g: number; b: number } | null;
 }
 
@@ -81,9 +94,12 @@ export class MaskRenderer {
   private readonly group: THREE.Group;
   /** Holds the active mask content (bundled meshes or a loaded package scene). */
   private readonly content: THREE.Group;
+  /** Built once; removed/re-added by reference so a switch never rebuilds it. */
+  private readonly bundled: THREE.Group;
   private visible = false;
   private probeKind: ProbeKind = 'eye';
   private materialProbeColor: { r: number; g: number; b: number } | null = null;
+  private disposed = false;
   private readonly loader = new GLTFLoader();
 
   constructor(width: number, height: number) {
@@ -118,13 +134,31 @@ export class MaskRenderer {
     this.group.matrixAutoUpdate = false;
     this.group.visible = false;
     this.content = new THREE.Group();
+    this.bundled = this.buildBundledMask();
+    this.content.add(this.bundled);
+    this.probeKind = 'eye';
+    this.materialProbeColor = null;
     this.group.add(this.content);
     this.scene.add(this.group);
-    this.setBundledMask();
   }
 
   /** Restores the bundled procedural mask (used when switching back to it). */
   setBundledMask(): void {
+    if (this.content.children.includes(this.bundled)) {
+      this.probeKind = 'eye';
+      this.materialProbeColor = null;
+      return;
+    }
+    this.disposeContent();
+    this.content.add(this.bundled);
+    this.probeKind = 'eye';
+    this.materialProbeColor = null;
+  }
+
+  /** Builds the procedural mask geometry/material graph exactly once. */
+  private buildBundledMask(): THREE.Group {
+    const bundled = new THREE.Group();
+    bundled.name = 'bundled-mask';
     const shellMaterial = new THREE.MeshStandardMaterial({
       color: 0x2f6fa3,
       roughness: 0.5,
@@ -151,53 +185,50 @@ export class MaskRenderer {
     const eyeMaterial = new THREE.MeshBasicMaterial({ color: EYE_COLOR });
     const noseMaterial = new THREE.MeshBasicMaterial({ color: 0x0ea5b7 });
 
-    this.content.clear();
-    this.probeKind = 'eye';
-    this.materialProbeColor = null;
-
     const shell = new THREE.Mesh(new THREE.IcosahedronGeometry(9.5, 1), shellMaterial);
     shell.scale.set(1.02, 1.16, 0.92);
     shell.position.set(0, 0.6, -2.4);
-    this.content.add(shell);
+    bundled.add(shell);
 
     const visor = new THREE.Mesh(new THREE.BoxGeometry(15.2, 4.8, 1.8), visorMaterial);
     visor.position.set(0, 1.5, 5.2);
-    this.content.add(visor);
+    bundled.add(visor);
 
     for (const side of [-1, 1]) {
       const eye = new THREE.Mesh(new THREE.BoxGeometry(3.2, 2.1, 1.4), eyeMaterial);
       eye.position.set(side * 3.9, 1.8, 6.1);
-      this.content.add(eye);
+      bundled.add(eye);
 
       const fin = new THREE.Mesh(new THREE.BoxGeometry(1.4, 5.6, 3.2), sideMaterial);
       fin.position.set(side * 9.4, -0.2, 0.2);
-      this.content.add(fin);
+      bundled.add(fin);
 
       const cheek = new THREE.Mesh(new THREE.BoxGeometry(1.4, 3.4, 1.4), trimMaterial);
       cheek.position.set(side * 7.6, -3.4, 4.4);
-      this.content.add(cheek);
+      bundled.add(cheek);
     }
 
     const crest = new THREE.Mesh(new THREE.BoxGeometry(1.9, 7.8, 1.7), trimMaterial);
     crest.position.set(0, 7.9, 0.8);
-    this.content.add(crest);
+    bundled.add(crest);
 
     const chin = new THREE.Mesh(new THREE.BoxGeometry(7.2, 1.5, 1.4), eyeMaterial);
     chin.position.set(0, -6.5, 5.2);
-    this.content.add(chin);
+    bundled.add(chin);
 
     const nose = new THREE.Mesh(new THREE.ConeGeometry(1.25, 3.4, 4), noseMaterial);
     nose.rotation.x = Math.PI / 2;
     nose.position.set(0, -1.8, 6.4);
-    this.content.add(nose);
+    bundled.add(nose);
+    return bundled;
   }
 
   /**
-   * Loads a validated package GLB into the same mask scene, replacing the
-   * bundled content, and applies the manifest's declarative attachment. Only
-   * validated `.glb` bytes reach this method; no package code is evaluated.
+   * Parses a validated package GLB into a detached group without touching the
+   * live scene, so a caller whose switch token went stale can discard it.
+   * Only validated `.glb` bytes reach this method; no package code is evaluated.
    */
-  async loadGltfModel(data: ArrayBuffer, attachment: MaskAttachment): Promise<PackageMaskSummary> {
+  async parseGltfModel(data: ArrayBuffer, attachment: MaskAttachment): Promise<ParsedPackageMask> {
     const gltf = await new Promise<THREE.Group>((resolve, reject) => {
       this.loader.parse(
         data,
@@ -207,19 +238,13 @@ export class MaskRenderer {
       );
     });
 
+    const transform = maskAttachmentTransform(attachment);
     const holder = new THREE.Group();
     holder.name = 'package-mask';
-    holder.position.set(attachment.position[0], attachment.position[1], attachment.position[2]);
-    holder.rotation.set(
-      THREE.MathUtils.degToRad(attachment.rotationDeg[0]),
-      THREE.MathUtils.degToRad(attachment.rotationDeg[1]),
-      THREE.MathUtils.degToRad(attachment.rotationDeg[2]),
-    );
-    holder.scale.setScalar(attachment.scale);
+    holder.position.fromArray(transform.position);
+    holder.rotation.set(transform.rotationRad[0], transform.rotationRad[1], transform.rotationRad[2]);
+    holder.scale.setScalar(transform.scale);
     holder.add(gltf);
-
-    this.content.clear();
-    this.content.add(holder);
 
     let meshes = 0;
     let materials = 0;
@@ -241,9 +266,69 @@ export class MaskRenderer {
         };
       }
     });
-    this.probeKind = probeColor ? 'material' : 'none';
-    this.materialProbeColor = probeColor;
-    return { meshes, materials, probeColor };
+    return {
+      group: holder,
+      summary: { meshes, materials, probeColor },
+      probeKind: probeColor ? 'material' : 'none',
+      probeColor,
+    };
+  }
+
+  /**
+   * Atomically replaces the live content with a parsed package mask. Called only
+   * after the caller re-checked its switch token; no await may separate the
+   * token check from this synchronous swap.
+   */
+  commitGltfModel(content: ParsedPackageMask): void {
+    this.disposeContent();
+    this.content.add(content.group);
+    this.probeKind = content.probeKind;
+    this.materialProbeColor = content.probeColor;
+  }
+
+  /** Releases an uncommitted parse (for example a switch superseded mid-load). */
+  discardGltfModel(content: ParsedPackageMask): void {
+    this.disposeObjectResources(content.group);
+  }
+
+  /** Releases the mask scene's geometries, materials, textures and WebGL context. */
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.disposeContent();
+    this.disposeObjectResources(this.bundled);
+    this.visible = false;
+    this.group.visible = false;
+    this.scene.clear();
+    this.renderer.dispose();
+  }
+
+  /** Disposes everything under `content` except the reusable bundled graph. */
+  private disposeContent(): void {
+    for (const child of [...this.content.children]) {
+      if (child !== this.bundled) this.disposeObjectResources(child);
+      this.content.remove(child);
+    }
+  }
+
+  private disposeObjectResources(root: THREE.Object3D): void {
+    const textures = new Set<THREE.Texture>();
+    const materials = new Set<THREE.Material>();
+    root.traverse((object: THREE.Object3D) => {
+      const mesh = object as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      mesh.geometry?.dispose();
+      const rawMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const material of rawMaterials) {
+        if (!material) continue;
+        materials.add(material);
+        for (const value of Object.values(material as unknown as Record<string, unknown>)) {
+          if (value instanceof THREE.Texture) textures.add(value);
+        }
+      }
+    });
+    for (const material of materials) material.dispose();
+    for (const texture of textures) texture.dispose();
   }
 
   /**

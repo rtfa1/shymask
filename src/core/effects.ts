@@ -11,7 +11,7 @@ import {
   type InstalledEffectPackage,
   type MaskAttachment,
 } from './effect-package-contract';
-import { COLOR_TREATMENTS, type ColorTreatment } from './treatments';
+import { COLOR_TREATMENTS, getEffectLabel, type ColorTreatment } from './treatments';
 
 export type EffectSource = 'bundled' | 'package';
 
@@ -41,7 +41,7 @@ export const DEFAULT_EFFECT_ID = 'warm';
 export const BUNDLED_EFFECT_DEFINITIONS: readonly EffectDefinition[] = [
   {
     id: NO_EFFECT_ID,
-    label: 'No effect',
+    label: getEffectLabel(NO_EFFECT_ID),
     source: 'bundled',
     description: 'Hides the processed output (the opaque paused screen) instead of passing the feed through.',
     treatment: null,
@@ -49,7 +49,7 @@ export const BUNDLED_EFFECT_DEFINITIONS: readonly EffectDefinition[] = [
   },
   {
     id: BUNDLED_MASK_ID,
-    label: 'Rigid mask',
+    label: getEffectLabel(BUNDLED_MASK_ID),
     source: 'bundled',
     description: 'Bundled procedural low-poly helmet/visor attached to the tracked face.',
     treatment: null,

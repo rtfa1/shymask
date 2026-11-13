@@ -130,10 +130,6 @@ ipcMain.handle('shymask:startup-info', (): StartupInfo => {
   return { fixture: currentFixture, tracker: currentTracker, effectPackages: getPackageStore().list() };
 });
 
-ipcMain.handle('shymask:effect-packages', () => {
-  return getPackageStore().list();
-});
-
 ipcMain.handle('shymask:effect-package-import', async (event): Promise<ImportEffectPackageResult> => {
   const store = getPackageStore();
   const parent = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
