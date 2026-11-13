@@ -98,9 +98,12 @@ attempt are written to `summary.json` (`virtualCamera.captureAttempts`) and the
 check log, and the final attempt still fails on a persistent fallback. Before each
 processed capture, the expected preview mean is read only once the public status
 reports `render` and the throttled mean-RGB diagnostic is non-dark (sum > 60; the
-paused canvas is about 47). That gate proves render mode plus a non-dark mean, not
+normal paused canvas mean is about 47, while a rendered preview mean is typically
+65 or more). The render-mode status is the real gate; the brightness clause is a
+secondary sanity check. That gate proves render mode plus a non-dark mean, not
 freshness: a stale same-brightness mean would also pass, and the camera comparison
-allows a summed-channel difference of 25. For the held occlusion A/B the mean is
+allows at most a maximum per-channel difference of 25 (the summed difference can
+reach 75). For the held occlusion A/B the mean is
 read once before the ON capture and reused for the OFF capture, because both
 captures come from the same held canvas.
 
@@ -143,17 +146,18 @@ material colour covers at least 99% of the changed face-box pixels in OFF and at
 most 1.5% of the same pixels in ON (enforced ≥97% / ≤3%). The bundled procedural
 mask uses lit materials, so the check takes the dominant exact OFF-frame mask
 colours from the changed region (top 64 shades, at least 90% coverage) and
-requires that none of them reappear in ON at those pixels (at most 1%; observed
-0). Removing the mask colour is not by itself proof that the reveal is video: a
+requires that they do not reappear in ON at those pixels (at most 1%; observed
+≤0.1%, including 4 of 17,253 px in one opposite-view run). Removing the mask
+colour is not by itself proof that the reveal is video: a
 black, transparent or uniform fill would also remove it. The ON changed pixels
 must therefore also pass a plausible-video floor — mean luminance ≥30, luminance
 standard deviation ≥6, at most 10% near-black pixels and at least 16 distinct
 colours — and for the untreated bundled mask and `rose-visor` at least 90% of the
 sampled ON pixels must match the underlying held replay frame drawn at the
 pipeline's 0,0,1280,720 scale. Observed ON pixels across recent runs (floors 30
-and 6): bundled about 125–128 mean luminance / 33–36 luminance standard deviation,
-`rose-visor` about 150 / 13–14, and the opposite-view bundled frame about
-102–105 / 40–41; the held-replay match was 0.94–0.97 for the bundled and
+and 6): bundled about 125–130 mean luminance / 32–36 luminance standard deviation,
+`rose-visor` about 149–151 / 13–14.5, and the opposite-view bundled frame about
+102–105 / 40–41; the held-replay match was 0.93–0.97 for the bundled and
 `rose-visor` masks (floor 0.90). The check therefore
 proves that mask material is removed and plausible video is revealed; the saved
 PNGs show the face. It is not an exact-colour proof of identity, and for a treated
@@ -199,12 +203,12 @@ alpha ≤ 0.4. Raw and smoothed poses were measured over the same frames.
 | Measurement | Raw | Smoothed |
 | --- | --- | --- |
 | Slow-segment origin jitter, p95 second difference | 3.7–4.2 px | 1.5–2.3 px |
-| Slow-segment rotation jitter, p95 second difference | 2.4–2.6 deg | 1.0–1.4 deg |
+| Slow-segment rotation jitter, p95 second difference | 2.4–2.7 deg | 1.0–1.4 deg |
 | Slow-segment origin jitter reduction | — | 40–66% (gate ≤0.80× raw) |
-| Slow-segment rotation jitter reduction | — | 43–58% (gate ≤0.85× raw) |
+| Slow-segment rotation jitter reduction | — | 43–59% (gate ≤0.85× raw) |
 
 Recent runs measured smoothed origin 1.72–2.24 px (41.6–55.3% lower) and
-smoothed rotation 1.09–1.36 deg (43.8–57.9% lower), and the ranges above cover
+smoothed rotation 1.09–1.36 deg (43–59% lower), and the ranges above cover
 all of them.
 
 Across the full motion window, the adaptive gain prioritizes responsiveness.
@@ -229,9 +233,9 @@ a claim that the mask does not slide. The check samples the same documented wind
 a second time through the public **Pose smoothing** raw mode (the shadow smoother
 still runs), so the raw-mode p95 is measured over comparable recorded motion; the
 check reports it without asserting it, because only the rendered output is the
-user-visible path. Observed runs measured **raw-mode ~9–12 px** and rendered
+user-visible path. Observed runs measured **raw-mode ~9–13 px** and rendered
 ~12–16 px, so smoothing did **not** reduce this proxy metric (the rendered pass
-was about 3–77% higher across runs, consistent with filter lag and with
+was about 2–77% higher across runs, consistent with filter lag and with
 frame-timing differences between the two passes); the smoother's measured benefit
 is the slow-segment jitter reduction above, not sliding. The face-box centre itself
 shifts under yaw, so this is a proxy metric, not a ground-truth surface distance,

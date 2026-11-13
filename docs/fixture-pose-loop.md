@@ -66,10 +66,14 @@ side-view moment inside that window (yaw about −20° to −22°, measured at t
 frozen frame) and **16.0 s** (`OCCLUSION_CAPTURE_SECONDS_OPPOSITE`) as a second
 held side view in the opposite yaw direction (about +9° to +14° at the frozen
 frame). It holds
-each recorded frame and captures occlusion-on/off output PNGs for the bundled
-mask, `guard-visor` and `rose-visor`, plus the independent virtual-camera
-consumer, so the occlusion A/B covers both turn directions and the imported-mask
-camera path.
+each recorded frame and captures occlusion-on/off output PNGs. At the primary
+47.7 s view it covers the bundled mask, `guard-visor` and `rose-visor` in the
+preview, and the bundled mask and `guard-visor` through the independent
+virtual-camera consumer; `rose-visor` has no camera A/B. At the opposite 16.0 s
+view it covers the bundled mask and `guard-visor` in the preview and the bundled
+mask through the camera. So the A/B covers both turn directions in the preview
+(bundled and `guard-visor`) and the imported-mask camera path for `guard-visor`
+only.
 
 Gaps still relevant to later slices:
 

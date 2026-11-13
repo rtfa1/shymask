@@ -326,28 +326,30 @@ independent camera consumer:
     the bundled mask and `guard-visor` (there is no `rose-visor` camera A/B). The ON frame is also
     proved to reveal non-mask content: the imported package's exact unlit material colour covers ≥97%
     of the changed pixels in OFF and ≤3% in ON (observed 0.3–1.5%), while the bundled mask's dominant
-    rendered palette (top 64 exact shades, ≥90% coverage) does not reappear in ON (≤1%, observed 0).
+    rendered palette (top 64 exact shades, ≥90% coverage) does not reappear in ON (≤1%, observed
+    ≤0.1%, including 4 px in one opposite-view run).
     The ON changed pixels must additionally pass a plausible-video floor (mean luminance ≥30,
     luminance stddev ≥6, ≤10% near-black, ≥16 distinct colours), and for the untreated bundled mask
     and `rose-visor` ≥90% of sampled ON pixels must match the held replay frame drawn at the pipeline
-    scale (observed across recent runs: bundled ~125–128 mean luminance / ~33–36 stddev, `rose-visor`
-    ~150 / ~13–14, opposite-view bundled ~102–105 / ~40–41; held-replay match 0.94–0.97). This proves
-    mask material is removed and plausible video is revealed; the saved PNGs show the face, but it is
-    not an exact-colour proof of identity. The occlusion A/B therefore covers bundled and imported
-    masks through the same renderer path, in both turn directions.
+    scale (observed across recent runs: bundled ~125–130 mean luminance / ~32–36 stddev, `rose-visor`
+    ~149–151 / ~13–14.5, opposite-view bundled ~102–105 / ~40–41; held-replay match 0.93–0.97). This
+    proves mask material is removed and plausible video is revealed; the saved PNGs show the face, but
+    it is not an exact-colour proof of identity. The occlusion A/B therefore covers bundled and
+    imported masks through the same renderer path: both turn directions for the bundled mask and
+    `guard-visor`, and the primary view for `rose-visor`.
 30. Bounded face anchoring is measured against raw tracking on the same recorded frames. The initial
     ~2 s segment is measured, not assumed, to be slow (pose span about 5.6–8.5° yaw, 6–9° pitch, ~2°
     roll and 11–14 px origin, p50 alpha ~0.33–0.34; enforced bounds 10°/10°/5°, 30 px and p50 alpha
-    ≤0.4). Slow-segment p95 jitter drops from about 3.7–4.2 px / 2.4–2.6° raw to about 1.5–2.3 px /
-    1.0–1.4° smoothed (40–66% origin and 43–58% rotation lower; enforced gates smoothed ≤0.80× raw
+    ≤0.4). Slow-segment p95 jitter drops from about 3.7–4.2 px / 2.4–2.7° raw to about 1.5–2.3 px /
+    1.0–1.4° smoothed (40–66% origin and 43–59% rotation lower; enforced gates smoothed ≤0.80× raw
     origin and ≤0.85× raw rotation; recent runs measured 1.72–2.24 px / 41.6–55.3% origin and
-    1.09–1.36° / 43.8–57.9% rotation). Across the full
+    1.09–1.36° / 43–59% rotation). Across the full
     turn/nod/lean window the rendered mask origin's p95 sliding relative to the face-box centre is
     a bounded measured value of ~12–16 px (about 5–7% of face width; enforced bound 24 px;
     earlier runs up to ~20 px), not a claim that it does not slide. The same documented window is
     sampled again through the public raw Pose smoothing mode: observed runs measured raw-mode p95
-    ~9–12 px vs rendered ~12–16 px, so smoothing did not reduce this proxy metric (the rendered
-    pass was about 3–77% higher, consistent with filter lag and frame-timing differences); its
+    ~9–13 px vs rendered ~12–16 px, so smoothing did not reduce this proxy metric (the rendered
+    pass was about 2–77% higher, consistent with filter lag and frame-timing differences); its
     measured benefit is the slow-segment jitter reduction above. The face-box centre shifts under yaw,
     so the metric is a proxy and no correction is claimed: acceptance criterion 2's sliding is
     bounded, not corrected (jitter is reduced and clipping is addressed by the occluder). The raw
@@ -427,10 +429,10 @@ source clip 3.379 s:
 | Tracker inference, steady-state p95 | 13.2–13.8 ms per presented frame |
 | Tracker inference, first-call warm-up | ~0.28 s in recent runs; ~0.3–2.0 s observed across runs (excluded from the p95) |
 | Default-clip mask motion (~2.5 s sample) | origin moved ~7 px horizontally / ~3 px vertically; yaw ~3.5°, pitch ~2.1° (a longer manual sample saw ~12 × 23 px) |
-| Recorded motion-window swing (41.6–49.6 s) | enforced minimums yaw/pitch ≥12°, roll ≥4°, origin ≥40 px; observed across recent runs yaw ~24–29°, pitch ~23–35°, roll ~12–19°, mask origin ~91–99 × ~44–77 px, 17–18/18 sampled frames tracked (a representative run 27.0° / 28.9° / 17.8°, 98 × 60 px, 18/18); projected-origin sliding p95 ~12–16 px (bound 24 px; raw-mode ~9–12 px; earlier runs up to ~20 px rendered), raw origin-to-face-centre offset p95 ~29–34 px (bound 60 px) |
-| Slow-segment pose jitter, p95 | raw 3.7–4.2 px / 2.4–2.6° → smoothed 1.5–2.3 px / 1.0–1.4° (40–66% origin, 43–58% rotation lower; enforced gates smoothed ≤0.80× raw origin and ≤0.85× raw rotation; recent runs measured 1.72–2.24 px / 41.6–55.3% origin and 1.09–1.36° / 43.8–57.9% rotation; paired over the same frames). The segment is measured to be slow: about 5.6–8.5° yaw / 6–9° pitch / 2° roll span, 11–14 px origin, p50 alpha ~0.33–0.34 |
+| Recorded motion-window swing (41.6–49.6 s) | enforced minimums yaw/pitch ≥12°, roll ≥4°, origin ≥40 px; observed across recent runs yaw ~24–29°, pitch ~23–35°, roll ~12–19°, mask origin ~91–99 × ~44–77 px, 17–18/18 sampled frames tracked (a representative run 27.0° / 28.9° / 17.8°, 98 × 60 px, 18/18); projected-origin sliding p95 ~12–16 px (bound 24 px; raw-mode ~9–13 px; earlier runs up to ~20 px rendered), raw origin-to-face-centre offset p95 ~29–34 px (bound 60 px) |
+| Slow-segment pose jitter, p95 | raw 3.7–4.2 px / 2.4–2.7° → smoothed 1.5–2.3 px / 1.0–1.4° (40–66% origin, 43–59% rotation lower; enforced gates smoothed ≤0.80× raw origin and ≤0.85× raw rotation; recent runs measured 1.72–2.24 px / 41.6–55.3% origin and 1.09–1.36° / 43–59% rotation; paired over the same frames). The segment is measured to be slow: about 5.6–8.5° yaw / 6–9° pitch / 2° roll span, 11–14 px origin, p50 alpha ~0.33–0.34 |
 | Smoothing added lag / cost | p95 raw-vs-smoothed offset 3.6–4.3 px origin and 1.7–1.9° rotation; implied constant-velocity delay p95 60.2–61.6 ms; filter cost 0.1 ms p95. The ~50.9 ms reference-interval figure is not a global maximum (effective alpha ~0.34 at the observed ~35 ms interval) |
-| Occlusion A/B at two turned frames (47.7 s about −20° to −22°, 16.0 s about +9° to +14°) | bundled mask 15,705–17,414 px changed (89–94% inside the tracked-face bbox); `guard-visor` 5,319–5,700 px (92–96.5%); `rose-visor` 2,257–2,306 px (100%); same-state repeats pixel-identical. ON reveal is proved by exact colour: package material ≥97% of changed pixels in OFF and ≤3% in ON (observed 0.3–1.5%); bundled dominant palette ≥90% coverage and ≤1% reappearance in ON (observed 0) |
+| Occlusion A/B at two turned frames (47.7 s about −20° to −22°, 16.0 s about +9° to +14°) | bundled mask 15,705–17,414 px changed (89–94% inside the tracked-face bbox); `guard-visor` 5,319–5,700 px (92–96.5%); `rose-visor` 2,257–2,306 px (100%); same-state repeats pixel-identical. ON reveal is proved by exact colour: package material ≥97% of changed pixels in OFF and ≤3% in ON (observed 0.3–1.5%); bundled dominant palette ≥90% coverage and ≤1% reappearance in ON (observed ≤0.1%, including 4 px in one opposite-view run) |
 | Occlusion camera A/B | the independent consumer received the same change on the held frame: total and inside-bbox pixel counts are asserted equal to the preview's for the bundled mask and `guard-visor`, with 0 same-state self-diff |
 | Loop cycles observed | 3 seam crossings inside an 8.27 s sampling window |
 | Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
