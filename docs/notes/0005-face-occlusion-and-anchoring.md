@@ -1,4 +1,4 @@
-# Face occlusion and bounded mask anchoring (issue #6)
+# Face occlusion and bounded face anchoring (issue #6)
 
 This note records the face-occlusion method, the bounded pose smoother, the
 measured replay-based behavior on recorded turns/nods/leaning, and the remaining
@@ -54,16 +54,18 @@ tracker matrix:
 - the per-sample gain is `baseAlpha = 0.45` at rest and rises linearly to `1` as
   measured face speed approaches **360 deg/s** or **60 cm/s**. Slow tracking
   noise is therefore damped, while a real fast turn/nod is passed through;
-- the gain is normalized to the presented frame interval (`1000/24 ms`), and a
-  long gap (>250 ms), the first sample, or leaving the `tracking` phase snaps
-  instead of smoothing from stale state;
+- the gain is normalized to the presented frame interval (`1000/24 ms`), so the
+  effective per-sample alpha at the observed ~35 ms interval is about 0.34 rather
+  than the 0.45 base gain; a long gap (>250 ms), the first sample, or leaving the
+  `tracking` phase snaps instead of smoothing from stale state;
 - hard caps move the filter toward the raw pose if the measured offset would
   exceed **4 cm** translation or **8 deg** rotation. The normal adaptive gain
   stays far below these caps; they make the lag bound independent of the
   recorded motion;
-- the constant-velocity lag is bounded by
-  `(1 - 0.45) / 0.45 × frame interval ≈ 51 ms` at 24 Hz. At the observed p95
-  frame interval of ~35 ms the implied delay p95 was ~61 ms; the filter itself
+- the constant-velocity lag of the base gain at the 24 Hz **reference interval**
+  is `(1 - 0.45) / 0.45 × reference frame interval ≈ 51 ms`; this is a
+  reference-interval figure, not a global maximum. At the observed p95 frame
+  interval of ~35 ms the implied delay p95 was **~61 ms**, and the filter itself
   costs ~0.1 ms p95.
 
 The smoother is applied only to matrices the tracking state machine accepted as
@@ -92,58 +94,96 @@ Hardware and source are the same development desktop and fixtures as note 0003
 0.10.21 GPU delegate; Three.js 0.180.0). The recorded clip is `pose-loop-v1`.
 Measurements below are observations, not performance-target claims.
 
-### Occlusion A/B, 47.7 s side-view frame (yaw about −21°)
+### Occlusion A/B on two side-view frames (yaw about −20° to −22° and +9° to +14°)
 
-Each state was captured twice through the public control; the two same-state
-PNGs were pixel-identical (self-diff 0). Disabling only the occluder changed
-these many pixels, almost all on the tracked face:
+The primary held frame is 47.7 s (yaw about −20° to −22° across runs). A second
+held frame at 16.0 s has yaw in the opposite direction (about +9° to +14° at the
+frozen frame), so the A/B covers both turn directions. Each state was captured
+twice through the public control; the two same-state PNGs were pixel-identical
+(self-diff 0). Disabling only the occluder changed these many pixels, required to
+be at least 88% inside the tracked face's **axis-aligned bounding box** and at
+least 1,500 px inside it:
 
-| Mask | Changed pixels | Inside tracked face | Notes |
+| Mask | Changed pixels | Inside tracked face bbox | Notes |
 | --- | --- | --- | --- |
 | Bundled procedural helmet | 15,705–16,146 | 89.4–91.0% | preview and independent camera PNGs matched; 0 self-diff |
-| `guard-visor` package (mask + treatment) | 5,319–5,441 | 94.9–96.0% | imported through **Import package…** |
+| `guard-visor` package (mask + treatment) | 5,319–5,441 | 94.5–96.5% | imported through **Import package…**; camera A/B too |
 | `rose-visor` package (mask only, nonzero attachment) | 2,257–2,306 | 100.0% | imported through **Import package…** |
 
-The facing view and the turned view are deliberately different: the turned view
-shows the face/hair silhouette cutting into the helmet shell where the mask
-geometry would otherwise draw through the forehead/cheek. See the evidence PNGs
-`28-*-occlusion-on.png` / `28-*-occlusion-off.png` in the check run directory.
-The independent Media Foundation consumer received the identical occlusion
-change (same pixel count and inside-face fraction) from the same held frame.
+The table is the primary 47.7 s frame. The second angle applies the same gates and
+across runs recorded 17,250–17,414 changed bundled pixels (91.0–93.8% inside the
+bounding box) and 5,510–5,700 changed `guard-visor` pixels. The facing view and
+the turned views are deliberately different: the turned frames show the canonical
+face region cutting into the helmet shell where mask geometry would otherwise
+draw through the forehead/cheek. The bounding box is a rectangular proxy for the
+face region, not a hand-drawn silhouette and not the hairline. See the evidence
+PNGs `28-*-occlusion-on.png` / `28-*-occlusion-off.png` and
+`28b-*-occlusion-on.png` / `28b-*-occlusion-off.png` in the check run directory.
+
+Each A/B also proves positively that the ON state reveals non-mask content where
+the OFF state drew mask material. For the imported packages the exact unlit
+material colour covers at least 99% of the changed face-box pixels in OFF and at
+most 1.5% of the same pixels in ON (enforced ≥97% / ≤3%). The bundled procedural
+mask uses lit materials, so the check takes the dominant exact OFF-frame mask
+colours from the changed region (top 64 shades, at least 90% coverage) and
+requires that none of them reappear in ON at those pixels (at most 1%; observed
+0). This is an exact-colour proof of reveal, not a claim that the whole bbox is
+face. The independent Media Foundation consumer received exactly the same change
+(same total and same inside-bbox pixel count) from the same held frame; that
+equality is asserted, not just recorded.
 
 Because face occlusion can legitimately hide the packaged mask's
-bounding-box-centre probe, the package scenario now proves composition by
-counting the package's exact unlit material colour in exact 1280×720 preview and
-camera PNGs (guard: >31,000 pixels; rose: >38,000). The probe pixel is still
-asserted whenever it is visible, and the probe colour metadata is always checked.
+bounding-box-centre probe, the preview probe pixel is asserted only when it is
+the declared mask colour, and the camera probe is asserted under the same
+condition. Composition is proved independently by counting the package's exact
+unlit material colour in exact 1280×720 preview and camera PNGs (enforced
+>20,000 for guard and >25,000 for rose; observed about 31,000–33,000 and
+38,000–39,000 across recent runs). The probe colour metadata is always checked.
 
 ### Jitter and added lag (recorded turns/nods/leaning)
 
-The low-motion part of the documented 41.6 s window (about 1.5–2 s) is where
-tracking noise dominates; the full 8 s window covers turns, nods and leaning.
-Raw and smoothed poses were measured over the same frames.
+The initial segment of the documented 41.6 s window is a slow segment, not a
+stationary one. The check measures it rather than assuming it: over the ~2 s
+segment the mask pose spanned about 5.8–8.5° yaw, 5–9° pitch and ~2° roll with
+11–14 px origin movement, and the filter p50 gain stayed at ~0.33–0.34 (near the
+base gain at the observed frame interval). The bounds enforced for calling it a
+slow jitter segment are 10° yaw, 10° pitch, 5° roll, 30 px origin and p50
+alpha ≤ 0.4. Raw and smoothed poses were measured over the same frames.
 
 | Measurement | Raw | Smoothed |
 | --- | --- | --- |
-| Low-motion origin jitter, p95 second difference | 3.7–4.3 px | 1.4–2.1 px |
-| Low-motion rotation jitter, p95 second difference | 2.4–2.6 deg | 1.1–1.4 deg |
-| Low-motion origin jitter reduction | — | 44–66% |
-| Low-motion rotation jitter reduction | — | 44–56% |
+| Slow-segment origin jitter, p95 second difference | 3.7–4.2 px | 1.5–2.3 px |
+| Slow-segment rotation jitter, p95 second difference | 2.4–2.6 deg | 1.0–1.4 deg |
+| Slow-segment origin jitter reduction | — | 40–66% (gate ≤0.80× raw) |
+| Slow-segment rotation jitter reduction | — | 43–58% (gate ≤0.85× raw) |
+
+Recent runs measured smoothed origin 1.72–2.23 px (41.6–55.3% lower) and
+smoothed rotation 1.09–1.36 deg (43.8–57.9% lower), and the ranges above cover
+all of them.
 
 Across the full motion window, the adaptive gain prioritizes responsiveness.
-The measured added offset was p95 **3.6–4.2 px** origin and **1.7–1.9 deg**
-rotation, with an implied constant-velocity delay p95 of **60.6–61.3 ms** and a
+The measured added offset was p95 **3.6–4.3 px** origin and **1.7–1.9 deg**
+rotation, with an implied constant-velocity delay p95 of **60.2–61.6 ms** and a
 filter cost p95 of **0.1 ms**. The 8 s window tracked 17–18 of 18 sampled frames
-and produced yaw 26.4–28.8°, pitch 24.9–29.7°, roll 13.3–18.0° and 95–98 ×
-48–77 px mask-origin movement, with the mask inside the tracked face at every
-sample.
+and produced yaw 26–30°, pitch 22–36°, roll 12–19° and 94–100 × 44–77 px
+mask-origin movement. The mask origin stayed inside the tracked face
+bounding box expanded by 35% of its width/height at every sample.
+
+Sliding is quantified over the same motion window: the p95 deviation of the
+projected mask origin from its median offset to the tracked face-box centre was
+about **12–20 px** (about 5–9% of face width; enforced bound 24 px), and the
+raw origin-to-face-centre offset p95 was about **30–34 px** (enforced bound
+60 px). The clipping metric is the mask pixels removed inside the face bounding
+box by the occluder in each A/B (at least 1,500 px; observed 2.3k–17.3k depending
+on mask and angle).
 
 ## Supported motion limits and remaining limitations
 
 - **Recorded coverage:** the pinned motion window contains turns/nods/leaning up
-  to about 29° yaw, 29° pitch and 18° roll at this framing. Faster or more
-  extreme motion is handled by the adaptive gain and hard caps but is not
-  evidenced by this clip.
+  to about 29° yaw, 31° pitch and 19° roll at this framing, and the occlusion A/B
+  adds a held side view in the opposite yaw direction (about +9° to +14°). Faster, more
+  extreme or intermediate poses are handled by the adaptive gain and hard caps
+  but are not evidenced by this clip.
 - **Replay only:** no physical-camera or live-human evidence exists in this
   slice. Camera-sensor, call-network and real Zoom/Meet/OBS behavior remain for
   final live acceptance.
@@ -153,13 +193,24 @@ sample.
   large expression (for example a wide open mouth) is not reconstructed; the
   mask is rigid as well. Hand-over-mask occlusion is explicitly out of scope, as
   is secondary motion (issue #8) and distortion (issue #7).
-- **Residual visual artifacts:** at extreme poses the rigid mask can still
-  partially intersect the face silhouette or leave a thin visible edge; the
-  occluder hides depth-behind-face fragments, not every possible authoring
-  mistake in a mask.
+- **Face surface only:** the occluder has no hair, ears, neck or full head
+  silhouette. Mask geometry that passes through those regions, or through the
+  head outline outside the canonical face surface, is not hidden by this
+  occluder. The A/B evidence covers the face region as a bounding-box proxy, not
+  a hand-drawn head mask.
+- **Residual visual artifacts:** the check quantifies clipping removal (the mask
+  pixels removed inside the tracked face bounding box) at two recorded side
+  views in opposite yaw directions; it does not prove clean occlusion at poses
+  outside the recorded coverage. At such extreme poses the rigid mask can still
+  partially intersect the face surface or leave a thin visible edge, and the
+  occluder hides depth-behind-face fragments rather than every possible
+  authoring mistake in a mask.
 - **No prediction:** smoothing is a filter, not motion prediction. The measured
-  60.8–61.3 ms implied delay plus tracker/render cost is below the 100 ms
+  60.2–61.6 ms implied delay plus tracker/render cost is below the 100 ms
   processing budget on this desktop, but the budget is not a final live claim.
+  The ~50.9 ms reference-interval figure reported alongside the filter is not a
+  global maximum; the effective alpha at the observed ~35 ms frame interval is
+  about 0.34.
 - **Policy unchanged:** tracking loss, unreliable tracking, multiple faces,
   manual pause, switching, startup and processing failures still replace the
   entire output with the opaque paused screen in preview and camera. The

@@ -22,13 +22,20 @@
  *
  *   (1 - BASE_ALPHA) / BASE_ALPHA * frame interval
  *
- * (about 51 ms at 24 Hz with `BASE_ALPHA = 0.45`). A safety cap additionally
- * snaps the filter toward the raw pose if a measured offset ever exceeds
- * `MAX_TRANSLATION_LAG_CM` / `MAX_ROTATION_LAG_DEG`.
+ * (about 51 ms at the 24 Hz reference interval with `BASE_ALPHA = 0.45`). That
+ * 51 ms figure is a reference-interval bound, not a global maximum: the gain is
+ * normalized to `referenceFrameMs`, so at the observed ~35 ms presented-frame
+ * interval the effective per-sample gain is about 0.34 and the measured
+ * constant-velocity ramp lag is about 61 ms (reported separately from this
+ * reference bound). A safety cap additionally snaps the filter toward the raw
+ * pose if a measured offset ever exceeds `MAX_TRANSLATION_LAG_CM` /
+ * `MAX_ROTATION_LAG_DEG`.
  *
- * The module is pure (no Three.js or DOM dependency) so the math, the bound and
- * the reset behavior are unit-tested without a WebGL context. Rotation is
- * smoothed as a quaternion (shortest arc) and translation component-wise.
+ * The transform math is self-contained (no Three.js or DOM-rendering
+ * dependency), but this class is stateful: `push()` retains the previous pose and
+ * calls `performance.now()` for its cost metric. The math, the bound and the
+ * reset behavior are unit-tested without a WebGL context. Rotation is smoothed
+ * as a quaternion (shortest arc) and translation component-wise.
  */
 
 export const POSE_SMOOTHING_LIMITS = {
@@ -258,8 +265,14 @@ export class PoseSmoother {
   private stats: PoseFilterStats = { ...EMPTY_STATS };
   private sampleCount = 0;
 
-  /** Worst-case constant-velocity delay of the base gain at the reference frame interval. */
-  get maxRampLagMs(): number {
+  /**
+   * Constant-velocity delay of the base gain at the reference frame interval
+   * (about 51 ms at 24 Hz). This is not a global maximum: the gain is normalized
+   * to `referenceFrameMs`, so a longer presented-frame interval produces a
+   * proportionally larger ramp lag. The measured p95 at the observed interval is
+   * reported separately as `rampLagMs`.
+   */
+  get referenceRampLagMs(): number {
     return ((1 - POSE_SMOOTHING_LIMITS.baseAlpha) / POSE_SMOOTHING_LIMITS.baseAlpha) *
       POSE_SMOOTHING_LIMITS.referenceFrameMs;
   }

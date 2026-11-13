@@ -17,7 +17,7 @@
 export const CANONICAL_FACE_VERTEX_COUNT = 468;
 export const CANONICAL_FACE_TRIANGLE_COUNT = 898;
 
-/** Column-major xyz triplets in centimetres, canonical face space. */
+/** Flat xyz triplets (three consecutive values per vertex), canonical face space. */
 export const CANONICAL_FACE_POSITIONS: readonly number[] = [
   0, -3.406404, 5.979507, 0, -1.126865, 7.475604,
   0, -2.089024, 6.058267, -0.463928, 0.955357, 6.633583,

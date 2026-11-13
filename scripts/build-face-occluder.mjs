@@ -97,7 +97,7 @@ const moduleSource = `/**
 export const CANONICAL_FACE_VERTEX_COUNT = ${vertexCount};
 export const CANONICAL_FACE_TRIANGLE_COUNT = ${triangleCount};
 
-/** Column-major xyz triplets in centimetres, canonical face space. */
+/** Flat xyz triplets (three consecutive values per vertex), canonical face space. */
 export const CANONICAL_FACE_POSITIONS: readonly number[] = [
 ${format(positions, 6)}
 ];

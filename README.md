@@ -3,7 +3,7 @@
 Shymask applies visual effects to a webcam feed and publishes the result as a virtual webcam. This
 repository currently delivers a **recorded-replay preview** (issue #2), the **Windows 11 virtual
 camera** (issue #3), **one-face tracking with a basic rigid 3D mask** (issue #4), **imported,
-validated effect packages** (issue #5), and **face-based occlusion with bounded mask anchoring**
+validated effect packages** (issue #5), and **face-based occlusion with bounded face anchoring**
 (issue #6): a desktop
 preview loops a recorded webcam-style clip at real-time pacing, tracks exactly one face, attaches a
 procedural low-poly mask to that face, hides mask geometry behind the face, displays a selectable
@@ -293,10 +293,11 @@ independent camera consumer:
     removal, and that acceptance is recorded explicitly.
 19. Face-tracker assets are validated before Start; the model is ready and the recorded replay
     produces exactly one face with full landmarks and a transform.
-20. The rigid mask is attached to the tracked face (origin inside the face bounding box, sized to
-    it) and the output pixel at its cyan eye plate is the exact mask colour.
+20. The rigid mask is attached to the tracked face (origin inside the face bounding box expanded
+    by 35% of its width/height, sized to it) and the output pixel at its cyan eye plate is the exact
+    mask colour when the probe is visible.
 21. Mask position and orientation change with the recorded head motion, frame by frame, while the
-    mask stays on the face.
+    mask origin stays inside the expanded tracked-face bounding box.
 22. The camera consumer receives the same masked canvas: its saved PNG mean matches the preview and
     contains the mask eye plate at the expected probe colour.
 23. Injected tracking loss replaces the whole output with the exact opaque paused screen in preview
@@ -311,21 +312,35 @@ independent camera consumer:
 28. On the second recorded CC0 clip, a documented 8 s window with real turns, nods and leaning keeps
     exactly one face tracked and moves/rotates the mask by at least 12° of yaw and pitch and 40 px of
     origin movement, with screenshots at three points in the turn.
-29. Face occlusion is active in the normal preview and camera path. On a held side-view frame (47.7 s
-    of the motion clip), disabling only the depth-only canonical face occluder changes ~16k pixels
-    for the bundled mask (~90% on the tracked face), ~5.4k for `guard-visor` and ~2.3k for
-    `rose-visor` (~95–100% on the face); two captures of the same state are pixel-identical, and the
-    independent camera receives the identical change for the same held frame. The occlusion A/B
-    therefore covers bundled and imported masks through the same renderer path.
-30. Bounded pose smoothing is measured against raw tracking on the same recorded frames: low-motion
-    p95 jitter drops from about 3.7–4.3 px / 2.4–2.6° to about 1.4–2.1 px / 1.1–1.4° (roughly 44–66%
-    lower), while the full turn/nod/lean window reports p95 raw-vs-smoothed offsets around 3.6–4.2 px
-    / 1.7–1.9° and an implied constant-velocity delay p95 of ~61 ms. The filter costs ~0.1 ms p95.
+29. Face occlusion is active in the normal preview and camera path. Two held side-view frames in
+    opposite yaw directions (47.7 s, about −20° to −22°, and 16.0 s, about +9° to +14°) are compared
+    with only the depth-only canonical face occluder disabled: the bundled mask changes
+    ~15.7k–17.4k pixels, with 88%+ inside the tracked-face **bounding box** (~89–94%), ~5.3k–5.7k for
+    `guard-visor` and ~2.3k for `rose-visor` (~92–100% inside that bbox); two captures of the same
+    state are pixel-identical, and the independent camera's total and inside-bbox change counts are
+    asserted equal to the preview's. The ON frame is also proved to reveal non-mask content: the
+    imported package's exact unlit material colour covers ≥97% of the changed pixels in OFF and ≤3%
+    in ON (observed 0.3–1.5%), while the bundled mask's dominant rendered palette (top 64 exact
+    shades, ≥90% coverage) does not reappear in ON (≤1%, observed 0). The occlusion A/B therefore
+    covers bundled and imported masks through the same renderer path, in both turn directions.
+30. Bounded face anchoring is measured against raw tracking on the same recorded frames. The initial
+    ~2 s segment is measured, not assumed, to be slow (pose span about 5.8–8° yaw, 5–9° pitch, ~2°
+    roll and 11–14 px origin, p50 alpha ~0.33–0.34; enforced bounds 10°/10°/5°, 30 px and p50 alpha
+    ≤0.4). Slow-segment p95 jitter drops from about 3.7–4.2 px / 2.4–2.6° raw to about 1.5–2.3 px /
+    1.0–1.4° smoothed (40–66% origin and 43–58% rotation lower; enforced gates smoothed ≤0.80× raw
+    origin and ≤0.85× raw rotation; recent runs measured 1.72–2.23 px / 41.6–55.3% origin and
+    1.09–1.36° / 43.8–57.9% rotation). Across the full
+    turn/nod/lean window the projected mask origin's p95 sliding relative to the face-box centre is
+    ~12–20 px (about 5–9% of face width; bound 24 px), the raw origin-to-centre offset p95 is
+    ~30–34 px (bound 60 px), and the p95 raw-vs-smoothed lag is ~3.6–4.3 px / ~1.7–1.9° with a
+    ~60–62 ms constant-velocity delay; the filter costs ~0.1 ms p95.
 31. A valid generated package imports through the public **Import package…** control (only the OS file
     picker is stubbed), appears in the Effect selector, and renders its packaged GLB mask + declared
     color treatment in the preview. The exact unlit material colour appears in exact 1280×720 preview
-    and camera PNGs, so the packaged asset — not the bundled mask — is composited. Face occlusion can
-    hide the bounding-box-centre probe; the probe pixel is asserted when visible.
+    and camera PNGs (enforced >20,000 px for guard and >25,000 for rose, observed ~31k–33k and
+    ~38k–39k), so the packaged asset — not the bundled mask — is composited. Face occlusion can hide
+    the bounding-box-centre probe; the preview probe is asserted when visible, and the camera probe
+    is asserted under the same condition.
 32. The independent camera consumer receives the same imported mask + treatment: its saved PNG mean
     matches the preview and contains the package material colour.
 33. A color-treatment-only package visibly changes the preview and camera output through the same path.
@@ -387,11 +402,11 @@ source clip 3.379 s:
 | Tracker inference, steady-state p95 | 13.2–13.8 ms per presented frame |
 | Tracker inference, first-call warm-up | ~0.28 s in recent runs; ~0.3–2.0 s observed across runs (excluded from the p95) |
 | Default-clip mask motion (~2.5 s sample) | origin moved ~7 px horizontally / ~3 px vertically; yaw ~3.5°, pitch ~2.1° (a longer manual sample saw ~12 × 23 px) |
-| Recorded motion-window swing (41.6–49.6 s) | yaw 26.4–28.8°, pitch 24.9–29.7°, roll 13.3–18.0°, mask origin 95–98 × 48–77 px, 17–18/18 sampled frames tracked across recent runs |
-| Low-motion pose jitter, p95 | raw 3.7–4.3 px / 2.4–2.6° → smoothed 1.4–2.1 px / 1.1–1.4° (44–66% lower; paired over the same frames) |
-| Smoothing added lag / cost | p95 raw-vs-smoothed offset 3.6–4.2 px origin and 1.7–1.9° rotation; implied constant-velocity delay p95 60.6–61.3 ms; filter cost 0.1 ms p95 |
-| Occlusion A/B on the 47.7 s turned frame | bundled mask 15,705–16,146 px changed (89.4–91.0% on the tracked face); `guard-visor` 5,319–5,441 px (94.9–96.0%); `rose-visor` 2,257–2,306 px (100%); same-state repeats pixel-identical |
-| Occlusion camera A/B | the independent consumer received the identical change on the held frame (same pixel count and inside-face fraction, 0 self-diff) |
+| Recorded motion-window swing (41.6–49.6 s) | yaw 26–30°, pitch 22–36°, roll 12–19°, mask origin 94–100 × 44–77 px, 17–18/18 sampled frames tracked across recent runs; projected-origin sliding p95 ~12–20 px (bound 24 px), raw origin-to-face-centre offset p95 ~30–34 px (bound 60 px) |
+| Slow-segment pose jitter, p95 | raw 3.7–4.2 px / 2.4–2.6° → smoothed 1.5–2.3 px / 1.0–1.4° (40–66% origin, 43–58% rotation lower; enforced gates smoothed ≤0.80× raw origin and ≤0.85× raw rotation; recent runs measured 1.72–2.23 px / 41.6–55.3% origin and 1.09–1.36° / 43.8–57.9% rotation; paired over the same frames). The segment is measured to be slow: about 5.8–8.5° yaw / 5–9° pitch / 2° roll span, 11–14 px origin, p50 alpha ~0.33–0.34 |
+| Smoothing added lag / cost | p95 raw-vs-smoothed offset 3.6–4.3 px origin and 1.7–1.9° rotation; implied constant-velocity delay p95 60.2–61.6 ms; filter cost 0.1 ms p95. The ~50.9 ms reference-interval figure is not a global maximum (effective alpha ~0.34 at the observed ~35 ms interval) |
+| Occlusion A/B at two turned frames (47.7 s about −20° to −22°, 16.0 s about +9° to +14°) | bundled mask 15,705–17,414 px changed (89–94% inside the tracked-face bbox); `guard-visor` 5,319–5,700 px (92–96.5%); `rose-visor` 2,257–2,306 px (100%); same-state repeats pixel-identical. ON reveal is proved by exact colour: package material ≥97% of changed pixels in OFF and ≤3% in ON (observed 0.3–1.5%); bundled dominant palette ≥90% coverage and ≤1% reappearance in ON (observed 0) |
+| Occlusion camera A/B | the independent consumer received the same change on the held frame: total and inside-bbox pixel counts are asserted equal to the preview's for the bundled mask and `guard-visor`, with 0 same-state self-diff |
 | Loop cycles observed | 3 seam crossings inside an 8.27 s sampling window |
 | Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
 | Replay pacing ratio | 1.004 processing time / wall time in this run |
@@ -400,12 +415,13 @@ Effect-package evidence from the same run (replay-based): the committed `guard-v
 1,715-byte archive with 2 entries and a 693-byte manifest, containing a 2,284-byte GLB with 96
 triangles, 1 mesh, 1 material and 1 node; `verdant-tint` is a 397-byte color-only archive. The
 imported mask's unlit material colour (RGB 225,29,154) appears in exact 1280×720 preview and camera
-PNGs (about 31,000 pixels in recent runs), so the packaged asset is composited through the shared
-path. Face occlusion can legitimately hide the package's bounding-box-centre probe; the probe pixel
-is asserted when it is visible and the exact material-colour count is always asserted.
+PNGs (about 31,000–33,000 pixels in recent runs; enforced >20,000), so the packaged asset is
+composited through the shared path. Face occlusion can legitimately hide the package's
+bounding-box-centre probe; the preview probe is asserted when visible, the camera probe is asserted
+under the same condition, and the exact material-colour count is always asserted.
 `rose-visor` is a mask-only sample with nonzero `position`/`rotationDeg`/`scale` whose distinct
-material colour (RGB 32,196,128) is asserted in both preview and camera (about 38,000 pixels), and a
-rapid double switch must leave only the later package's mask committed.
+material colour (RGB 32,196,128) is asserted in both preview and camera (about 38,000–40,000 pixels;
+enforced >25,000), and a rapid double switch must leave only the later package's mask committed.
 Package complexity is reported, not budgeted; no triangle/mesh threshold is asserted.
 
 Replay-derived tracking measurements from the same run are documented in
@@ -420,9 +436,10 @@ numbers are replay-derived. They do **not** establish the parent spec's 720p/30 
 camera-to-output target, physical-camera compatibility, tracking on a physical camera, call-application
 compatibility, or laptop integrated-graphics suitability. The camera latency includes the app's ~30 Hz
 publish cadence (a frame waits up to one 33 ms sample slot), so p95 is dominated by pacing rather than
-transport. The mask has face-based occlusion and bounded pose smoothing but no secondary motion; the
-canonical face occluder is rigid and does not deform with expressions, and the policy cannot detect
-every possible visual defect. See `docs/notes/0001-preview-stack-and-loop.md`,
+transport. The mask has face-based occlusion and bounded face anchoring but no secondary motion; the
+canonical face occluder is rigid, has no hair/ears/neck or full head silhouette, and does not deform
+with expressions, and the policy cannot detect every possible visual defect. See
+`docs/notes/0001-preview-stack-and-loop.md`,
 `docs/notes/0002-windows-virtual-camera-spike.md`,
 `docs/notes/0003-face-tracking-and-mask.md` and
 `docs/notes/0005-face-occlusion-and-anchoring.md`.

@@ -160,7 +160,7 @@ test('fast recorded motion passes through without added lag', () => {
   assert.ok(stats.translationLagCm < 0.05, `fast motion must not trail, got ${stats.translationLagCm}cm`);
 });
 
-test('constant-velocity lag is bounded by the documented base-gain bound', () => {
+test('constant-velocity lag is bounded by the documented base-gain reference bound', () => {
   const smoother = new PoseSmoother();
   const frameMs = 1000 / 24;
   // Slow constant motion: the adaptive gain stays near the base gain.
@@ -168,8 +168,8 @@ test('constant-velocity lag is bounded by the documented base-gain bound', () =>
   const stats = smoother.lastStats;
   assert.ok(stats.alpha >= POSE_SMOOTHING_LIMITS.baseAlpha - 1e-9);
   assert.ok(
-    stats.rampLagMs <= smoother.maxRampLagMs + 1,
-    `ramp lag ${stats.rampLagMs}ms must stay under the documented ${smoother.maxRampLagMs}ms bound`,
+    stats.rampLagMs <= smoother.referenceRampLagMs + 1,
+    `ramp lag ${stats.rampLagMs}ms must stay under the documented ${smoother.referenceRampLagMs}ms reference-interval bound`,
   );
   assert.ok(stats.translationLagCm <= POSE_SMOOTHING_LIMITS.maxTranslationLagCm);
 });

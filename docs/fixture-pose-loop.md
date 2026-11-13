@@ -62,9 +62,14 @@ clip in 0.4 s steps and maximizing the pose spread, then pinned in the check as
 `MOTION_WINDOW_START_SECONDS`.
 
 The public check also pins **47.7 s** (`OCCLUSION_CAPTURE_SECONDS`) as a
-side-view moment inside that window (yaw about −21 degrees). It holds that
-recorded frame and captures occlusion-on/off output PNGs for the bundled mask,
-`guard-visor` and `rose-visor`, plus the independent virtual-camera consumer.
+side-view moment inside that window (yaw about −20° to −22°, measured at the
+frozen frame) and **16.0 s** (`OCCLUSION_CAPTURE_SECONDS_OPPOSITE`) as a second
+held side view in the opposite yaw direction (about +9° to +14° at the frozen
+frame). It holds
+each recorded frame and captures occlusion-on/off output PNGs for the bundled
+mask, `guard-visor` and `rose-visor`, plus the independent virtual-camera
+consumer, so the occlusion A/B covers both turn directions and the imported-mask
+camera path.
 
 Gaps still relevant to later slices:
 
