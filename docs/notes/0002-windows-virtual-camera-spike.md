@@ -151,16 +151,16 @@ controls and an independent Media Foundation consumer process:
 
 ### Measured baseline (replay-based, virtual camera)
 
-From the passing `npm run check` run at the head containing this note (the check summary records
-the exact SHA), source clip 3.379 s, Windows 11 Pro 26100, i7-11700K / RTX 3070 Ti / 31.8 GiB,
-Electron 45.3.1:
+From a passing `npm run check` run on 2026-11-13 (run-to-run variation is expected; the check
+summary records the exact head SHA of the run it cites), source clip 3.379 s, Windows 11 Pro 26100,
+i7-11700K / RTX 3070 Ti / 31.8 GiB, Electron 45.3.1:
 
 | Measurement | Value |
 | --- | --- |
 | Camera media type | RGB32 1280×720 @ 30/1 |
-| Camera frames observed | 212 over 6.75 s (30.5 Hz sample rate) |
-| Camera frame interval, p95 | 48 ms |
-| Replay-to-camera latency, p50 / p95 | 31 ms / 54 ms (canvas capture time → consumer receive time) |
+| Camera frames observed | 212 over 6.68 s (30.4 Hz sample rate) |
+| Camera frame interval, p95 | 47 ms |
+| Replay-to-camera latency, p50 / p95 | 32 ms / 56 ms (canvas capture time → consumer receive time) |
 | Camera mean-RGB spread across the window | 19 (replay content changes across loops) |
 | Replay loops crossed during the camera window | 2 |
 | Preview source frame interval, p95 | ~42–49 ms across passing runs (~21–24 Hz replay) |

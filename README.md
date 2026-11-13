@@ -194,16 +194,16 @@ source clip 3.379 s:
 | Measurement | Value |
 | --- | --- |
 | Camera media type | RGB32 1280×720 @ 30/1 |
-| Camera frames observed | 212 over 6.75 s (30.5 Hz sample rate) |
-| Camera frame interval, p95 | 48 ms |
-| Replay-to-camera latency, p50 / p95 | 31 ms / 54 ms (canvas capture time → consumer receive time) |
+| Camera frames observed | 212 over 6.68 s (30.4 Hz sample rate) |
+| Camera frame interval, p95 | 47 ms |
+| Replay-to-camera latency, p50 / p95 | 32 ms / 56 ms (canvas capture time → consumer receive time) |
 | Camera mean-RGB spread across the window | 19 (replay content changes across loops) |
 | Replay loops crossed during the camera window | 2 |
-| Source frame interval, p95 | 48.5 ms in this run; ~42–49 ms across passing runs (the clip presents at ~21–24 Hz here; no 30 FPS forcing) |
+| Source frame interval, p95 | 42 ms in this run; ~42–49 ms across passing runs (the clip presents at ~21–24 Hz here; no 30 FPS forcing) |
 | Render + filter cost, p95 | 0.40 ms (main-thread draw/filter submission with no camera consumer; a connected camera adds canvas readback) |
-| Loop cycles observed | 3 seam crossings inside an 8.88 s sampling window |
+| Loop cycles observed | 3 seam crossings inside a 9.29 s sampling window |
 | Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
-| Replay pacing ratio | 0.987 processing time / wall time in this run |
+| Replay pacing ratio | 0.979 processing time / wall time in this run |
 
 Run-to-run variation is expected under desktop load; these are observations, not benchmarks. The
 numbers are replay-derived. They do **not** establish the parent spec's 720p/30 FPS / ≤100 ms
