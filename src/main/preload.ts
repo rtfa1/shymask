@@ -1,5 +1,12 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import type { CaptureResult, FixtureInfo, ShymaskBridge, StartupInfo } from '../core/bridge';
+import type {
+  CameraFrame,
+  CaptureResult,
+  FixtureInfo,
+  ShymaskBridge,
+  StartupInfo,
+  VirtualCameraStatus,
+} from '../core/bridge';
 
 const bridge: ShymaskBridge = {
   getStartupInfo(): Promise<StartupInfo> {
@@ -10,6 +17,24 @@ const bridge: ShymaskBridge = {
   },
   captureOutputPng(dataUrl: string): Promise<CaptureResult> {
     return ipcRenderer.invoke('shymask:capture-output', dataUrl) as Promise<CaptureResult>;
+  },
+  publishCameraFrame(frame: CameraFrame): void {
+    // Structured clone to the main process; main forwards it to the native
+    // media source over the loopback frame transport.
+    ipcRenderer.send('shymask:camera-frame', frame);
+  },
+  getVirtualCameraStatus(): Promise<VirtualCameraStatus> {
+    return ipcRenderer.invoke('shymask:vcam-status') as Promise<VirtualCameraStatus>;
+  },
+  restartVirtualCamera(): Promise<VirtualCameraStatus> {
+    return ipcRenderer.invoke('shymask:vcam-restart') as Promise<VirtualCameraStatus>;
+  },
+  onVirtualCameraStatus(listener: (status: VirtualCameraStatus) => void): () => void {
+    const handler = (_event: Electron.IpcRendererEvent, status: VirtualCameraStatus): void => {
+      listener(status);
+    };
+    ipcRenderer.on('shymask:vcam-status', handler);
+    return () => ipcRenderer.removeListener('shymask:vcam-status', handler);
   },
 };
 

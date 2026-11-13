@@ -118,6 +118,20 @@ body {
   border-left: 4px solid var(--warning);
 }
 
+.vcam-panel {
+  border-left: 4px solid var(--warning);
+}
+
+.vcam-panel[data-state="publishing"] {
+  border-left-color: var(--accent);
+}
+
+.vcam-panel[data-state="error"],
+.vcam-panel[data-state="unavailable"],
+.vcam-panel[data-state="stopped"] {
+  border-left-color: #ef4444;
+}
+
 body[data-output-mode="render"] .status-panel {
   border-left-color: var(--accent);
 }

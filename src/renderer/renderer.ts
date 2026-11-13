@@ -1,4 +1,4 @@
-import type { FixtureInfo } from '../core/bridge';
+import type { FixtureInfo, VirtualCameraStatus } from '../core/bridge';
 import { DECODE_STALL_THRESHOLD_MS, FrameWatchdog } from '../core/frame-watchdog';
 import { PAUSED_TITLE, resolveOutput, type OutputDecision, type PreviewState } from '../core/output-policy';
 import { PreviewPipeline, type FrameStats } from '../core/pipeline';
@@ -28,6 +28,11 @@ const statusPanel = mustGet<HTMLElement>('status-panel');
 const statusTitle = mustGet<HTMLParagraphElement>('status-title');
 const statusExplanation = mustGet<HTMLParagraphElement>('status-explanation');
 const statusAction = mustGet<HTMLParagraphElement>('status-action');
+const vcamPanel = mustGet<HTMLElement>('vcam-panel');
+const vcamState = mustGet<HTMLParagraphElement>('vcam-state');
+const vcamDetail = mustGet<HTMLParagraphElement>('vcam-detail');
+const vcamAction = mustGet<HTMLParagraphElement>('vcam-action');
+const vcamRestart = mustGet<HTMLButtonElement>('vcam-restart');
 
 const pipeline = new PreviewPipeline(canvas);
 const timeline = new ReplayTimeline();
@@ -54,20 +59,37 @@ let frameIntervals: number[] = [];
 let renderCosts: number[] = [];
 let lastDiagnosticsAt = 0;
 let undrawableSinceMs: number | null = null;
+let lastPublishedAt = 0;
+let publishedFrames = 0;
+let latestVirtualCamera: VirtualCameraStatus | null = null;
+let cameraClients = 0;
+
+// The virtual camera and the preview receive the exact same frames. 30 Hz is
+// the camera workload; the replay itself presents at ~21-24 Hz here.
+const CAMERA_FRAME_MIN_INTERVAL_MS = 1000 / 30;
 
 // The app always paints the exact paused output first; no frame is ever shown
 // before the replay fixture has been validated and started.
 pipeline.renderPausedScreen(PAUSED_TITLE);
+publishOutputFrame();
 statusTitle.textContent = PAUSED_TITLE;
 
 buildEffectOptions();
 bindControls();
 updateStaticDiagnostics();
+void refreshVirtualCamera();
 void bootstrap();
 
 // requestVideoFrameCallback cannot fire when the decoder silently stops
 // presenting frames, so a real timer is the only watchdog for that stall.
 window.setInterval(checkDecodeStall, WATCHDOG_POLL_MS);
+
+// Republish the current output on a slow heartbeat. The canvas is always either
+// a processed frame or the exact opaque paused screen, so this keeps a newly
+// connected camera consumer from receiving a stale frame from before a pause,
+// effect switch, or error (the media source caches the newest transported
+// frame).
+window.setInterval(publishOutputFrame, 100);
 
 async function bootstrap(): Promise<void> {
   if (!window.shymask) {
@@ -115,6 +137,98 @@ function bindControls(): void {
     state.processingError = failureSimulated ? SIMULATED_FAILURE_MESSAGE : null;
     renderNow();
   });
+  vcamRestart.addEventListener('click', () => {
+    if (!window.shymask) return;
+    vcamRestart.disabled = true;
+    void window.shymask
+      .restartVirtualCamera()
+      .then((status) => applyVirtualCameraStatus(status))
+      .catch((error: Error) => {
+        vcamAction.textContent = `Virtual camera restart failed: ${error.message}`;
+      })
+      .finally(() => {
+        vcamRestart.disabled = false;
+      });
+  });
+}
+
+async function refreshVirtualCamera(): Promise<void> {
+  if (!window.shymask) {
+    vcamPanel.dataset.state = 'unavailable';
+    vcamState.textContent = 'Virtual camera not available';
+    vcamAction.textContent = 'The preload bridge is unavailable. Restart the app.';
+    return;
+  }
+  window.shymask.onVirtualCameraStatus(applyVirtualCameraStatus);
+  try {
+    applyVirtualCameraStatus(await window.shymask.getVirtualCameraStatus());
+  } catch (error) {
+    vcamPanel.dataset.state = 'error';
+    vcamState.textContent = 'Virtual camera unavailable';
+    vcamAction.textContent = `Could not read the camera status: ${(error as Error).message}`;
+  }
+}
+
+function applyVirtualCameraStatus(status: VirtualCameraStatus): void {
+  latestVirtualCamera = status;
+  cameraClients = status.clients;
+  vcamPanel.dataset.state = status.state;
+  const titles: Record<VirtualCameraStatus['state'], string> = {
+    starting: 'Starting virtual camera…',
+    publishing: 'Shymask Camera is available',
+    stopped: 'Camera output stopped',
+    error: 'Virtual camera unavailable',
+    unavailable: 'Virtual camera not installed',
+  };
+  vcamState.textContent = titles[status.state];
+  const details = [status.message];
+  if (status.state === 'publishing') {
+    details.push(
+      `Friendly name: ${status.friendlyName}. Camera clients: ${status.clients}. Output frames sent: ${status.framesPublished}.`,
+    );
+  }
+  vcamDetail.textContent = details.filter(Boolean).join(' ');
+  vcamAction.textContent = status.action ?? '';
+  vcamRestart.disabled = status.state === 'starting';
+  updateVirtualCameraDiagnostics();
+}
+
+function updateVirtualCameraDiagnostics(): void {
+  if (!latestVirtualCamera) {
+    setDiag('diag-vcam', 'state=starting');
+    return;
+  }
+  setDiag(
+    'diag-vcam',
+    `state=${latestVirtualCamera.state} enumerable=${latestVirtualCamera.enumerable} clients=${latestVirtualCamera.clients} frames=${latestVirtualCamera.framesPublished} port=${latestVirtualCamera.port ?? 'none'} pid=${latestVirtualCamera.hostPid ?? 'none'} published=${publishedFrames}`,
+  );
+}
+
+/**
+ * Hands the current output canvas to the virtual camera transport. Called after
+ * every drawn output frame, so processed frames and the opaque paused screen
+ * both reach camera consumers through the same output policy.
+ */
+function publishOutputFrame(): void {
+  if (!window.shymask?.publishCameraFrame) return;
+  // Only read the canvas back when a camera client is actually consuming
+  // frames; an idle virtual camera must not cost preview render time.
+  if (cameraClients <= 0) return;
+  const now = performance.now();
+  if (now - lastPublishedAt < CAMERA_FRAME_MIN_INTERVAL_MS) return;
+  lastPublishedAt = now;
+  try {
+    const data = pipeline.readOutputRgba();
+    window.shymask.publishCameraFrame({
+      captureUnixMs: Date.now(),
+      width: pipeline.width,
+      height: pipeline.height,
+      data,
+    });
+    publishedFrames += 1;
+  } catch {
+    // A canvas readback failure must not affect the preview.
+  }
 }
 
 function updateStaticDiagnostics(): void {
@@ -283,6 +397,7 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
     if (treatment && element.readyState >= 2) {
       undrawableSinceMs = null;
       const stats = pipeline.renderProcessedFrame(element, treatment);
+      publishOutputFrame();
       latestStats = stats;
       renderCosts = pushRolling(renderCosts, stats.renderCostMs);
       applyDecision(decision);
@@ -305,6 +420,7 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
 
   const pausedDecision = resolveOutput(state);
   const stats = pipeline.renderPausedScreen(PAUSED_TITLE);
+  publishOutputFrame();
   latestStats = stats;
   renderCosts = pushRolling(renderCosts, stats.renderCostMs);
   applyDecision(pausedDecision);
@@ -337,8 +453,10 @@ function renderNow(): void {
   if (decision.mode === 'render' && treatment && video && video.readyState >= 2) {
     undrawableSinceMs = null;
     latestStats = pipeline.renderProcessedFrame(video, treatment);
+    publishOutputFrame();
   } else if (decision.mode === 'paused') {
     latestStats = pipeline.renderPausedScreen(PAUSED_TITLE);
+    publishOutputFrame();
   }
   // In render mode without a drawable frame, leave the previous processed
   // frame visible rather than substituting the paused screen for one frame.
@@ -457,6 +575,7 @@ function updateDiagnostics(_now: number): void {
       `mode=${currentDecision.mode} reason=${currentDecision.reason} canvas=${pipeline.width}x${pipeline.height} treatment=${state.effect}`,
     );
   }
+  updateVirtualCameraDiagnostics();
 }
 
 function pushRolling(values: number[], value: number): number[] {

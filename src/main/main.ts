@@ -1,8 +1,9 @@
 import { app, BrowserWindow, ipcMain } from 'electron';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import type { CaptureResult, FixtureInfo, StartupInfo } from '../core/bridge';
+import type { CameraFrame, CaptureResult, FixtureInfo, StartupInfo, VirtualCameraStatus } from '../core/bridge';
 import { loadFixture } from './fixture';
+import { VirtualCameraPublisher } from './virtual-camera';
 
 // Electron's `app.getAppPath()` is the project root when launched with `electron .`;
 // the Playwright check harness uses the same entry point.
@@ -16,6 +17,8 @@ const evidenceDir = process.env.SHYMASK_EVIDENCE_DIR
 
 let currentFixture: FixtureInfo = loadFixture({ repoRoot, fixtureDir });
 let mainWindow: BrowserWindow | null = null;
+let virtualCamera: VirtualCameraPublisher | null = null;
+let quitting = false;
 
 function writeCapture(dataUrl: string): CaptureResult {
   const prefix = 'data:image/png;base64,';
@@ -78,11 +81,74 @@ ipcMain.handle('shymask:capture-output', (_event, dataUrl: unknown): CaptureResu
   return writeCapture(typeof dataUrl === 'string' ? dataUrl : '');
 });
 
+ipcMain.on('shymask:camera-frame', (_event, frame: unknown) => {
+  if (!frame || typeof frame !== 'object') return;
+  const candidate = frame as Partial<CameraFrame>;
+  if (
+    typeof candidate.captureUnixMs !== 'number' ||
+    typeof candidate.width !== 'number' ||
+    typeof candidate.height !== 'number' ||
+    !(candidate.data instanceof ArrayBuffer)
+  ) {
+    return;
+  }
+  virtualCamera?.publishFrame({
+    captureUnixMs: candidate.captureUnixMs,
+    width: candidate.width,
+    height: candidate.height,
+    data: candidate.data,
+  });
+});
+
+ipcMain.handle('shymask:vcam-status', (): VirtualCameraStatus => {
+  return virtualCamera?.getStatus() ?? startingVirtualCameraStatus();
+});
+
+ipcMain.handle('shymask:vcam-restart', async (): Promise<VirtualCameraStatus> => {
+  if (!virtualCamera) return startingVirtualCameraStatus();
+  return virtualCamera.restart();
+});
+
+function startingVirtualCameraStatus(): VirtualCameraStatus {
+  return {
+    state: 'starting',
+    friendlyName: 'Shymask Camera',
+    enumerable: false,
+    clients: 0,
+    framesPublished: 0,
+    port: null,
+    hostPid: null,
+    message: 'Starting the Windows virtual camera…',
+    action: null,
+    hresult: null,
+  };
+}
+
+function broadcastVirtualCameraStatus(status: VirtualCameraStatus): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed()) window.webContents.send('shymask:vcam-status', status);
+  }
+}
+
 app.whenReady().then(() => {
   createWindow();
+  virtualCamera = new VirtualCameraPublisher({
+    repoRoot,
+    onStatus: broadcastVirtualCameraStatus,
+  });
+  void virtualCamera.start();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+// Closing Shymask stops the camera output: the host owns the session-lifetime
+// IMFVirtualCamera and is asked to Stop/Remove before the app exits.
+app.on('before-quit', (event) => {
+  if (quitting || !virtualCamera) return;
+  event.preventDefault();
+  quitting = true;
+  void virtualCamera.stop().finally(() => app.quit());
 });
 
 app.on('window-all-closed', () => {

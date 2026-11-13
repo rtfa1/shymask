@@ -2,7 +2,7 @@
   "name": "shymask",
   "version": "0.1.0",
   "private": true,
-  "description": "Shymask development preview: a looped webcam-style replay with a selectable color treatment.",
+  "description": "Shymask: a looped webcam-style preview published as the Shymask Camera Windows virtual webcam.",
   "license": "UNLICENSED",
   "main": "dist/src/main/main.js",
   "scripts": {
@@ -12,7 +12,12 @@
     "fetch:fixture": "node scripts/fetch-fixture.mjs",
     "test": "npm run build && node --test \"dist/tests/**/*.test.js\"",
     "check": "npm run build && node scripts/check-app.mjs",
-    "check:all": "npm test && npm run check"
+    "check:all": "npm test && npm run check",
+    "build:native": "node scripts/build-native.mjs",
+    "vcam:install": "npm run build:native && node scripts/vcam.mjs install",
+    "vcam:uninstall": "node scripts/vcam.mjs uninstall",
+    "vcam:status": "node scripts/vcam.mjs status",
+    "vcam:check": "npm run build:native && node scripts/vcam-check.mjs"
   },
   "devDependencies": {
     "@types/node": "^24.9.0",

@@ -66,6 +66,16 @@ export class PreviewPipeline {
     return this.finishFrame(startedAt);
   }
 
+  /**
+   * Copies the current output canvas as top-down RGBA. This is the exact frame
+   * the preview displays (processed or opaque paused screen); the main process
+   * forwards it to the Windows virtual camera transport.
+   */
+  readOutputRgba(): ArrayBuffer {
+    const image = this.context.getImageData(0, 0, this.width, this.height);
+    return image.data.buffer;
+  }
+
   private finishFrame(startedAt: number): FrameStats {
     return {
       renderCostMs: performance.now() - startedAt,
