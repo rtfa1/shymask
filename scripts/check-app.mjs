@@ -2444,9 +2444,10 @@ async function effectPackageScenario() {
     consoleErrors = relaunched.consoleErrors;
     await waitForTrackerModelReady(page);
     const persistedPackages = parseKeyValues(await readDiagnostic(page, 'diag-packages'));
-    assert.equal(persistedPackages.installed, '1', `expected one persisted package, got ${JSON.stringify(persistedPackages)}`);
+    assert.equal(persistedPackages.installed, '2', `expected two persisted packages, got ${JSON.stringify(persistedPackages)}`);
     const persistedOptions = await effectOptionValues(page);
     assert.ok(persistedOptions.includes(VERDANT_TINT_EFFECT_ID), 'imported effect must survive an app restart');
+    assert.ok(persistedOptions.includes(ROSE_VISOR_EFFECT_ID), 'the rose mask package must survive an app restart');
     assert.ok(!persistedOptions.includes(GUARD_VISOR_EFFECT_ID), 'removed effect must stay removed after restart');
     await waitFor('start enabled after restart', async () => {
       return (await page.locator('[data-testid="start"]').isDisabled()) ? null : true;
