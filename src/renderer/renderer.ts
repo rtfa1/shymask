@@ -8,7 +8,7 @@ import {
 } from '../core/output-policy';
 import { PreviewPipeline, type FrameStats } from '../core/pipeline';
 import { ReplayTimeline, type ReplayFrameTimestamp } from '../core/replay-clock';
-import { EFFECT_OPTIONS, getEffectLabel, getTreatment, isMaskEffect, type EffectId } from '../core/treatments';
+import { EFFECT_OPTIONS, getEffectLabel, getTreatment, isMaskEffect, type ColorTreatment, type EffectId } from '../core/treatments';
 import {
   initialTrackingSnapshot,
   TrackingStateMachine,
@@ -556,13 +556,8 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
 
   if (decision.mode === 'render') {
     if (isMaskEffect(state.effect)) {
-      if (maskRenderer && lastMaskProjection.visible && element.readyState >= 2) {
+      if (element.readyState >= 2 && drawProcessedFrame(element, null)) {
         undrawableSinceMs = null;
-        maskRenderCostMs = maskRenderer.render();
-        const stats = pipeline.renderProcessedFrame(element, null, maskRenderer.canvas);
-        publishOutputFrame();
-        latestStats = stats;
-        renderCosts = pushRolling(renderCosts, stats.renderCostMs + maskRenderCostMs);
         applyDecision(decision);
         maybeUpdateDiagnostics(now);
         return;
@@ -580,12 +575,8 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
       state.processingError = 'The face pose was not drawable for more than 250 ms. Output is hidden.';
     } else {
       const treatment = getTreatment(state.effect);
-      if (treatment && element.readyState >= 2) {
+      if (element.readyState >= 2 && drawProcessedFrame(element, treatment)) {
         undrawableSinceMs = null;
-        const stats = pipeline.renderProcessedFrame(element, treatment, null);
-        publishOutputFrame();
-        latestStats = stats;
-        renderCosts = pushRolling(renderCosts, stats.renderCostMs);
         applyDecision(decision);
         maybeUpdateDiagnostics(now);
         return;
@@ -701,6 +692,29 @@ function injectedSample(injection: Exclude<TrackingInjection, 'auto'>): Tracking
 }
 
 /**
+ * Draws one processed frame with the active effect into the single output
+ * canvas and publishes it. The frame loop and the on-demand render path share
+ * this so both apply exactly the same mask/colour logic and cost accounting.
+ * Returns false when the effect cannot be drawn (no drawable mask pose, or no
+ * colour treatment), in which case the caller keeps the previous output instead
+ * of substituting the raw frame.
+ */
+function drawProcessedFrame(element: HTMLVideoElement, treatment: ColorTreatment | null): boolean {
+  if (isMaskEffect(state.effect)) {
+    if (!maskRenderer || !lastMaskProjection.visible) return false;
+    maskRenderCostMs = maskRenderer.render();
+    latestStats = pipeline.renderProcessedFrame(element, null, maskRenderer.canvas);
+    renderCosts = pushRolling(renderCosts, latestStats.renderCostMs + maskRenderCostMs);
+  } else {
+    if (!treatment) return false;
+    latestStats = pipeline.renderProcessedFrame(element, treatment, null);
+    renderCosts = pushRolling(renderCosts, latestStats.renderCostMs);
+  }
+  publishOutputFrame();
+  return true;
+}
+
+/**
  * Timer tick for a decoder that stops presenting frames. It only hides output
  * when a frame is genuinely expected (started, not manually paused, a fixture
  * and an effect active) and processing is otherwise healthy, so a specific
@@ -728,20 +742,11 @@ function renderNow(): void {
 
   if (decision.mode === 'render' && video && video.readyState >= 2) {
     if (isMaskEffect(state.effect)) {
-      if (maskRenderer && lastMaskProjection.visible) {
-        undrawableSinceMs = null;
-        maskRenderCostMs = maskRenderer.render();
-        latestStats = pipeline.renderProcessedFrame(video, null, maskRenderer.canvas);
-        renderCosts = pushRolling(renderCosts, latestStats.renderCostMs + maskRenderCostMs);
-        publishOutputFrame();
-      }
+      if (drawProcessedFrame(video, null)) undrawableSinceMs = null;
       // Without a drawable pose the previous output stays until the next frame;
       // the paused screen is never replaced by the raw frame.
-    } else if (treatment) {
+    } else if (treatment && drawProcessedFrame(video, treatment)) {
       undrawableSinceMs = null;
-      latestStats = pipeline.renderProcessedFrame(video, treatment, null);
-      renderCosts = pushRolling(renderCosts, latestStats.renderCostMs);
-      publishOutputFrame();
     }
   } else if (decision.mode === 'paused') {
     latestStats = pipeline.renderPausedScreen(PAUSED_TITLE);

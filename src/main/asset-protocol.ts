@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 /**
@@ -7,8 +7,15 @@ import path from 'node:path';
  * The renderer is served from `shymask://app/...` instead of `file://` so that
  * the MediaPipe WASM fileset and model can be fetched with the normal Fetch API
  * under a strict CSP, and so the replay clip can be streamed with byte-range
- * support. Only files under the configured roots are reachable, and directory
- * traversal is rejected. There are no Windows APIs and no network listener.
+ * support. Only files under the configured roots are reachable, directory
+ * traversal is rejected, and symlinks that escape a root are rejected by
+ * comparing the real paths. There are no Windows APIs and no network listener.
+ *
+ * Byte ranges follow RFC 7233 for the forms Chromium media needs: `start-end`,
+ * `start-` and the suffix form `-N` (the last N bytes). An `end` past the file
+ * size is clamped to the last byte; unsatisfiable ranges get 416. A multi-range
+ * request is answered with the whole file (200), which the RFC permits when a
+ * server chooses to ignore the Range header.
  */
 
 export interface AssetRoots {
@@ -73,9 +80,53 @@ export function resolveAssetPath(roots: AssetRoots, pathname: string): ResolvedA
   if (relative.length === 0) return null;
 
   const file = safeJoin(root, relative);
-  if (!file || !existsSync(file) || !statSync(file).isFile()) return null;
-  const extension = path.extname(file).toLowerCase();
-  return { file, mime: MIME_TYPES[extension] ?? 'application/octet-stream' };
+  if (!file) return null;
+  // `safeJoin` rejects `..` segments, but a symlink inside a root could still
+  // point outside it. Compare real paths so the documented "only files under
+  // the configured roots" boundary holds for links too.
+  let realFile: string;
+  let realRoot: string;
+  try {
+    realRoot = realpathSync(root);
+    realFile = realpathSync(file);
+  } catch {
+    return null;
+  }
+  if (realFile !== realRoot && !realFile.startsWith(realRoot + path.sep)) return null;
+  if (!statSync(realFile).isFile()) return null;
+  const extension = path.extname(realFile).toLowerCase();
+  return { file: realFile, mime: MIME_TYPES[extension] ?? 'application/octet-stream' };
+}
+
+/** A satisfiable byte range, or a rejection reason for the response. */
+type ParsedRange = { start: number; end: number } | 'invalid' | 'ignore';
+
+/**
+ * Parses one `Range: bytes=...` header against `total` bytes.
+ *
+ * - `start-end` and `start-` are inclusive; `end` is clamped to `total - 1`;
+ * - `-N` is the suffix form and returns the last N bytes;
+ * - `bytes=-0`, an empty range, a start past the file and `start > end` are
+ *   unsatisfiable (`416`);
+ * - anything else (another unit, multiple ranges) is ignored and the caller
+ *   serves the whole file, as RFC 7233 allows.
+ */
+function parseByteRange(header: string, total: number): ParsedRange {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match) return 'ignore';
+  const [, startText, endText] = match;
+  if (total === 0 || (startText === '' && endText === '')) return 'invalid';
+  if (startText === '') {
+    const suffix = Number(endText);
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) return 'invalid';
+    return { start: Math.max(total - suffix, 0), end: total - 1 };
+  }
+  const start = Number(startText);
+  if (!Number.isSafeInteger(start) || start >= total) return 'invalid';
+  if (endText === '') return { start, end: total - 1 };
+  const end = Number(endText);
+  if (!Number.isSafeInteger(end) || start > end) return 'invalid';
+  return { start, end: Math.min(end, total - 1) };
 }
 
 function rangeResponse(bytes: Buffer, mime: string, request: Request): Response {
@@ -87,18 +138,12 @@ function rangeResponse(bytes: Buffer, mime: string, request: Request): Response 
     'cache-control': 'no-store',
   };
   if (range) {
-    const match = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
-    if (match) {
-      let start = match[1] ? Number(match[1]) : 0;
-      let end = match[2] ? Number(match[2]) : total - 1;
-      if (!Number.isFinite(start) || !Number.isFinite(end)) {
-        return new Response(null, { status: 416, headers: { 'content-range': `bytes */${total}` } });
-      }
-      if (start < 0 || end >= total || start > end) {
-        // A suffix range such as `bytes=-N` is not needed by Chromium media.
-        return new Response(null, { status: 416, headers: { 'content-range': `bytes */${total}` } });
-      }
-      end = Math.min(end, total - 1);
+    const parsed = parseByteRange(range, total);
+    if (parsed === 'invalid') {
+      return new Response(null, { status: 416, headers: { 'content-range': `bytes */${total}` } });
+    }
+    if (parsed !== 'ignore') {
+      const { start, end } = parsed;
       const slice = new Uint8Array(bytes.subarray(start, end + 1));
       return new Response(slice, {
         status: 206,

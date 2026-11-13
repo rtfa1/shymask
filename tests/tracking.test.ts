@@ -101,6 +101,91 @@ test('recovery from loss requires one reliable face for the recovery window', ()
   assert.equal(machine.update(sample(), 1000).phase, 'tracking');
 });
 
+test('a face returning at a different pose after a loss gap still reacquires', () => {
+  const machine = new TrackingStateMachine();
+  const zero = sample({ faceCount: 0, landmarkCount: 0, hasTransform: false, pose: null });
+  machine.reset(0);
+  machine.update(sample(), 100);
+  machine.update(sample(), 400);
+  assert.equal(machine.snapshot(400).phase, 'tracking');
+
+  // Longer than the grace window: the output pauses and the pre-loss pose is
+  // no longer a valid reference.
+  const lostAt = 400 + TRACKING_LIMITS.lostGraceMs + 10;
+  machine.update(zero, lostAt);
+  assert.equal(machine.snapshot(lostAt).phase, 'lost');
+
+  // The person legitimately turned while the output was paused: a 90 degree
+  // yaw change is greater than the per-sample jump limit, but this is a
+  // reacquisition after a gap, not a single glitched frame.
+  const turned = sample({ pose: { yawDeg: 90, pitchDeg: 0, rollDeg: 0, tx: 0, ty: 0, tz: -56 } });
+  const reacquiredAt = lostAt + 200;
+  assert.equal(machine.classify(turned), 'reliable');
+  assert.equal(machine.update(turned, reacquiredAt).phase, 'lost');
+  // The recovery window still applies before the output is restored.
+  assert.equal(machine.update(turned, reacquiredAt + TRACKING_LIMITS.recoveryConfirmMs - 1).phase, 'lost');
+  assert.equal(machine.update(turned, reacquiredAt + TRACKING_LIMITS.recoveryConfirmMs).phase, 'tracking');
+});
+
+test('multiple faces returning as one face at a different pose recovers', () => {
+  const machine = new TrackingStateMachine();
+  machine.reset(0);
+  machine.update(sample(), 100);
+  machine.update(sample(), 400);
+  assert.equal(machine.update(sample({ faceCount: 2 }), 440).phase, 'multiple-faces');
+  // The second person left and the remaining person is at a large pose change
+  // from the pre-multiple pose; the pause reason must not veto reacquisition.
+  const turned = sample({ pose: { yawDeg: -90, pitchDeg: 0, rollDeg: 0, tx: 0, ty: 0, tz: -56 } });
+  const recoveredAt = 600;
+  assert.equal(machine.classify(turned), 'reliable');
+  assert.equal(machine.update(turned, recoveredAt).phase, 'multiple-faces');
+  assert.equal(machine.update(turned, recoveredAt + TRACKING_LIMITS.recoveryConfirmMs).phase, 'tracking');
+});
+
+test('a single glitched pose-jump frame during continuous tracking is never accepted', () => {
+  const machine = new TrackingStateMachine();
+  machine.reset(0);
+  machine.update(sample(), 100);
+  machine.update(sample(), 400);
+  const glitch = sample({ pose: { yawDeg: 0, pitchDeg: 0, rollDeg: 0, tx: 0, ty: 0, tz: 20 } });
+  // The guard rejects the glitch frame instead of teleporting the mask.
+  assert.equal(machine.classify(glitch), 'unreliable');
+  // One glitched frame inside the confirmation window alone does not pause...
+  assert.equal(machine.update(glitch, 440).phase, 'tracking');
+  // ...but a persistent glitch still pauses after the confirmation window.
+  assert.equal(
+    machine.update(glitch, 440 + TRACKING_LIMITS.unreliableConfirmMs + 10).phase,
+    'unreliable',
+  );
+});
+
+test('multiple faces falling back to zero faces reports tracking lost, not multiple faces', () => {
+  const machine = new TrackingStateMachine();
+  const zero = sample({ faceCount: 0, landmarkCount: 0, hasTransform: false, pose: null });
+  machine.reset(0);
+  machine.update(sample(), 100);
+  machine.update(sample(), 400);
+  const multipleAt = 440;
+  assert.equal(machine.update(sample({ faceCount: 2 }), multipleAt).phase, 'multiple-faces');
+  // The second person leaves too: the zero-face grace window starts here, so a
+  // single dropped detection still reads as the multiple-face pause.
+  const firstZeroAt = multipleAt + 100;
+  assert.equal(machine.update(zero, firstZeroAt).phase, 'multiple-faces');
+  assert.equal(
+    machine.update(zero, firstZeroAt + TRACKING_LIMITS.lostGraceMs - 10).phase,
+    'multiple-faces',
+  );
+  const lostAt = firstZeroAt + TRACKING_LIMITS.lostGraceMs + 10;
+  const snapshot = machine.update(zero, lostAt);
+  assert.equal(snapshot.phase, 'lost');
+  assert.equal(snapshot.faceCount, 0);
+  // A healthy single face then recovers through the normal recovery window.
+  const reacquiredAt = lostAt + 100;
+  assert.equal(machine.update(sample(), reacquiredAt).phase, 'lost');
+  assert.equal(machine.update(sample(), reacquiredAt + TRACKING_LIMITS.recoveryConfirmMs).phase, 'tracking');
+});
+
+
 test('injected samples are labelled but use the same transitions', () => {
   const machine = new TrackingStateMachine();
   machine.reset(0);

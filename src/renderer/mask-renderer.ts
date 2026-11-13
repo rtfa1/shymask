@@ -16,6 +16,10 @@ import { poseFromColumnMajorMatrix, type TrackingPose } from '../core/tracking';
  * matrix), which is what makes the mask land on the face instead of merely near
  * it. Sixteen-bit colour/RGB evidence and placement numbers are exposed for the
  * public-workflow check.
+ *
+ * One renderer is created for the renderer process lifetime (the mask canvas is
+ * part of the single output path), so there is deliberately no `dispose()`:
+ * closing Shymask tears down the window and its WebGL context.
  */
 
 export interface MaskProjection {

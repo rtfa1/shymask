@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build as esbuild } from 'esbuild';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -37,15 +37,22 @@ for (const asset of ['index.html', 'styles.css']) {
 // missing model is not a build failure, because the app must be able to show
 // the actionable hidden-output error instead of silently starting without
 // tracking. The WASM files come from the exact npm version in package.json.
+// The required file list is owned by src/main/tracker.ts (compiled by the tsc
+// step above) so launch validation and this staging step cannot drift.
 const trackerDist = path.join(rendererDist, 'tracker');
 mkdirSync(trackerDist, { recursive: true });
+const trackerModule = await import(
+  pathToFileURL(path.join(root, 'dist', 'src', 'main', 'tracker.js')).href
+);
+const requiredTrackerFiles = trackerModule.REQUIRED_TRACKER_FILES ?? trackerModule.default?.REQUIRED_TRACKER_FILES;
+if (!Array.isArray(requiredTrackerFiles) || requiredTrackerFiles.length === 0) {
+  console.error('build error: dist/src/main/tracker.js did not export REQUIRED_TRACKER_FILES.');
+  process.exit(1);
+}
+const trackerMetadata = JSON.parse(readFileSync(path.join(root, 'tracker', 'face-landmarker-model.json'), 'utf8'));
+const modelFileName = trackerMetadata.fileName;
 const mediapipeWasmDir = path.join(root, 'node_modules', '@mediapipe', 'tasks-vision', 'wasm');
-const wasmAssets = [
-  'vision_wasm_internal.js',
-  'vision_wasm_internal.wasm',
-  'vision_wasm_nosimd_internal.js',
-  'vision_wasm_nosimd_internal.wasm',
-];
+const wasmAssets = requiredTrackerFiles.filter((fileName) => fileName !== modelFileName);
 for (const asset of wasmAssets) {
   const source = path.join(mediapipeWasmDir, asset);
   if (!existsSync(source)) {
@@ -54,12 +61,12 @@ for (const asset of wasmAssets) {
   }
   copyFileSync(source, path.join(trackerDist, asset));
 }
-const modelPath = path.join(root, '.cache', 'tracker', 'face_landmarker.task');
+const modelPath = path.join(root, '.cache', 'tracker', modelFileName);
 if (existsSync(modelPath)) {
-  copyFileSync(modelPath, path.join(trackerDist, 'face_landmarker.task'));
+  copyFileSync(modelPath, path.join(trackerDist, modelFileName));
 } else {
   console.warn(
-    'build warning: face_landmarker.task is not cached; run "npm run fetch:tracker". ' +
+    `build warning: ${modelFileName} is not cached; run "npm run fetch:tracker". ` +
       'The app will show an actionable hidden-output error until the model is staged.',
   );
 }

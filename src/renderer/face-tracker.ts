@@ -5,8 +5,6 @@ import { poseFromColumnMajorMatrix, TRACKING_LIMITS, type TrackingSample } from 
 export interface DetectedTracking extends TrackingSample {
   /** First face bounding box in normalized frame coordinates. */
   faceBbox: { x: number; y: number; width: number; height: number } | null;
-  /** First face bounding-box centre in normalized frame coordinates. */
-  faceCenter: { x: number; y: number } | null;
   /** MediaPipe facial transformation matrix (column-major) for the first face. */
   matrix: number[] | null;
 }
@@ -35,7 +33,9 @@ function installInformationalLogFilter(): void {
  * Thin wrapper around the MediaPipe Face Landmarker. It owns the model/runtime
  * lifetime and converts one detection into the plain sample the portable
  * tracking state machine consumes. The tracker never touches camera APIs: the
- * only source is the validated replay <video> element.
+ * only source is the validated replay <video> element. One tracker lives for the
+ * renderer process lifetime, so its resources are released when the window is
+ * torn down and the class exposes no separate teardown path.
  */
 export class FaceTracker {
   private constructor(private readonly landmarker: FaceLandmarker) {}
@@ -94,14 +94,7 @@ export class FaceTracker {
       faceWidthRatio: faceBbox?.width ?? 0,
       pose,
       faceBbox,
-      faceCenter: faceBbox
-        ? { x: faceBbox.x + faceBbox.width / 2, y: faceBbox.y + faceBbox.height / 2 }
-        : null,
       matrix,
     };
-  }
-
-  close(): void {
-    this.landmarker.close();
   }
 }

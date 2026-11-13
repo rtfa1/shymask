@@ -36,9 +36,11 @@ import { inflateSync } from 'node:zlib';
 import { _electron as electron } from 'playwright-core';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+/** Committed fixture cache; scenarios override the app's input via SHYMASK_FIXTURE_DIR. */
+const committedFixtureCacheDir = path.join(root, 'fixtures', 'cache');
 const metadata = JSON.parse(readFileSync(path.join(root, 'fixtures', 'webcam-loop.json'), 'utf8'));
 const packageJson = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
-const mediaPath = path.join(root, 'fixtures', 'cache', metadata.fileName);
+const mediaPath = path.join(committedFixtureCacheDir, metadata.fileName);
 const programData = process.env.ProgramData ?? 'C:\\ProgramData';
 const installedBin = path.join(programData, 'Shymask', 'bin');
 const nativeBin = path.join(root, 'build', 'native');
@@ -1254,12 +1256,36 @@ async function missingFixtureCameraScenario() {
 const MASK_EYE_RGB = { r: 103, g: 232, b: 249 };
 /** Window with the largest recorded pose swing in fixtures/pose-loop.json. */
 const MOTION_WINDOW_START_SECONDS = 41.6;
+/** Documented motion window length (docs/fixture-pose-loop.md, docs/notes/0003). */
+const MOTION_WINDOW_SECONDS = 8;
+const MOTION_WINDOW_START_MS = MOTION_WINDOW_START_SECONDS * 1000;
+const MOTION_WINDOW_END_MS = MOTION_WINDOW_START_MS + MOTION_WINDOW_SECONDS * 1000;
+
+async function readTracking(page) {
+  return parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
+}
+
+/**
+ * Evidence for one injected policy state: the public diagnostics must label the
+ * sample as injected and report the phase the output policy is acting on, so
+ * summary.json proves these states were not produced by the real detector.
+ */
+function injectedTrackingEvidence(tracking) {
+  return {
+    phase: tracking.phase,
+    injected: tracking.injected === 'true',
+    source: tracking.source,
+    faces: Number(tracking.faces),
+    landmarks: Number(tracking.landmarks),
+    transform: tracking.transform,
+  };
+}
 
 async function waitForTrackingPhase(page, phase = 'tracking', timeoutMs = 30000) {
   return waitFor(
     `tracking phase ${phase}`,
     async () => {
-      const values = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
+      const values = await readTracking(page);
       return values.phase === phase ? values : null;
     },
     timeoutMs,
@@ -1333,7 +1359,7 @@ function spread(values) {
 
 function verifyFixtureManifest(manifestFileName) {
   const manifest = JSON.parse(readFileSync(path.join(root, 'fixtures', manifestFileName), 'utf8'));
-  const file = path.join(root, 'fixtures', 'cache', manifest.fileName);
+  const file = path.join(committedFixtureCacheDir, manifest.fileName);
   if (!existsSync(file)) {
     throw new Error(`Fixture ${manifest.id} is missing at ${file}. Run \`npm run fetch:motion-fixture\`.`);
   }
@@ -1468,6 +1494,12 @@ async function trackingMaskScenario() {
     });
     assert.equal(lost.mode, 'paused');
     assert.equal(lost.title, 'Tracking paused');
+    await waitForTrackingPhase(page, 'lost');
+    const lostTracking = injectedTrackingEvidence(await readTracking(page));
+    assert.equal(lostTracking.injected, true, 'tracking-loss evidence must come from the labelled injection');
+    assert.equal(lostTracking.source, 'lost');
+    assert.equal(lostTracking.phase, 'lost');
+    assert.equal(lostTracking.faces, 0);
     await page.waitForTimeout(300);
     const lostRgb = await readRgb(page);
     assert.ok(rgbSum(lostRgb) < 120, `tracking-loss output must be the dark paused screen, got ${JSON.stringify(lostRgb)}`);
@@ -1475,10 +1507,10 @@ async function trackingMaskScenario() {
     const lostRun = await captureCameraState(page, 'tracking-lost', 6);
     assertAllPausedFrames(lostRun.frames, 'tracking lost');
     const lostPng = assertPausedPng(lostRun.frames, 'tracking lost');
-    evidence.states.trackingLost = { status: lost, preview: lostRgb, camera: averageFrameRgb(lostRun.frames), png: lostPng.png, screenshot: lostShot };
+    evidence.states.trackingLost = { injectedTracking: lostTracking, status: lost, preview: lostRgb, camera: averageFrameRgb(lostRun.frames), png: lostPng.png, screenshot: lostShot };
     pass(
       'Tracking loss replaces the whole output with the opaque paused screen in preview and camera',
-      `preview=${JSON.stringify(lostRgb)} camera=${JSON.stringify(evidence.states.trackingLost.camera)} ${lostShot}`,
+      `injected=${lostTracking.injected} phase=${lostTracking.phase} preview=${JSON.stringify(lostRgb)} camera=${JSON.stringify(evidence.states.trackingLost.camera)} ${lostShot}`,
     );
 
     // Multiple faces.
@@ -1490,6 +1522,12 @@ async function trackingMaskScenario() {
       return /more than one face/i.test(status.explanation) ? status : null;
     });
     assert.equal(multiple.mode, 'paused');
+    await waitForTrackingPhase(page, 'multiple-faces');
+    const multipleTracking = injectedTrackingEvidence(await readTracking(page));
+    assert.equal(multipleTracking.injected, true, 'multiple-face evidence must come from the labelled injection');
+    assert.equal(multipleTracking.source, 'multiple');
+    assert.equal(multipleTracking.phase, 'multiple-faces');
+    assert.ok(multipleTracking.faces > 1, `multiple-face evidence must report more than one face, got ${multipleTracking.faces}`);
     await page.waitForTimeout(300);
     const multipleRgb = await readRgb(page);
     assert.ok(rgbSum(multipleRgb) < 120, 'multiple-face output must be dark');
@@ -1497,10 +1535,10 @@ async function trackingMaskScenario() {
     const multipleRun = await captureCameraState(page, 'multiple-faces', 6);
     assertAllPausedFrames(multipleRun.frames, 'multiple faces');
     const multiplePng = assertPausedPng(multipleRun.frames, 'multiple faces');
-    evidence.states.multipleFaces = { status: multiple, preview: multipleRgb, camera: averageFrameRgb(multipleRun.frames), png: multiplePng.png, screenshot: multipleShot };
+    evidence.states.multipleFaces = { injectedTracking: multipleTracking, status: multiple, preview: multipleRgb, camera: averageFrameRgb(multipleRun.frames), png: multiplePng.png, screenshot: multipleShot };
     pass(
       'More than one detected face pauses the whole output in preview and camera',
-      `preview=${JSON.stringify(multipleRgb)} camera=${JSON.stringify(evidence.states.multipleFaces.camera)} ${multipleShot}`,
+      `injected=${multipleTracking.injected} phase=${multipleTracking.phase} preview=${JSON.stringify(multipleRgb)} camera=${JSON.stringify(evidence.states.multipleFaces.camera)} ${multipleShot}`,
     );
 
     // Unreliable tracking.
@@ -1512,6 +1550,12 @@ async function trackingMaskScenario() {
       return /unreliable/i.test(status.explanation) ? status : null;
     });
     assert.equal(unreliable.mode, 'paused');
+    await waitForTrackingPhase(page, 'unreliable');
+    const unreliableTracking = injectedTrackingEvidence(await readTracking(page));
+    assert.equal(unreliableTracking.injected, true, 'unreliable-tracking evidence must come from the labelled injection');
+    assert.equal(unreliableTracking.source, 'unreliable');
+    assert.equal(unreliableTracking.phase, 'unreliable');
+    assert.equal(unreliableTracking.faces, 1);
     await page.waitForTimeout(300);
     const unreliableRgb = await readRgb(page);
     assert.ok(rgbSum(unreliableRgb) < 120, 'unreliable-tracking output must be dark');
@@ -1519,10 +1563,10 @@ async function trackingMaskScenario() {
     const unreliableRun = await captureCameraState(page, 'unreliable', 6);
     assertAllPausedFrames(unreliableRun.frames, 'unreliable tracking');
     const unreliablePng = assertPausedPng(unreliableRun.frames, 'unreliable tracking');
-    evidence.states.unreliable = { status: unreliable, preview: unreliableRgb, camera: averageFrameRgb(unreliableRun.frames), png: unreliablePng.png, screenshot: unreliableShot };
+    evidence.states.unreliable = { injectedTracking: unreliableTracking, status: unreliable, preview: unreliableRgb, camera: averageFrameRgb(unreliableRun.frames), png: unreliablePng.png, screenshot: unreliableShot };
     pass(
       'Unreliable tracking pauses the whole output in preview and camera',
-      `preview=${JSON.stringify(unreliableRgb)} camera=${JSON.stringify(evidence.states.unreliable.camera)} ${unreliableShot}`,
+      `injected=${unreliableTracking.injected} phase=${unreliableTracking.phase} preview=${JSON.stringify(unreliableRgb)} camera=${JSON.stringify(evidence.states.unreliable.camera)} ${unreliableShot}`,
     );
 
     // Automatic recovery to the selected effect.
@@ -1534,10 +1578,16 @@ async function trackingMaskScenario() {
     evidence.states.recovered = { status: recovered, mask: recoveredMask };
     pass('The selected mask is restored automatically when one face and healthy processing return', `${recovered.title} ${JSON.stringify(recoveredMask.visible)}`);
 
-    // Manual pause must win over automatic tracking recovery.
+    // Manual pause must persist until Resume. The tracker is deliberately
+    // skipped while paused, so this public-workflow check can observe
+    // persistence, not an automatic recovery racing the manual pause; the
+    // precedence itself is asserted through the public diag-output reason and
+    // is covered exhaustively by the output-policy unit tests.
     await page.locator('[data-testid="pause-toggle"]').click();
     const manualPause = await waitForStatusTitle(page, /^Tracking paused$/);
     assert.match(manualPause.explanation, /paused manually/i);
+    const manualReason = parseKeyValues(await readDiagnostic(page, 'diag-output')).reason;
+    assert.equal(manualReason, 'manual-pause', 'the output policy must report manual pause as the active reason');
     await page.locator('[data-testid="tracking-injection"]').selectOption('lost');
     await page.waitForTimeout(400);
     await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
@@ -1545,11 +1595,19 @@ async function trackingMaskScenario() {
     const stillPaused = await readStatus(page);
     assert.equal(stillPaused.title, 'Tracking paused');
     assert.match(stillPaused.explanation, /paused manually/i);
+    assert.equal(
+      parseKeyValues(await readDiagnostic(page, 'diag-output')).reason,
+      'manual-pause',
+      'manual pause must stay the policy reason across tracking-injection changes',
+    );
     assert.equal(await page.locator('[data-testid="pause-toggle"]').textContent(), 'Resume');
     const manualShot = await screenshotCanvas(page, '16-manual-pause-precedence.png');
     await page.locator('[data-testid="pause-toggle"]').click();
     await waitForStatusTitle(page, /Effect active: Rigid mask/);
-    pass('Automatic tracking recovery does not override manual pause', `${manualShot} ${stillPaused.explanation}`);
+    pass(
+      'Manual pause persists until Resume and is the reported output reason across tracking changes',
+      `${manualShot} ${stillPaused.explanation}`,
+    );
 
     // AC4: tracking readiness/loss gates every selected effect, not just the mask.
     await page.locator('[data-testid="effect-select"]').selectOption('warm');
@@ -1631,8 +1689,17 @@ async function recordedMotionScenario() {
 
     const samples = [];
     const sampleShots = [];
+    let windowExitedAtMs = null;
     for (let index = 0; index < 18; index += 1) {
       await page.waitForTimeout(400);
+      const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+      const mediaMs = Number(timestamp.mediaMs ?? 0);
+      if (mediaMs > MOTION_WINDOW_END_MS) {
+        // Sampling reached the end of the documented 8 s window; keep the
+        // collected in-window samples and record where it stopped.
+        windowExitedAtMs = mediaMs;
+        break;
+      }
       const tracking = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
       if (tracking.phase !== 'tracking') continue;
       const mask = await readMask(page);
@@ -1646,13 +1713,19 @@ async function recordedMotionScenario() {
         originY: Number(mask.originY),
         face,
         inside: originInsideFace(mask, face),
-        mediaMs: Number(parseKeyValues(await readDiagnostic(page, 'diag-timestamp')).mediaMs ?? 0),
+        mediaMs,
       });
       if (index === 3 || index === 9 || index === 15) {
         const shot = await screenshotCanvas(page, `18-motion-mask-${index}.png`);
         sampleShots.push(shot);
       }
     }
+    // Every kept sample must be inside the documented window; the window exists
+    // so the pose ranges are not a whole-clip claim.
+    assert.ok(
+      samples.every((sample) => sample.mediaMs >= MOTION_WINDOW_START_MS && sample.mediaMs <= MOTION_WINDOW_END_MS),
+      `motion samples must fall inside the ${MOTION_WINDOW_SECONDS}s window at ${MOTION_WINDOW_START_SECONDS}s: ${samples.map((sample) => sample.mediaMs).join(', ')}`,
+    );
     assert.ok(samples.length >= 14, `expected most motion-window frames tracked, got ${samples.length}/18`);
     assert.ok(samples.every((sample) => sample.inside), 'the mask must stay attached to the face during turns and nods');
     const yawRange = spread(samples.map((sample) => sample.yaw));
@@ -1672,6 +1745,10 @@ async function recordedMotionScenario() {
     evidence.motion = {
       fixture: motionMetadata.id,
       windowStartSeconds: MOTION_WINDOW_START_SECONDS,
+      windowSeconds: MOTION_WINDOW_SECONDS,
+      windowStartMediaMs: MOTION_WINDOW_START_MS,
+      windowEndMediaMs: MOTION_WINDOW_END_MS,
+      windowExitedAtMs,
       trackedSamples: samples.length,
       yawRange,
       pitchRange,
@@ -1680,10 +1757,11 @@ async function recordedMotionScenario() {
       originYRange,
       previewProbe: motionProbe,
       screenshots: sampleShots,
+      samples,
     };
     pass(
       'The mask follows recorded head turns, nods and leaning through the normal pipeline',
-      `tracked=${samples.length}/18 yaw=${yawRange.toFixed(1)} pitch=${pitchRange.toFixed(1)} roll=${rollRange.toFixed(1)} origin=${originXRange}x${originYRange}px`,
+      `tracked=${samples.length}/18 yaw=${yawRange.toFixed(1)} pitch=${pitchRange.toFixed(1)} roll=${rollRange.toFixed(1)} origin=${originXRange}x${originYRange}px mediaMs=${samples[0]?.mediaMs ?? '?'}-${samples[samples.length - 1]?.mediaMs ?? '?'} (window ${MOTION_WINDOW_START_MS}-${MOTION_WINDOW_END_MS})`,
     );
     pass('Masked motion-window screenshots captured at three points in the turn', sampleShots.join(' '));
 
@@ -1782,10 +1860,16 @@ async function trackerModelScenario() {
       const rgb = await readRgb(page);
       assert.ok(rgbSum(rgb) < 120, `corrupt tracker model must hide the output, got ${JSON.stringify(rgb)}`);
       const shot = await screenshotCanvas(page, '20-corrupt-tracker-model.png');
-      evidence.corrupt = { status, preview: rgb, screenshot: shot };
+      // The paused screen is one canvas shared with the camera path, so the
+      // corrupt-model case is cheap to confirm through the camera consumer too.
+      await waitForVirtualCamera(page);
+      const run = await captureCameraState(page, 'corrupt-tracker', 6);
+      assertAllPausedFrames(run.frames, 'corrupt tracker model');
+      const png = assertPausedPng(run.frames, 'corrupt tracker model');
+      evidence.corrupt = { status, preview: rgb, camera: averageFrameRgb(run.frames), png: png.png, screenshot: shot };
       pass(
         'A corrupt tracker model (checksum mismatch) shows an actionable error and hidden output',
-        `${JSON.stringify(rgb)} ${shot}`,
+        `${JSON.stringify(rgb)} camera=${JSON.stringify(evidence.corrupt.camera)} ${png.png}`,
       );
       assert.deepEqual(consoleErrors, [], `renderer console errors: ${consoleErrors.join(' | ')}`);
     } finally {
@@ -1907,6 +1991,7 @@ async function main() {
         durationSeconds: motionManifest.durationSeconds,
         resolution: `${motionManifest.width}x${motionManifest.height}`,
         windowStartSeconds: MOTION_WINDOW_START_SECONDS,
+        windowSeconds: MOTION_WINDOW_SECONDS,
       },
     },
     measuredBoundaries: [
@@ -1968,6 +2053,14 @@ async function main() {
         unreliableConfirmMs: 250,
         recoveryConfirmMs: 300,
         maxConsecutiveInferenceErrors: 5,
+      },
+      // Policy states produced by the labelled diagnostic injection, with the
+      // phase the output policy acted on; the real detector path is used for
+      // the trackingReady and recorded-motion evidence.
+      injectedStates: {
+        trackingLost: trackingMask.states.trackingLost.injectedTracking,
+        multipleFaces: trackingMask.states.multipleFaces.injectedTracking,
+        unreliable: trackingMask.states.unreliable.injectedTracking,
       },
       evidence: {
         defaultClip: trackingMask,

@@ -11,7 +11,10 @@
  * - `multiple-faces` and `unreliable` pause immediately or after a short
  *   confirmation window;
  * - recovery requires a confirmed stretch of reliable one-face samples, so the
- *   output cannot flap between processed frames and the paused screen.
+ *   output cannot flap between processed frames and the paused screen;
+ * - the per-sample pose-jump guard only applies while tracking is continuous:
+ *   once the phase leaves `tracking`, the pre-loss pose is no longer a valid
+ *   reference for a person who may have moved legitimately.
  *
  * Manual pause is deliberately *not* modelled here: the output policy checks it
  * before tracking state, so automatic recovery can never override it.
@@ -122,6 +125,8 @@ export class TrackingStateMachine {
   private lastGoodAtMs: number | null = null;
   private recoverySinceMs: number | null = null;
   private previousPose: TrackingPose | null = null;
+  /** First sample of the current continuous zero-face run, if any. */
+  private zeroSinceMs: number | null = null;
   private faceCount = 0;
   private landmarkCount = 0;
   private hasTransform = false;
@@ -133,6 +138,7 @@ export class TrackingStateMachine {
     this.lastGoodAtMs = null;
     this.recoverySinceMs = null;
     this.previousPose = null;
+    this.zeroSinceMs = null;
     this.faceCount = 0;
     this.landmarkCount = 0;
     this.hasTransform = false;
@@ -168,6 +174,7 @@ export class TrackingStateMachine {
     this.landmarkCount = sample.landmarkCount;
     this.hasTransform = sample.hasTransform;
     this.injected = injected;
+    this.zeroSinceMs = classification === 'none' ? (this.zeroSinceMs ?? nowMs) : null;
 
     if (classification === 'reliable') {
       this.lastGoodAtMs = nowMs;
@@ -206,6 +213,16 @@ export class TrackingStateMachine {
       }
     } else if (this.phase === 'initializing' && sinceReferenceMs > TRACKING_LIMITS.lostGraceMs) {
       this.setPhase('lost', nowMs);
+    } else if (
+      this.phase === 'multiple-faces' &&
+      classification === 'none' &&
+      this.zeroSinceMs !== null &&
+      nowMs - this.zeroSinceMs > TRACKING_LIMITS.lostGraceMs
+    ) {
+      // The second face left as well. The output is already hidden; once zero
+      // faces have persisted through the grace window, report the accurate
+      // reason (no face) instead of claiming that more than one is visible.
+      this.setPhase('lost', nowMs);
     }
     return this.snapshot(nowMs);
   }
@@ -228,6 +245,14 @@ export class TrackingStateMachine {
     if (this.phase === phase) return;
     this.phase = phase;
     this.phaseSinceMs = nowMs;
+    if (phase !== 'tracking') {
+      // Leaving `tracking` invalidates the pose-jump reference. The guard exists
+      // to reject a single glitched sample during continuous tracking; keeping a
+      // pre-loss pose would instead reject a person who legitimately moved while
+      // the output was paused, so a face returning at a different pose could
+      // never reacquire (AC3 automatic recovery).
+      this.previousPose = null;
+    }
   }
 }
 

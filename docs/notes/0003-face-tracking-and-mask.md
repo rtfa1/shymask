@@ -83,9 +83,19 @@ the only frame source.
 | Consecutive inference errors | 5 | Turns repeated detector failure into the persistent hidden-output error |
 
 - **Multiple faces pause immediately.** A second person is never published, so
-  there is no confirmation delay for that state.
+  there is no confirmation delay for that state. If the second face leaves and
+  then no face is detected, the phase moves to `lost` after the grace window so
+  the explanation says "no face was detected" instead of claiming that more than
+  one face is still visible; the output stays hidden throughout.
 - **Recovery is automatic** once exactly one reliable face has persisted for the
   recovery window, unless the operator paused manually.
+- **The pose-jump guard is scoped to continuous tracking.** A single implausible
+  jump (more than 30 cm or 60 degrees in one sample) is still rejected while the
+  phase is `tracking`, so a detector glitch cannot teleport the mask. When the
+  phase leaves `tracking` (lost, unreliable or multiple faces), the pre-loss pose
+  reference is discarded: a person who legitimately turned while the output was
+  paused must be able to reacquire through the normal recovery window (issue #4,
+  AC3).
 - **Readiness before first detection:** the policy has an `initializing` phase
   and hides the output with "tracking is starting" until the first confirmed
   face.
@@ -124,9 +134,12 @@ The renderer, WASM fileset, model and replay media are served from a local
 This is what allows the strict CSP (`default-src 'none'`, `script-src 'self'
 'wasm-unsafe-eval'`, `connect-src 'self'`) to keep working while the Fetch API
 loads the WASM/model, and it gives the replay `<video>` byte-range support for
-seeking. Only the build output, tracker directory and fixture directory are
-reachable; traversal is rejected. No network listener or Windows API is added to
-the portable path.
+seeking. Byte ranges support `start-end`, `start-` and the suffix form `-N`
+(the last N bytes); an end past the file size is clamped to the last byte and an
+unsatisfiable range gets 416. Only the build output, tracker directory and
+fixture directory are reachable; traversal is rejected, and a symlink is
+rejected when its resolved real path leaves its configured root. No network
+listener or Windows API is added to the portable path.
 
 ## Measured behavior (replay-based, this development desktop)
 
