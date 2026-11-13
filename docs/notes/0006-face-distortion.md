@@ -150,9 +150,13 @@ captured through the public **Capture evidence frame** control and compared:
 - the A/B is repeated at a second documented held pose with a different face
   position; the changed-region centroid must move with the face.
 
-A regression that drops the warp makes ON == OFF; a fixed screen-space overlay
-falls outside the tracked ellipse at one of the two poses. This is stronger
-than the offscreen warp delta and is reported as the published-output evidence.
+A regression that drops the warp makes ON == OFF. A fixed screen-space overlay
+is excluded by the cross-pose centroid gate, not by ellipse containment: the
+two tracked ellipses overlap, so a fixed point can be inside both. The check
+requires the changed-region centroid to move at least 40 px and at least 50% of
+the face-box movement between the two documented poses; a fixed overlay cannot
+satisfy that. This is stronger than the offscreen warp delta and is reported as
+the published-output evidence.
 
 ## Evidence (replay-based, this development desktop)
 
@@ -175,8 +179,12 @@ Covered by `npm test` and `npm run check`:
   the held-frame warp ON/OFF A/B in preview and camera, injects a WebGL context
   loss and asserts the hidden output plus recovery after a browser restore, and
   exercises every paused-output case (manual pause, tracking loss, multiple
-  faces, processing failure, switching, no-effect and removal) in preview and
-  camera. It also rejects the four distortion negative fixtures with their
+  faces, processing failure, switching, no-effect and removal). Manual pause,
+  tracking loss, multiple faces, processing failure, context loss, no-effect and
+  removal are camera-captured in preview and the independent camera; switching
+  is asserted by the public `switchingPausedFrames` counter and status text
+  (the six other paused states are the captured ones). It also rejects the four
+  distortion negative fixtures with their
   documented codes and keeps the previous effect rendering.
 - Scenario G (recorded `pose-loop-v1` clip, documented 8 s turn/nod/lean
   window): the warp ellipse's centre follows the tracked face box and moves at
@@ -201,21 +209,26 @@ Hardware and source are the same development desktop and fixtures as note 0005
 Landmarker 0.10.21 GPU delegate; Three.js 0.180.0). The distortion sample is the
 415-byte `fixtures/packages/face-distortion.zip` (1 entry, 496-byte schema v2
 manifest, no mask asset). The cited run is
-`evidence/check-2026-11-13T21-25-31-655Z/summary.json` at head
+`evidence/check-2026-11-13T21-25-31-655Z/summary.json` at code head
 `0e0e1a8c6e417ff73b6f14de83afc48735788746` (83/83 checks); all values below are
-from that run unless marked as earlier-run observations:
+from that run unless marked as earlier-run observations. The final head
+`e868fa608d5a3664e6a4aef12cfd4fd1ca3be124` adds documentation-only commits
+after that code head, and its own complete run
+(`evidence/check-2026-11-13T21-36-47-057Z/summary.json`) also passes 83/83 with
+slightly different per-run pixel counts; `evidence/logs/check-final.log` is that
+final-head run:
 
 | Measurement | Value |
 | --- | --- |
 | Default-clip offscreen warp change (diagnostic) | 72.5% of inside-ellipse samples changed, 0.0% outside, warp delta 0.86 (0-255 mean absolute); earlier runs 68.9–72.5% |
 | Distortion preview PNG | exact 1280×720 captured output, non-paused (mean RGB 140,51,43 for the PNG; live mean 143,53,45) |
-| Distortion camera PNG | independent Media Foundation consumer mean 139,51,43; matched the preview within the check's tolerance |
+| Distortion camera PNG | independent Media Foundation consumer mean 139,51,46; matched the preview within the check's tolerance (captured PNG mean 138,51,45) |
 | Main-thread warp submission, p95 | 0.4 ms at 1280×720 (rolling p95 after warm-up). `performance.now()` around `renderer.render()` only: no GPU sync or readback, so the GPU/compositor cost is not included |
 | Render + composite + diagnostics, p95 | 14.6 ms, with the color-only baseline 14.0 ms on the same fixture (observed sequential delta 0.6 ms); earlier runs 14.9–15.4 ms vs 13.8–15.1 ms. Not an isolated distortion cost |
 | Presented-frame interval, p95 | 69.5 ms vs 48.7 ms in the cited run's sequential 2.2 s windows (observed delta 20.8 ms); earlier runs 62.5–76.5 ms vs 48.7–56 ms. The windows are not isolated, so the delta is reported as observed run variation, not attributed added cost |
 | Published-output A/B, default clip | held 1.5 s frame: 32,036 changed pixels, 100% inside the independent `diag-face` ellipse, 0 outside; two ON and two OFF captures each 0 self-diff; camera PNG changed by the identical 32,036 pixels |
 | Recorded-motion window | 18/18 samples tracked on `pose-loop-v1` (enforced ≥12 of 18); warp centre moved 93×68 px with the face box; inside-ellipse change 55.7–71.6% (every sample passes the ≥8% inside / ≤3% outside gates) |
-| Published-output A/B, two poses | held 47.7 s: 62,598 changed pixels (100% inside the independent ellipse, 0 outside); held 16.0 s: 62,763 changed pixels (100% inside, 0 outside); camera identical to preview and 0 same-state self-diff at both; changed-region centroid moved 117.8 px with a 108.2 px face move |
+| Published-output A/B, two poses | held 47.7 s: 62,236 changed pixels (100% inside the independent ellipse, 0 outside); held 16.0 s: 62,763 changed pixels (100% inside, 0 outside); camera identical to preview and 0 same-state self-diff at both; changed-region centroid moved 117.8 px with a 108.2 px face move |
 | Paused-output camera captures | manual pause, tracking loss, multiple faces, processing failure, context loss, no-effect and removal all delivered the opaque paused canvas (mean ≈ 12,15,20) |
 | WebGL context loss | diagnostic `drawable=false`, `contextLost=true`; opaque paused output in preview (10,13,18) and camera (12,15,20); browser restore returned `drawable=true` and the effect resumed (preview 143,54,47) |
 
@@ -228,13 +241,18 @@ the exact 1280×720 ON/OFF PNGs differ by tens of thousands of pixels, all insid
 the independently derived tracked-face ellipse and none outside, with zero
 same-state self-diff and an identical camera change. Across two documented poses
 the changed region moved with the face. The pixel-change metric is not a visual
-quality score; the saved PNGs show the resulting frames.
+quality score; the saved PNGs show the resulting frames. The A/B proves a
+localized published change and a face-relative changed-region centroid; it is
+not a measurement of the radial displacement kernel, and OFF provenance rests on
+the effect-selection assertions and the renderer code path.
 
-See the measured values in the run's `summary.json`
-(`effectPackages.faceDistortion.evidence`, including `ab`, `abOpposite`,
-`faceFollowingPoses` and `contextLoss`, and
-`effectPackages.faceDistortion.motionFollowing`) and
-`evidence/logs/check-final.log`.
+See the measured values in the run's `summary.json`. The default-clip A/B,
+preview/timing/context-loss data and `timingBaseline` are under
+`effectPackages.faceDistortion.evidence` (including `ab` and `contextLoss`);
+the two-pose A/B, opposite-pose A/B, centroid comparison and motion samples are
+under `effectPackages.faceDistortion.motionFollowing` (including `ab`,
+`abOpposite`, `faceFollowingPoses`, `samples`, `centerXRange`, `centerYRange`).
+`evidence/logs/check-final.log` is the final-head run described above.
 
 ## Supported limits and remaining limitations
 

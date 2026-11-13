@@ -273,7 +273,7 @@ npm run fetch:motion-fixture
 ```
 
 The public-workflow check asserts, through the app's visible controls, its diagnostics and the
-independent camera consumer (79/79 checks passed in the latest run at this head):
+independent camera consumer (83/83 checks passed in the latest run at this head):
 
 1. Startup is the opaque "Tracking paused" screen; no raw feed.
 2. Start renders a processed replay frame through the treatment control.
@@ -410,13 +410,15 @@ independent camera consumer (79/79 checks passed in the latest run at this head)
     inside/outside change gates, and three screenshots are saved. The published A/B is repeated at the
     held 47.7 s and 16.0 s poses: the changed-region centroid moves 117.8 px with a 108.2 px face move,
     so the change is anchored to the tracked face rather than a fixed screen-space overlay.
-38. The distortion follows every paused-output rule in preview and camera: manual pause, injected
-    tracking loss, injected multiple faces, injected processing failure, switching to an imported
-    mask (paused while it loads) and back, explicit `No effect`, and removal of the active package
-    all show the opaque paused canvas in both paths; recovery is automatic after the injection
-    clears. The four distortion negative fixtures (v1 declaration, unsupported mode, out-of-range
-    strength, unknown field) are rejected with `schema-version-unsupported` or `distortion-invalid`
-    and leave the previous effect rendering.
+38. The distortion follows every paused-output rule: manual pause, injected tracking loss, injected
+    multiple faces, injected processing failure, switching to an imported mask (paused while it loads)
+    and back, explicit `No effect`, and removal of the active package all keep the output hidden.
+    Manual pause, tracking loss, multiple faces, processing failure, context loss, `No effect` and
+    removal are camera-captured in preview and the independent camera; the switching case is asserted
+    by the public `switchingPausedFrames` counter and status text (the six other paused states are the
+    captured ones). Recovery is automatic after the injection clears. The four distortion negative
+    fixtures (v1 declaration, unsupported mode, out-of-range strength, unknown field) are rejected
+    with `schema-version-unsupported` or `distortion-invalid` and leave the previous effect rendering.
 39. Replay-based timing for the distortion path is recorded at 1280×720: main-thread warp submission
     time (no GPU sync/readback), the full render/composite cost and the presented-frame interval,
     plus a color-only package baseline on the same fixture. The render-cost and frame-interval
@@ -488,7 +490,7 @@ source clip 3.379 s:
 | Face-distortion presented-frame interval, p95 | 69.5 ms vs 48.7 ms in the cited run's sequential 2.2 s windows (observed delta 20.8 ms); earlier runs observed 62.5–76.5 ms vs 48.7–56 ms. The windows are not isolated and the delta is not attributed to the warp |
 | Face-distortion published-output A/B (held default-clip frame at 1.5 s) | 32,036 pixels changed, 100% inside the ellipse derived from the independent `diag-face` tracking box and 0 outside; two ON and two OFF captures are each pixel-identical (0 self-diff); the independent Media Foundation camera PNG changed by the identical 32,036 pixels |
 | Face-distortion recorded-motion following | 18/18 sampled frames tracked on `pose-loop-v1` in the cited run (enforced ≥12 of 18); warp centre moved 93 × 68 px with the tracked face box; inside-ellipse change 55.7–71.6% (every sample passes the ≥8% inside / ≤3% outside gates) |
-| Face-distortion face-following A/B (two held poses) | at 47.7 s and 16.0 s the published change was 62,598 and 62,763 px, all inside the independent `diag-face` ellipse and 0 outside, with the camera receiving the identical change and 0 same-state self-diff; the changed-region centroid moved 117.8 px with a 108.2 px face move |
+| Face-distortion face-following A/B (two held poses) | at 47.7 s and 16.0 s the published change was 62,236 and 62,763 px, all inside the independent `diag-face` ellipse and 0 outside, with the camera receiving the identical change and 0 same-state self-diff; the changed-region centroid moved 117.8 px with a 108.2 px face move |
 | Face-distortion WebGL context loss | public `WEBGL_lose_context` injection made the renderer non-drawable (`drawable=false`, `contextLost=true`); the 250 ms undrawable guard showed the opaque paused screen in preview (10,13,18) and camera (12,15,20). A browser restore returned `drawable=true` and the effect resumed (preview 143,54,47) |
 | Loop cycles observed | 3 seam crossings inside an 8.36–8.60 s sampling window |
 | Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
