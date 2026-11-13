@@ -1,4 +1,4 @@
-# Shymask
+﻿# Shymask
 
 Shymask applies visual effects to a webcam feed and (later) publishes the result as a virtual
 webcam. This repository is currently a **preview-only technology spike** for issue #2: a desktop
@@ -7,6 +7,14 @@ treatment. No physical webcam, account, cloud service, or live test subject is u
 
 This slice deliberately does **not** include face tracking, masks, virtual webcam publication, or
 the final 720p/30 FPS / 100 ms target. Those arrive in later child tickets of the parent spec.
+
+Issue #3's Windows virtual camera work lives in an isolated native spike under `native/`
+(Media Foundation software camera source + session-lifetime host + an independent Source Reader
+consumer harness). On this machine it is **blocked by a Windows permission boundary**: the Media
+Foundation frame server runs as Local Service and cannot activate a per-user (HKCU) COM media
+source, while a machine-wide (HKLM) registration needs one elevated install step. The preview app
+is not wired to the camera until that boundary is resolved. See
+[`docs/notes/0002-windows-virtual-camera-spike.md`](docs/notes/0002-windows-virtual-camera-spike.md).
 
 ## Quick start (Windows 11)
 
@@ -32,7 +40,7 @@ If `npm install` blocks install scripts (newer npm releases gate them), run
 | **Pause / Resume** | Manual pause replaces the whole output with the opaque "Tracking paused" screen and freezes processing. It persists until Resume is pressed. |
 | **Color treatment** | `Warm tint`, `Cool tint`, `Monochrome`, or explicit `No effect`. Choosing `No effect` hides the output; choosing a treatment restores it automatically. |
 | **Recheck input** | Re-runs fixture size/checksum validation. Use after fetching a fixture that was missing at launch. |
-| **Capture evidence frame** | Writes the current output canvas (1280×720 PNG) to `evidence/` and shows the path in the app. |
+| **Capture evidence frame** | Writes the current output canvas (1280Ã—720 PNG) to `evidence/` and shows the path in the app. |
 | **Simulate effect-processing failure** | Diagnostic-only toggle that forces the failure policy to demonstrate the opaque paused output and automatic recovery. |
 
 The app never opens a physical camera in this slice. There is no passthrough mode: the output is
@@ -43,12 +51,12 @@ either a processed replay frame or the opaque "Tracking paused" screen.
 - **Recorded input.** `fixtures/cache/webcam-loop.webm` is downloaded by `npm run fetch:fixture` and
   validated against the committed metadata (`fixtures/webcam-loop.json`). Invalid or missing media
   produces an actionable error and hidden output; `Start` stays disabled.
-- **One output canvas.** Every frame — processed or paused — is drawn to the single
-  `#output` canvas at 1280×720. Later slices will capture that same canvas for the virtual webcam
+- **One output canvas.** Every frame â€” processed or paused â€” is drawn to the single
+  `#output` canvas at 1280Ã—720. Later slices will capture that same canvas for the virtual webcam
   and insert tracking before the treatment, instead of building a second demo pipeline.
 - **Real-time loop.** The clip plays muted at rate 1 with `requestVideoFrameCallback` as the
   present-time scheduler. The processing timestamp is monotonic across loop seams:
-  `loopIndex × clipDuration + mediaTime`. A loop seam is a deliberate media-time reset, not a
+  `loopIndex Ã— clipDuration + mediaTime`. A loop seam is a deliberate media-time reset, not a
   tracking defect. A one-frame decode gap at a seam keeps the last processed frame visible rather
   than flashing the paused screen; a decode gap longer than 250 ms is treated as a processing
   failure and hides the output. A 50 ms timer watchdog covers the case `requestVideoFrameCallback`
@@ -72,6 +80,27 @@ npm run check       # builds, launches the real Electron app with Playwright, dr
 npm run check:all   # npm test && npm run check
 ```
 
+Native virtual camera components (issue #3) are built and exercised separately; they require the
+MSVC "Desktop development with C++" workload and the Windows 11 SDK (`mfvirtualcamera.h`,
+`mfsensorgroup.lib`):
+
+```powershell
+npm run build:native # ShymaskVirtualCamera.dll, shymask-vcam-host.exe, shymask-camera-consumer.exe
+npm run vcam:install # stages binaries in %ProgramData%\Shymask\bin, registers per user
+npm run vcam:status  # enumerates Media Foundation camera devices (public OS path)
+npm run vcam:check   # 1280x720 test-pattern source + camera host + independent consumer;
+                     # exits 0 on a passing consumer run and 3 with a BLOCKED evidence report
+```
+
+`npm run vcam:check` currently exits `3`: `MFCreateVirtualCamera` succeeds, the OS creates the
+per-user camera device and the frame server attempts to initialize it, but
+`IMFVirtualCamera::Start` returns `0x80070003` because the Local Service frame server cannot see the
+per-user COM registration. No consumer receives frames in that state, so no camera evidence is
+claimed. One elevated action unblocks it: run `npm run vcam:install` once from an elevated prompt
+(it then writes the machine-wide HKLM registration). `npm run vcam:uninstall` removes it, and
+`evidence/vcam-check/summary.json` records the exact head SHA, HRESULTs, registry state and
+frame-server events for the run.
+
 The repository has **no CI** (there is no `.github/workflows` directory) and `main` has **no branch
 protection or rulesets** (verified read-only through the GitHub API on 2026-11-13). These local
 checks are therefore the validation gate, and they must pass at the exact head SHA being delivered.
@@ -92,7 +121,7 @@ The public-workflow check asserts, through the app's visible controls and diagno
    the sampled diagnostics (not the loop counter that increments alongside them).
 7. A missing fixture and a checksum-corrupt fixture each show an actionable error, hide output and
    keep Start disabled.
-8. The public capture control writes a valid 1280×720 PNG of the output canvas.
+8. The public capture control writes a valid 1280Ã—720 PNG of the output canvas.
 9. No renderer console errors occur, and no physical-camera API appears in application source.
 10. A silent decode stall (media element paused directly, bypassing the manual Pause control) hides
     the output behind the opaque paused screen after the 250 ms watchdog and recovers on the next
@@ -115,20 +144,20 @@ From a passing `npm run check` run on 2026-11-13 at head
 - **Hardware:** 11th Gen Intel Core i7-11700K (8 cores / 16 logical), NVIDIA GeForce RTX 3070 Ti,
   31.8 GiB RAM, Windows 11 Pro 10.0.26100 (build 26100). Node.js 24.19.0, Electron 45.3.1.
 - **Workload and source mode:** recorded replay fixture `fixtures/cache/webcam-loop.webm` decoded by
-  Chromium; Electron development preview only — no physical webcam, call/stream application, or
+  Chromium; Electron development preview only â€” no physical webcam, call/stream application, or
   virtual webcam in the path.
 - **Commands:** `npm run typecheck`, `npm test`, `npm run check`.
 
 | Measurement | Value |
 | --- | --- |
-| Source frame interval, p95 | 47.4 ms in this run; ~42–49 ms across passing runs (the clip presents at ~21–24 Hz here; no 30 FPS forcing) |
+| Source frame interval, p95 | 47.4 ms in this run; ~42â€“49 ms across passing runs (the clip presents at ~21â€“24 Hz here; no 30 FPS forcing) |
 | Render + filter cost, p95 | 0.40 ms (main-thread draw/filter submission; compositor/GPU latency not measured) |
 | Loop cycles observed | 3 seam crossings inside a 9.29 s sampling window; that window spans parts of four clip plays (~2.75 clip durations), so it is a cross-seam observation, not a throughput figure |
 | Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
-| Replay pacing ratio | 0.983 processing time / wall time in this run; ~0.98–0.99 across passing runs |
+| Replay pacing ratio | 0.983 processing time / wall time in this run; ~0.98â€“0.99 across passing runs |
 
 Run-to-run variation is expected under desktop load; these are observations, not benchmarks. The
-numbers are replay-derived. They do **not** establish the parent spec's 720p/30 FPS / ≤100 ms
+numbers are replay-derived. They do **not** establish the parent spec's 720p/30 FPS / â‰¤100 ms
 camera-to-output target, physical-camera compatibility, or laptop integrated-graphics suitability.
 See `docs/notes/0001-preview-stack-and-loop.md`.
 
@@ -145,10 +174,11 @@ committed; only the fetch script and metadata are versioned.
 src/core/       output policy, replay clock, canvas pipeline, treatments
 src/main/       Electron main process, fixture validation, IPC
 src/renderer/   desktop preview UI (HTML/CSS/TS)
-scripts/        build, start, fixture fetch, public-workflow check
+scripts/        build, start, fixture fetch, public-workflow check, native camera scripts
+native/         Windows virtual camera spike (Media Foundation COM media source, host, consumer)
 tests/          focused unit tests (node:test)
 fixtures/       committed metadata; fetched media is gitignored
-docs/           fixture note and the preview/loop spike note
+docs/           fixture note and the preview/loop + virtual camera spike notes
 ```
 
 ## Environment notes and troubleshooting
@@ -177,3 +207,23 @@ public controls, and reproducible local checks.
 
 Deferred: physical webcam capture, face tracking, masks/occlusion, secondary motion, virtual webcam
 publication, Zoom/Meet/OBS compatibility, final live acceptance, and the performance target.
+
+The native virtual camera spike under `native/` is committed as documentation of the issue #3
+blocker and as a starting point for the unblocked slice. It does not change the preview app's
+behavior and is not wired into the public workflow.
+
+## Windows virtual camera prerequisites and cleanup
+
+- `npm run build:native` needs MSVC (`cl.exe` from the C++ build tools) and Windows SDK 10.0.26100 (or newer with
+  `mfvirtualcamera.h`), so it is not part of `npm start` or `npm run check`.
+- `npm run vcam:install` stages binaries in `%ProgramData%\Shymask\bin` and registers the media
+  source for the current user. If run elevated, it also writes the machine-wide (HKLM) registration.
+- `npm run vcam:uninstall` removes the per-user registration; run it elevated to remove the
+  machine-wide one. The installed binaries and `%ProgramData%\Shymask\vcam.log` are left in place
+  for inspection (delete the directory manually if desired).
+- Camera registration leaves no device behind: the camera host uses `MFVirtualCameraLifetime_Session`
+  and calls `Stop`/`Remove` on exit, so a closed Shymask (or host) stops the camera.
+- If `IMFVirtualCamera::Start` returns `0x80070003`, the frame server cannot see the media source:
+  run `npm run vcam:install` from an elevated prompt once and retry. If it returns `0x80070005`,
+  check Windows camera privacy settings ("Let desktop apps access your camera").
+
