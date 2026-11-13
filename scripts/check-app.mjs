@@ -2225,8 +2225,18 @@ async function effectPackageScenario() {
     const importedLostShot = await screenshotCanvas(page, '24-imported-effect-tracking-lost.png');
     await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
     await waitForStatusTitle(page, /Effect active: Guard visor/);
-    const recoveredRgb = await readRgb(page);
-    assert.ok(rgbSum(recoveredRgb) > 120, 'the imported effect must recover automatically');
+    // The status decision and the throttled mean-RGB diagnostic update on
+    // different ticks after a tracking recovery, so wait for the processed frame
+    // itself instead of reading the previous paused sample.
+    const recoveredRgb = await waitFor(
+      'imported effect recovered output',
+      async () => {
+        const rgb = await readRgb(page);
+        return rgbSum(rgb) > 120 ? rgb : null;
+      },
+      10000,
+      100,
+    );
     evidence.switching.trackingGate = {
       paused: importedLostRgb,
       camera: averageFrameRgb(importedLostRun.frames),
