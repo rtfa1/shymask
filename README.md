@@ -83,12 +83,11 @@ the virtual camera. Closing Shymask stops its camera output.
   canvas to the native Windows virtual camera over a loopback frame transport, and
   `src/renderer/renderer.ts` pushes every drawn output frame plus a 100 ms heartbeat (only while a
   camera consumer is connected). Startup, no effect, manual pause, processing errors and missing
-  input therefore all appear in the camera as the same opaque "Tracking paused" canvas, and an
-  interrupted switch would pause the same way; a treatment change itself is synchronous and renders
-  the new treatment in the camera immediately (the async switching-interruption sub-case is
-  deferred; see Scope boundaries). The native opaque fallback covers only the pre-connection
-  window. The camera uses `MFVirtualCameraLifetime_Session`, so closing Shymask stops the stream and
-  removes the device.
+  input therefore all appear in the camera as the same opaque "Tracking paused" canvas. A treatment
+  change itself is synchronous and renders the new treatment in the camera immediately (the async
+  switching-interruption sub-case is deferred; see Scope boundaries). The native opaque fallback
+  covers only the pre-connection window. The camera uses `MFVirtualCameraLifetime_Session`, so
+  closing Shymask stops the stream and removes the device.
 
 ## Windows virtual camera (issue #3)
 
@@ -225,14 +224,17 @@ hardware, workload, measured boundaries, commands, validation-gate facts and the
 
 `npm run vcam:check` independently exercises the native path: it asserts the test-pattern pixels and
 that a connected frame source which stops sending (socket kept open) is replaced by the native opaque
-paused fallback at/after the 1200 ms staleness bound; the validated run observed the transition at
-1254 ms (`evidence/vcam-check/summary.json`).
+paused fallback. The media source applies a 1200 ms freshness bound to the cached app frame; the
+harness accepts a transition gap of 800–3000 ms (measured from the last coloured frame's capture
+time to the first dark frame's receive time), and the validated run recorded a 1233 ms gap in
+`evidence/vcam-check/summary.json`.
 
 ### Measured baseline (replay-based, virtual camera)
 
-From a passing `npm run check` run on 2026-11-13 at validated head `d353aa68aac6efbe8035b1dee11dbb08fbf96e4a` (that
-run's `evidence/check-<timestamp>/summary.json` and `evidence/vcam-check/summary.json` record the same
-SHA; later documentation-only commits do not change the validated behavior), source clip 3.379 s:
+From a passing `npm run check` run on 2026-11-13 (the head SHA validated by the latest full check run
+is recorded in `evidence/check-<timestamp>/summary.json`, `evidence/vcam-check/summary.json`, and
+`evidence/logs/*-final.log`; later documentation-only commits do not change the validated behavior),
+source clip 3.379 s:
 
 - **Hardware:** 11th Gen Intel Core i7-11700K (8 cores / 16 logical), NVIDIA GeForce RTX 3070 Ti,
   31.8 GiB RAM, Windows 11 Pro 10.0.26100 (build 26100). Node.js 24.19.0, Electron 45.3.1.

@@ -10,12 +10,12 @@
   parent spec [#1](https://github.com/rtfa1/shymask/issues/1).
 - **Related decisions:** [ADR-0003](../adr/0003-conceal-the-face-on-tracking-failure.md) (opaque
   paused output in every output path), [ADR-0004](../adr/0004-declarative-effect-packages.md).
-- **Validated head:** `d353aa68aac6efbe8035b1dee11dbb08fbf96e4a` (full `npm run check` plus `npm run vcam:check` at that
-  commit). Both `evidence/check-<timestamp>/summary.json` and `evidence/vcam-check/summary.json`
-  record that SHA; the check summary also records hardware, workload, timing and camera evidence.
-  The matching logs are `evidence/logs/check-final.log` and `evidence/logs/vcam-final.log`. Later
-  documentation-only commits do not change the validated behavior. Local validation is the gate
-  (no CI in the repository).
+- **Validated head:** the head SHA that each full `npm run check` plus `npm run vcam:check` run
+  validated is recorded inside `evidence/check-<timestamp>/summary.json` and
+  `evidence/vcam-check/summary.json`; the matching logs are `evidence/logs/check-final.log` and
+  `evidence/logs/vcam-final.log`. The check summary also records hardware, workload, timing and
+  camera evidence. Later documentation-only commits do not change the validated behavior. Local
+  validation is the gate (no CI in the repository).
 
 ## Decision
 
@@ -142,9 +142,9 @@ renderer or a silently stalled producer cannot freeze the camera. The socket sta
 next complete frame restores processed output immediately. A socket close still resets the cached
 frame and falls back at once. `npm run vcam:check` exercises the steady-clock path with
 `scripts/dev/vcam-test-pattern.mjs --stop-after N`, which stops writing but keeps the connection open,
-and asserts that the consumer sees coloured frames followed by the dark paused fallback at/after
-the 1200 ms bound (the validated run observed the transition at 1254 ms in
-`evidence/vcam-check/summary.json`).
+and asserts that the consumer sees coloured frames followed by the dark paused fallback. The source
+bound is 1200 ms, while the harness accepts a transition gap of 800–3000 ms; the validated run
+recorded 1233 ms in `evidence/vcam-check/summary.json`.
 
 Two harness bugs found during bring-up are fixed: the consumer double-released its Source Reader
 at exit (access violation), and the host emitted unescaped backslashes in its JSON `list` output.
@@ -204,16 +204,16 @@ controls and an independent Media Foundation consumer process:
   treatments, loops/seams, pacing, PNG capture, no console errors) and 23 unit tests remain green.
 - `npm run vcam:check` exercises the native path without Electron: test-pattern pixels and the
   1200 ms freshness bound (a source that stops writing but keeps the socket open must give the
-  consumer the dark native paused fallback at/after the bound; the validated run observed the
-  transition at 1254 ms in `evidence/vcam-check/summary.json`).
+  consumer the dark native paused fallback; the harness accepts a transition gap of 800–3000 ms,
+  and the validated run recorded 1233 ms in `evidence/vcam-check/summary.json`).
 
 ### Measured baseline (replay-based, virtual camera)
 
-From a passing `npm run check` run on 2026-11-13 at validated head `d353aa68aac6efbe8035b1dee11dbb08fbf96e4a` (run-to-run
-variation is expected; that run's `evidence/check-<timestamp>/summary.json` and
-`evidence/vcam-check/summary.json` record the same SHA, and later documentation-only commits do not
-change the validated behavior), source clip 3.379 s, Windows 11 Pro 26100, i7-11700K / RTX 3070 Ti /
-31.8 GiB, Electron 45.3.1:
+From a passing `npm run check` run on 2026-11-13 (run-to-run variation is expected; the head SHA
+that run validated is recorded inside `evidence/check-<timestamp>/summary.json` and
+`evidence/vcam-check/summary.json`, and later documentation-only commits do not change the validated
+behavior), source clip 3.379 s, Windows 11 Pro 26100, i7-11700K / RTX 3070 Ti / 31.8 GiB, Electron
+45.3.1:
 
 | Measurement | Value |
 | --- | --- |
@@ -255,7 +255,9 @@ Boundaries:
   frames, and decodes the saved PNG for paused and processed assertions.
 - Each sample also carries the producer's frame `sequence` (from the wire header) as a diagnostic
   attribute, and the consumer prints it, so the evidence distinguishes several samples of the same
-  app frame from a newly published frame. Native paused fallback samples carry sequence 0.
+  app frame from a newly published frame. Sequence 0 does not identify the native paused fallback:
+  the producer's first published app frame also carries sequence 0. `captureUnixMs` is the
+  discriminator (0 for native fallback samples, > 0 for app-published frames).
 - The harness bounds every consumer run (consumer-side watchdog plus a Node-side timeout) so a
   stalled camera fails the check instead of hanging.
 - Timing numbers come from a single desktop run and vary with load; they are observations, not

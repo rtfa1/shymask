@@ -70,9 +70,11 @@ inline constexpr GUID kShymaskSampleAttributeCaptureUnixMs = {
     0x6b0a2f1c, 0x9d34, 0x4e58, {0x8a, 0x7b, 0x1c, 0x2d, 0x3e, 0x4f, 0x5a, 0x60}};
 
 // Custom per-sample attribute carrying the producer's frame sequence from the
-// wire header (0 for native paused fallback samples). Several 30 Hz samples can
-// reuse one app frame, so the sequence identifies the source frame a sample was
-// made from without assuming one new frame per sample.
+// wire header. Several 30 Hz samples can reuse one app frame, so the sequence
+// identifies the source frame a sample was made from without assuming one new
+// frame per sample. Sequence 0 does not imply the native paused fallback: the
+// first published app frame can also be 0. Use captureUnixMs (0 for native
+// fallback samples, > 0 for app-published frames) to tell them apart.
 // {7C4E1B2A-5D6F-4A83-9E0C-2B4D6F8A1C35}
 inline constexpr GUID kShymaskSampleAttributeSequence = {
     0x7c4e1b2a, 0x5d6f, 0x4a83, {0x9e, 0x0c, 0x2b, 0x4d, 0x6f, 0x8a, 0x1c, 0x35}};

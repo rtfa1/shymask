@@ -456,7 +456,8 @@ HRESULT MediaStream::CreateSample(const std::vector<uint8_t>& rgba, uint64_t cap
   created->SetUINT32(MFSampleExtension_Interlaced, 0);
   // Diagnostic: expose the producer's frame sequence so a consumer can tell
   // which app frame a sample came from (several 30 Hz samples reuse one
-  // ~21-24 Hz app frame). Native paused fallback samples carry sequence 0.
+  // ~21-24 Hz app frame). Sequence 0 does not imply the native paused fallback
+  // (the first published app frame can also be 0); captureUnixMs == 0 does.
   created->SetUINT64(kShymaskSampleAttributeSequence, sequence);
 
   *sample = created.Detach();
