@@ -1789,8 +1789,20 @@ async function recordedMotionScenario() {
       Math.max(originXRange, originYRange) >= 40,
       `recorded motion must move the mask origin, x=${originXRange} y=${originYRange}`,
     );
-    const motionProbe = await readMaskProbe(page);
-    assertMaskProbe(motionProbe, 'motion-window preview mask');
+    // The fixed local eye probe is exact only when the eye plate faces the
+    // camera; at some large yaw/pitch poses the same view ray lands on the
+    // surrounding shell. Wait for a frame in the continuing replay where the
+    // sampled probe is actually the eye colour instead of asserting on one
+    // arbitrary post-window frame.
+    const motionProbe = await waitFor(
+      'motion-window mask eye probe',
+      async () => {
+        const probe = await readMaskProbe(page);
+        return maskEyeColourMatches(probe) ? probe : null;
+      },
+      5000,
+      100,
+    );
     evidence.motion = {
       fixture: motionMetadata.id,
       windowStartSeconds: MOTION_WINDOW_START_SECONDS,
