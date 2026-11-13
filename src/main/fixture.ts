@@ -5,7 +5,6 @@ import { pathToFileURL } from 'node:url';
 import type { FixtureInfo, FixtureMetadata } from '../core/bridge';
 
 export const FIXTURE_METADATA_FILENAME = 'webcam-loop.json';
-export const FIXTURE_DIR_DEFAULT = path.join('fixtures', 'cache');
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 const FETCH_ACTION =
@@ -111,7 +110,6 @@ export function loadFixture({ repoRoot, fixtureDir }: LoadFixtureOptions): Fixtu
   return {
     state: 'ready',
     metadata,
-    videoPath,
     videoUrl: pathToFileURL(videoPath).href,
   };
 }

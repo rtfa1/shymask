@@ -1,4 +1,5 @@
 import type { FixtureInfo } from '../core/bridge';
+import { DECODE_STALL_THRESHOLD_MS, FrameWatchdog } from '../core/frame-watchdog';
 import { PAUSED_TITLE, resolveOutput, type OutputDecision, type PreviewState } from '../core/output-policy';
 import { PreviewPipeline, type FrameStats } from '../core/pipeline';
 import { ReplayTimeline, type ReplayFrameTimestamp } from '../core/replay-clock';
@@ -6,6 +7,8 @@ import { EFFECT_OPTIONS, getTreatment, type EffectId } from '../core/treatments'
 
 const SIMULATED_FAILURE_MESSAGE =
   'Effect processing is failing (simulated by the diagnostic control). The output is hidden.';
+const DECODE_STALL_MESSAGE = `The replay frame could not be decoded for more than ${DECODE_STALL_THRESHOLD_MS} ms. Output is hidden while the decoder recovers.`;
+const WATCHDOG_POLL_MS = 50;
 
 function mustGet<T extends HTMLElement>(id: string): T {
   const element = document.getElementById(id);
@@ -28,6 +31,7 @@ const statusAction = mustGet<HTMLParagraphElement>('status-action');
 
 const pipeline = new PreviewPipeline(canvas);
 const timeline = new ReplayTimeline();
+const watchdog = new FrameWatchdog();
 
 const state: PreviewState = {
   fixture: { state: 'checking', metadata: null },
@@ -60,6 +64,10 @@ buildEffectOptions();
 bindControls();
 updateStaticDiagnostics();
 void bootstrap();
+
+// requestVideoFrameCallback cannot fire when the decoder silently stops
+// presenting frames, so a real timer is the only watchdog for that stall.
+window.setInterval(checkDecodeStall, WATCHDOG_POLL_MS);
 
 async function bootstrap(): Promise<void> {
   if (!window.shymask) {
@@ -116,19 +124,24 @@ function updateStaticDiagnostics(): void {
 
 function applyFixture(fixture: FixtureInfo): void {
   disposeVideo();
+  watchdog.disarm();
   state.fixture = fixture;
   state.started = false;
   state.ready = false;
   state.manualPaused = false;
-  state.processingHealthy = !failureSimulated;
-  state.processingError = failureSimulated ? SIMULATED_FAILURE_MESSAGE : null;
-  failureToggle.checked = false;
+  // Reset the diagnostic-only failure injection before deriving the processing
+  // state. A recheck must not leave a stale simulated-failure pause behind.
   failureSimulated = false;
+  failureToggle.checked = false;
+  state.processingHealthy = true;
+  state.processingError = null;
   timeline.reset();
   latestTimestamp = null;
   latestStats = null;
   frameIntervals = [];
   renderCosts = [];
+  undrawableSinceMs = null;
+  lastDiagnosticsAt = 0;
   captureResult.textContent = '';
 
   if (fixture.state === 'ready' && fixture.metadata && fixture.videoUrl) {
@@ -186,6 +199,7 @@ function disposeVideo(): void {
   const element = video;
   video = null;
   frameLoopActive = false;
+  watchdog.disarm();
   element.pause();
   element.removeAttribute('src');
   element.load();
@@ -207,6 +221,9 @@ async function startPreview(): Promise<void> {
   renderCosts = [];
   latestTimestamp = null;
   latestStats = null;
+  undrawableSinceMs = null;
+  lastDiagnosticsAt = 0;
+  watchdog.arm(performance.now());
   renderNow();
 
   try {
@@ -215,6 +232,7 @@ async function startPreview(): Promise<void> {
     state.started = false;
     state.processingHealthy = false;
     state.processingError = `Playback did not start: ${(error as Error).message}`;
+    watchdog.disarm();
     renderNow();
     return;
   }
@@ -231,6 +249,7 @@ function subscribeFrameLoop(): void {
       frameLoopActive = false;
       return;
     }
+    watchdog.noteFrame(now);
     processFrame(element, now, metadata);
     element.requestVideoFrameCallback(onFrame);
   };
@@ -281,8 +300,7 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
     }
     state.processingHealthy = false;
     state.ready = false;
-    state.processingError =
-      'The replay frame could not be decoded for more than 250 ms. Output is hidden while the decoder recovers.';
+    state.processingError = DECODE_STALL_MESSAGE;
   }
 
   const pausedDecision = resolveOutput(state);
@@ -291,6 +309,26 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
   renderCosts = pushRolling(renderCosts, stats.renderCostMs);
   applyDecision(pausedDecision);
   maybeUpdateDiagnostics(now);
+}
+
+/**
+ * Timer tick for a decoder that stops presenting frames. It only hides output
+ * when a frame is genuinely expected (started, not manually paused, a fixture
+ * and an effect active) and processing is otherwise healthy, so a specific
+ * decode/error message is not overwritten by the generic stall message.
+ */
+function checkDecodeStall(): void {
+  const expectFrame =
+    state.started &&
+    !state.manualPaused &&
+    state.fixture.state === 'ready' &&
+    state.effect !== 'none';
+  const stalled = watchdog.check(performance.now(), expectFrame);
+  if (!stalled || !state.processingHealthy) return;
+  state.processingHealthy = false;
+  state.ready = false;
+  state.processingError = DECODE_STALL_MESSAGE;
+  renderNow();
 }
 
 function renderNow(): void {
@@ -313,7 +351,9 @@ function applyDecision(decision: OutputDecision): void {
     currentDecision !== null &&
     currentDecision.mode === decision.mode &&
     currentDecision.reason === decision.reason &&
-    currentDecision.title === decision.title;
+    currentDecision.title === decision.title &&
+    currentDecision.explanation === decision.explanation &&
+    (currentDecision.action ?? '') === (decision.action ?? '');
   if (unchanged) return;
   currentDecision = decision;
   statusPanel.dataset.mode = decision.mode;
@@ -328,13 +368,16 @@ function togglePause(): void {
   if (!video || !state.started) return;
   if (state.manualPaused) {
     state.manualPaused = false;
+    watchdog.arm(performance.now());
     void video.play().catch((error: Error) => {
       state.processingHealthy = false;
       state.processingError = `Playback did not resume: ${error.message}`;
+      watchdog.disarm();
       renderNow();
     });
   } else {
     state.manualPaused = true;
+    watchdog.disarm();
     video.pause();
   }
   renderNow();

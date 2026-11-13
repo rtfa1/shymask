@@ -66,7 +66,7 @@ function createWindow(): void {
 }
 
 ipcMain.handle('shymask:startup-info', (): StartupInfo => {
-  return { fixture: currentFixture, fixtureDir, evidenceDir };
+  return { fixture: currentFixture };
 });
 
 ipcMain.handle('shymask:recheck-fixture', (): FixtureInfo => {

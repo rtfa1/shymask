@@ -2,10 +2,12 @@
  * Loop-aware frame clock for the recorded replay input.
  *
  * The media element resets its own `currentTime` at every loop seam. That
- * reset is deliberate, so the processing timestamp is built from the monotonic
- * wall clock (presented frame time) plus a loop counter: it keeps increasing
- * across seams instead of jumping backwards. Later tracking slices receive
- * this timestamp with each processed frame.
+ * reset is deliberate, so the processing timestamp is built from the loop index
+ * and the media time (`loopIndex × clipDuration + mediaTime`) rather than from
+ * the resetting media clock alone: it keeps increasing across seams instead of
+ * jumping backwards. The monotonic `performance.now()` presented time is
+ * recorded separately for frame-pacing diagnostics. Later tracking slices
+ * receive this processing timestamp with each processed frame.
  */
 
 /** A backward media-time jump larger than this is treated as a loop seam. */

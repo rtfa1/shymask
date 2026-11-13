@@ -27,7 +27,6 @@ const METADATA: FixtureMetadata = {
 const READY_FIXTURE: FixtureInfo = {
   state: 'ready',
   metadata: METADATA,
-  videoPath: 'C:\\fixtures\\cache\\webcam-loop.webm',
   videoUrl: 'file:///C:/fixtures/cache/webcam-loop.webm',
 };
 

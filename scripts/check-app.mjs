@@ -5,13 +5,19 @@
  * Launches the real Electron app with Playwright, drives the visible controls,
  * captures the preview canvas to an evidence directory, and asserts observable
  * behavior:
- *   - startup, no-effect, manual pause and failure states show the opaque
- *     "Tracking paused" canvas and never the raw replay feed;
+ *   - startup, no-effect, manual pause, simulated failure and a silent decode
+ *     stall show the opaque "Tracking paused" canvas and never the raw feed;
  *   - a color treatment visibly changes the canvas output and can be switched;
  *   - the replay loops for multiple cycles with strictly increasing processing
- *     timestamps and roughly real-time pacing;
+ *     timestamps and roughly real-time pacing; each reported seam is checked
+ *     against an independent backward media-time jump in the samples;
  *   - a missing or corrupt fixture produces an actionable paused error and
- *     Start stays disabled.
+ *     Start stays disabled; a second, different invalid message replaces the
+ *     first after Recheck.
+ *
+ * The run records the tested head SHA, hardware, workload, measured boundaries,
+ * commands and validation-gate facts in summary.json, and refreshes
+ * evidence/logs/check-final.log for the same run.
  *
  * Timing numbers printed by this harness are replay-derived measurements of
  * this preview slice only. They do not establish the 720p/30 FPS / 100 ms
@@ -23,24 +29,36 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { arch, cpus, platform, release, totalmem, version as osVersion } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { _electron as electron } from 'playwright-core';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const metadata = JSON.parse(readFileSync(path.join(root, 'fixtures', 'webcam-loop.json'), 'utf8'));
+const packageJson = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
 const mediaPath = path.join(root, 'fixtures', 'cache', metadata.fileName);
 const runStamp = new Date().toISOString().replace(/[:.]/g, '-');
 const evidenceDir = path.join(root, 'evidence', `check-${runStamp}`);
 const screenshotsDir = path.join(evidenceDir, 'screenshots');
+const logsDir = path.join(root, 'evidence', 'logs');
 mkdirSync(screenshotsDir, { recursive: true });
+mkdirSync(logsDir, { recursive: true });
+// Fixed path for the most recent run so a cited log always matches this run.
+const finalLogPath = path.join(logsDir, 'check-final.log');
+// Mirrors LOOP_SEAM_THRESHOLD_MS in src/core/replay-clock.ts; the public check
+// counts backward media-time jumps independently of the reported seam counter.
+const LOOP_SEAM_THRESHOLD_MS = 250;
 
 const { ELECTRON_RUN_AS_NODE, ...baseEnv } = process.env;
 const results = [];
 const timing = {};
+const logLines = [];
 
 function log(message) {
   console.log(message);
+  logLines.push(message);
+  writeFileSync(finalLogPath, `${logLines.join('\n')}\n`);
 }
 
 function pass(name, detail = '') {
@@ -141,12 +159,64 @@ async function waitForStatusTitle(page, pattern) {
   });
 }
 
-async function waitForLoops(page, minimum) {
-  return waitFor(`loops >= ${minimum}`, async () => {
-    const values = parseKeyValues(await readDiagnostic(page, 'diag-loop'));
-    const loops = Number(values.loops ?? 0);
-    return loops >= minimum ? loops : null;
-  }, 30000);
+function git(args) {
+  return execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+}
+
+/** Best-effort GPU name(s); Windows-only WMI query, empty elsewhere. */
+function detectGpuNames() {
+  try {
+    const output = execFileSync(
+      'powershell',
+      ['-NoProfile', '-NonInteractive', '-Command', '(Get-CimInstance Win32_VideoController).Name'],
+      { cwd: root, encoding: 'utf8', timeout: 15000 },
+    );
+    return output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function collectEnvironment() {
+  const cpuList = cpus();
+  const totalmemBytes = totalmem();
+  return {
+    node: process.version,
+    electron: packageJson.devDependencies?.electron ?? 'unknown',
+    os: {
+      platform: platform(),
+      release: release(),
+      version: osVersion(),
+      arch: arch(),
+      totalmemBytes,
+      totalmemGiB: Number((totalmemBytes / 1024 ** 3).toFixed(1)),
+    },
+    cpu: {
+      model: cpuList[0]?.model?.trim() ?? 'unknown',
+      logicalCores: cpuList.length,
+    },
+    gpu: detectGpuNames(),
+  };
+}
+
+/**
+ * Counts independent backward media-time jumps in the sampled diagnostics. This
+ * is what the replay clock treats as a loop seam, so it does not rely on the
+ * app's own seam counter to validate that counter.
+ */
+function countBackwardMediaJumps(samples) {
+  let jumps = 0;
+  for (let index = 1; index < samples.length; index += 1) {
+    const previous = samples[index - 1];
+    const current = samples[index];
+    if (previous && current && current.mediaMs < previous.mediaMs - LOOP_SEAM_THRESHOLD_MS) {
+      jumps += 1;
+    }
+  }
+  return jumps;
 }
 
 async function normalFixtureScenario() {
@@ -238,12 +308,15 @@ async function normalFixtureScenario() {
     pass('Resume restores processed output', `${pausedTimestamp}ms -> ${resumedTimestamp}ms`);
 
     // Loop measurement: wait until at least three more loops have completed and
-    // sample the public diagnostics throughout.
-    const initialLoops = Number(parseKeyValues(await readDiagnostic(page, 'diag-loop')).loops ?? 0);
+    // sample the public diagnostics throughout. The seam count is validated
+    // separately against backward media-time jumps in the samples, so it is not
+    // compared with the loop counter that increments alongside it.
+    const initialLoopValues = parseKeyValues(await readDiagnostic(page, 'diag-loop'));
+    const initialLoops = Number(initialLoopValues.loops ?? 0);
+    const initialSeams = Number(initialLoopValues.seams ?? 0);
     const samples = [];
     const sampleStart = Date.now();
     let lastTimestamp = -1;
-    let sawSeam = false;
     await waitFor(`three loops after loop ${initialLoops}`, async () => {
       const values = parseKeyValues(await readDiagnostic(page, 'diag-loop'));
       const timestampValues = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
@@ -251,6 +324,7 @@ async function normalFixtureScenario() {
       samples.push({
         atMs: Date.now() - sampleStart,
         processingMs,
+        mediaMs: Number(timestampValues.mediaMs ?? 0),
         loops: Number(values.loops ?? 0),
         seams: Number(values.seams ?? 0),
         rgb: await readRgb(page),
@@ -259,13 +333,22 @@ async function normalFixtureScenario() {
         throw new Error(`processing timestamp regressed within the sample series: ${lastTimestamp} -> ${processingMs}`);
       }
       lastTimestamp = processingMs;
-      if (Number(values.seams ?? 0) > 0) sawSeam = true;
       return Number(values.loops ?? 0) >= initialLoops + 3 ? Number(values.loops ?? 0) : null;
     }, 30000, 300);
 
-    assert.ok(sawSeam, 'at least one loop seam must have been crossed');
     const finalLoopValues = parseKeyValues(await readDiagnostic(page, 'diag-loop'));
-    assert.equal(Number(finalLoopValues.seams ?? -1), Number(finalLoopValues.loops ?? -2), 'each completed loop must be reported as one deliberate seam');
+    const finalLoops = Number(finalLoopValues.loops ?? -1);
+    const finalSeams = Number(finalLoopValues.seams ?? -1);
+    assert.equal(finalLoops, initialLoops + 3, 'the sample window must observe exactly three completed loops');
+    assert.ok(finalSeams > initialSeams, 'at least one loop seam must have been crossed');
+    const backwardMediaJumps = countBackwardMediaJumps(samples);
+    const seamsDuringSampling = finalSeams - initialSeams;
+    assert.ok(seamsDuringSampling >= 1, 'the seam counter must advance during the sample window');
+    assert.equal(
+      backwardMediaJumps,
+      seamsDuringSampling,
+      `independently observed backward media-time jumps (${backwardMediaJumps}) must match reported seams (${seamsDuringSampling})`,
+    );
     const loopShot = await screenshotCanvas(page, '07-multiple-loops.png');
 
     const firstSample = samples[0];
@@ -280,6 +363,8 @@ async function normalFixtureScenario() {
     timing.sourceFrameIntervalP95Ms = Number(frameDelta.p95Ms ?? 0);
     timing.renderCostP95Ms = Number(renderCost.p95Ms ?? 0);
     timing.loopsObserved = lastSample.loops - initialLoops;
+    timing.seamsObserved = seamsDuringSampling;
+    timing.backwardMediaJumps = backwardMediaJumps;
     timing.loopWallSpanMs = wallSpanMs;
     timing.processingSpanMs = processingSpanMs;
     timing.pacingRatio = Number(pacingRatio.toFixed(3));
@@ -287,7 +372,7 @@ async function normalFixtureScenario() {
     assert.ok(timing.sourceFrameIntervalP95Ms > 10 && timing.sourceFrameIntervalP95Ms < 80, `unexpected source frame interval ${timing.sourceFrameIntervalP95Ms}ms`);
     pass(
       `Replay looped for ${timing.loopsObserved} more cycles with strictly increasing processing timestamps`,
-      `pacing=${timing.pacingRatio} sourceFrameP95=${timing.sourceFrameIntervalP95Ms}ms ${loopShot}`,
+      `seams=${seamsDuringSampling} mediaJumps=${backwardMediaJumps} pacing=${timing.pacingRatio} sourceFrameP95=${timing.sourceFrameIntervalP95Ms}ms ${loopShot}`,
     );
 
     await page.locator('[data-testid="capture"]').click();
@@ -314,6 +399,51 @@ async function normalFixtureScenario() {
     await page.locator('[data-testid="simulate-failure"]').uncheck();
     await waitForStatusTitle(page, /Effect active: Warm tint/);
     pass('Output recovers automatically after the processing failure clears', await readDiagnostic(page, 'diag-output'));
+
+    // Recheck while the diagnostic failure is active must reset the injected
+    // failure state rather than leaving a stale simulated-failure pause.
+    await page.locator('[data-testid="simulate-failure"]').check();
+    const simulatedAgain = await waitForStatusTitle(page, /^Tracking paused$/);
+    assert.match(simulatedAgain.explanation, /simulated/i);
+    await page.locator('[data-testid="recheck"]').click();
+    const recheckedStartup = await waitFor('fixture recheck after simulated failure', async () => {
+      const status = await readStatus(page);
+      return /has not started/i.test(status.explanation) ? status : null;
+    });
+    assert.equal(await page.locator('[data-testid="simulate-failure"]').isChecked(), false);
+    assert.equal(await page.locator('[data-testid="start"]').isDisabled(), false);
+    await page.locator('[data-testid="start"]').click();
+    await waitForStatusTitle(page, /Effect active: Warm tint/);
+    await waitFor('warm output after recheck', async () => (rgbSum(await readRgb(page)) > 120 ? true : null));
+    pass(
+      'Recheck during a simulated failure clears it and recovers the processed preview on Start',
+      `${recheckedStartup.title} ${await readDiagnostic(page, 'diag-output')}`,
+    );
+
+    // Injected decode stall: pause the media element directly (not through the
+    // manual Pause control), so the renderer still expects frames while the
+    // decoder presents none. The timer watchdog must hide the output, then
+    // recovery must be automatic when the next valid frame arrives.
+    await page.evaluate(() => {
+      const element = document.querySelector('video');
+      if (!element) throw new Error('expected a replay video element');
+      element.pause();
+    });
+    const stall = await waitForStatusTitle(page, /^Tracking paused$/);
+    assert.match(stall.explanation, /decoded for more than 250 ms/i);
+    assert.equal(stall.mode, 'paused');
+    await page.waitForTimeout(600);
+    const stillStalled = await readStatus(page);
+    assert.equal(stillStalled.mode, 'paused', 'a silent decode stall must not reveal the last processed frame');
+    assert.match(stillStalled.explanation, /decoded for more than 250 ms/i);
+    const stallShot = await screenshotCanvas(page, '08b-decode-stall-paused.png');
+    await page.evaluate(() => {
+      const element = document.querySelector('video');
+      if (!element) throw new Error('expected a replay video element');
+      void element.play();
+    });
+    await waitForStatusTitle(page, /Effect active: Warm tint/);
+    pass('A silent decode stall shows the opaque paused screen and recovers on the next frame', stallShot);
 
     await page.screenshot({ path: path.join(screenshotsDir, '09-app-window.png'), fullPage: false });
     assert.deepEqual(consoleErrors, [], `renderer console errors: ${consoleErrors.join(' | ')}`);
@@ -346,7 +476,7 @@ async function missingFixtureScenario() {
 }
 
 async function invalidFixtureScenario() {
-  log('\n== Scenario C: corrupt fixture (checksum mismatch) ==');
+  log('\n== Scenario C: corrupt fixture (checksum mismatch, then size mismatch) ==');
   const invalidDir = path.join(evidenceDir, 'invalid-fixture');
   mkdirSync(invalidDir, { recursive: true });
   const corruptPath = path.join(invalidDir, metadata.fileName);
@@ -361,8 +491,24 @@ async function invalidFixtureScenario() {
     assert.match(status.action, /npm run fetch:fixture/);
     assert.equal(await page.locator('[data-testid="start"]').isDisabled(), true);
     const shot = await screenshotCanvas(page, '11-invalid-fixture.png');
-    assert.equal(consoleErrors.length, 0, `renderer console errors: ${consoleErrors.join(' | ')}`);
     pass('Corrupt fixture shows the checksum error and hidden output', shot);
+
+    // Change the failure kind without relaunching. Recheck must replace the
+    // stale checksum explanation with the new size-mismatch explanation even
+    // though mode/reason/title are unchanged.
+    writeFileSync(corruptPath, Buffer.alloc(metadata.bytes - 17, 0));
+    await page.locator('[data-testid="recheck"]').click();
+    const changed = await waitFor('size mismatch explanation', async () => {
+      const current = await readStatus(page);
+      return /size mismatch/i.test(current.explanation) ? current : null;
+    });
+    assert.doesNotMatch(changed.explanation, /checksum mismatch/i);
+    assert.match(changed.action, /npm run fetch:fixture/);
+    assert.equal(changed.mode, 'paused');
+    assert.equal(await page.locator('[data-testid="start"]').isDisabled(), true);
+    const changedShot = await screenshotCanvas(page, '11b-invalid-fixture-changed-message.png');
+    assert.equal(consoleErrors.length, 0, `renderer console errors: ${consoleErrors.join(' | ')}`);
+    pass('Recheck replaces a stale invalid-fixture explanation with the new failure message', changedShot);
   } finally {
     await closeApp(app);
   }
@@ -401,16 +547,65 @@ function verifyFixtureFile() {
 }
 
 async function main() {
+  const headSha = git(['rev-parse', 'HEAD']);
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']);
+  const environment = collectEnvironment();
+  const ciWorkflowsPresent = existsSync(path.join(root, '.github', 'workflows'));
+  log('== Shymask public-workflow check ==');
+  log(`head:     ${headSha}`);
+  log(`branch:   ${branch}`);
+  log(`command:  npm run check (build + this Electron/Playwright harness)`);
+  log(`source:   recorded replay fixture ${metadata.fileName} (no physical webcam, preview app only)`);
+  log(
+    `host:     ${environment.cpu.model} | ${environment.cpu.logicalCores} logical cores | ${environment.os.totalmemGiB} GiB RAM | ${environment.os.platform} ${environment.os.release} (${environment.os.version})`,
+  );
+  log(`gpu:      ${environment.gpu.join('; ') || 'not detected'}`);
+  log(`node:     ${environment.node} | electron ${environment.electron}`);
+
   verifyFixtureFile();
   staticCameraGuard();
   await normalFixtureScenario();
   await missingFixtureScenario();
   await invalidFixtureScenario();
 
-  const headSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
   const summary = {
     generatedAt: new Date().toISOString(),
     headSha,
+    branch,
+    baseSha: 'd28427e8b1844ce67f6923c982d4c14cf7ed130a',
+    environment,
+    workload: {
+      sourceMode: 'recorded replay fixture (no physical webcam)',
+      app: 'Electron development preview only (no virtual webcam, no call/stream application)',
+      output: '1280x720 canvas; processed frames and the opaque paused screen share this path',
+      fixture: {
+        id: metadata.id,
+        fileName: metadata.fileName,
+        durationSeconds: metadata.durationSeconds,
+        resolution: `${metadata.width}x${metadata.height}`,
+      },
+    },
+    measuredBoundaries: [
+      'Processing timestamps, loops and seams are read from the app diagnostics; loop seams are also counted independently from backward media-time jumps in the samples.',
+      'Source frame interval is the p95 of requestVideoFrameCallback presented-frame deltas (last 180 frames), not a camera or decoder throughput figure.',
+      'Render cost is renderer main-thread draw/filter submission only; compositor/GPU/present latency is not measured.',
+      'Replay pacing compares processing-timestamp span with wall-clock span inside one sampling window.',
+      'No camera-sensor-to-output latency, physical-camera behavior, virtual-webcam publication, laptop or call-application measurement is made.',
+    ],
+    commands: {
+      build: 'npm run build',
+      typecheck: 'npm run typecheck',
+      test: 'npm test',
+      check: 'npm run check',
+    },
+    validationGate: {
+      continuousIntegration: ciWorkflowsPresent
+        ? 'A .github/workflows directory exists; inspect its status separately.'
+        : 'No CI is configured (no .github/workflows); local validation is the merge gate.',
+      branchProtection:
+        'No branch protection or rulesets are configured on main (verified read-only via the GitHub API on 2026-11-13: branch protection 404 "Branch not protected"; rulesets []).',
+      requiredLocalValidation: 'npm run typecheck, npm test and npm run check must pass at the exact head SHA above.',
+    },
     fixture: {
       id: metadata.id,
       title: metadata.title,
@@ -430,6 +625,7 @@ async function main() {
       'Preview only; no virtual webcam publication, face tracking, or secondary motion exists in this slice.',
       'Measured on this development desktop; laptop integrated-graphics behavior is unverified.',
       'Color treatments use canvas CSS filters in this spike; a later tracking/effect slice may replace the implementation.',
+      'No CI or branch protection exists; these local checks are the validation gate.',
     ],
   };
   writeFileSync(path.join(evidenceDir, 'summary.json'), `${JSON.stringify(summary, null, 2)}\n`);
@@ -442,7 +638,9 @@ async function main() {
   log(`replay pacing ratio:         ${timing.pacingRatio} (processing time / wall time)`);
   log('These numbers are replay-derived and preview-only. They do not establish the 100ms target,');
   log('physical-camera compatibility, or laptop integrated-graphics suitability.');
+  log(`tested head SHA:             ${headSha}`);
   log(`\nEvidence: ${evidenceDir}`);
+  log(`Final log: ${finalLogPath}`);
   const failures = results.filter((result) => result.status === 'fail');
   log(`\n${results.length - failures.length}/${results.length} checks passed`);
   if (failures.length > 0) process.exitCode = 1;
@@ -453,5 +651,6 @@ main().catch((error) => {
   const failures = results.filter((result) => result.status === 'fail');
   log(`\n${results.length - failures.length}/${results.length} checks passed`);
   log(`Evidence: ${evidenceDir}`);
+  log(`Final log: ${finalLogPath}`);
   process.exitCode = 1;
 });

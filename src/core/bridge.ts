@@ -26,8 +26,6 @@ export type FixtureState = 'checking' | 'ready' | 'missing' | 'invalid';
 export interface FixtureInfo {
   state: FixtureState;
   metadata: FixtureMetadata | null;
-  /** Absolute path of the validated media file, present when state is ready. */
-  videoPath?: string;
   /** file:// URL the renderer can hand to a <video> element. */
   videoUrl?: string;
   /** Human-readable explanation, always present when state is missing/invalid. */
@@ -38,8 +36,6 @@ export interface FixtureInfo {
 
 export interface StartupInfo {
   fixture: FixtureInfo;
-  fixtureDir: string;
-  evidenceDir: string;
 }
 
 export interface CaptureResult {
