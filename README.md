@@ -3,10 +3,11 @@
 Shymask applies visual effects to a webcam feed and publishes the result as a virtual webcam. This
 repository currently delivers a **recorded-replay preview** (issue #2), the **Windows 11 virtual
 camera** (issue #3), **one-face tracking with a basic rigid 3D mask** (issue #4), **imported,
-validated effect packages** (issue #5), and **face-based occlusion with bounded face anchoring**
-(issue #6): a desktop
+validated effect packages** (issue #5), **face-based occlusion with bounded face anchoring**
+(issue #6), and a **packaged face-distortion effect** (issue #7): a desktop
 preview loops a recorded webcam-style clip at real-time pacing, tracks exactly one face, attaches a
-procedural low-poly mask to that face, hides mask geometry behind the face, displays a selectable
+procedural low-poly mask to that face, hides mask geometry behind the face, applies bounded
+declarative color treatments and an optional bounded face-following distortion, displays a selectable
 effect, and publishes its 1280×720 output canvas as **Shymask Camera** so other applications can
 select it. The camera publishes the app's output canvas; a native opaque paused fallback covers the
 short window before the app connects and is used when app frames stop arriving. No physical webcam,
@@ -14,9 +15,11 @@ account, cloud service, or live test subject is used.
 
 An effect package is a ZIP containing a versioned `manifest.json` plus declared assets only —
 never executable effect code. A package is **one complete effect** that may combine a rigid GLB
-mask and a declarative color treatment; imported effects use the same tracking, rendering and
-camera path as the bundled mask. The versioned contract, limits, error codes and authoring guidance
-are in [`docs/effect-packages.md`](docs/effect-packages.md).
+mask and/or a declarative color treatment (schema v1) with an optional bounded face distortion
+(schema v2). Imported effects use the same tracking, rendering and camera path as the bundled mask.
+The versioned contract, limits, error codes and authoring guidance are in
+[`docs/effect-packages.md`](docs/effect-packages.md); the distortion design and evidence are in
+[`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md).
 
 Tracking readiness and loss gate every effect: zero faces, multiple faces, unreliable tracking, a
 missing tracker model, no effect, manual pause and processing failures all replace the whole output
@@ -26,7 +29,6 @@ no raw-passthrough branch.
 Secondary motion, real call-application compatibility (issue #10), the Blender/AI authoring flow
 (issue #9), complexity budgets (issue #11), and the final 720p/30 FPS / 100 ms target are later child
 tickets of the parent spec. Hand-over-mask occlusion remains out of scope.
-
 ## Quick start (Windows 11)
 
 Prerequisites: Node.js 22.12+ (tested with 24.19.0) and npm 11+. The Windows virtual camera also
@@ -63,8 +65,8 @@ If `npm install` blocks install scripts (newer npm releases gate them), run
 | --- | --- |
 | **Start** | Begins real-time playback of the fixture already validated at launch. Disabled while the fixture is missing or corrupt, the face tracker is unavailable, playback has already started, or manual pause is active. |
 | **Pause / Resume** | Manual pause replaces the whole output with the opaque "Tracking paused" screen and freezes processing. It persists until Resume is pressed, including across automatic tracking recovery. |
-| **Effect** | One complete effect at a time: `Rigid mask`, `Warm tint`, `Cool tint`, `Monochrome`, explicit `No effect`, or any imported package. Bundled options are followed by an **Imported packages** group. A package may combine its own mask and color treatment; components from different packages are never stacked. Choosing `No effect` hides the output; choosing an effect restores it automatically once one face is tracked. Tracking loss pauses every effect, including color treatments. |
-| **Import package…** | Opens the OS file picker and validates the selected ZIP (schema v1, declared assets only, bounded declarations, no executable content). A valid package is stored under the app's `userData` directory, appears in the Effect selector and is selected. An invalid package is rejected with its actionable code, message and field/path; the current output is unchanged. |
+| **Effect** | One complete effect at a time: `Rigid mask`, `Warm tint`, `Cool tint`, `Monochrome`, explicit `No effect`, or any imported package. Bundled options are followed by an **Imported packages** group. A package may combine its own mask, bounded face distortion and color treatment; components from different packages are never stacked. Choosing `No effect` hides the output; choosing an effect restores it automatically once one face is tracked. Tracking loss pauses every effect, including color treatments and the face distortion. |
+| **Import package…** | Opens the OS file picker and validates the selected ZIP (schema v1 or v2, declared assets only, bounded declarations, no executable content). A valid package is stored under the app's `userData` directory, appears in the Effect selector and is selected. An invalid package is rejected with its actionable code, message and field/path; the current output is unchanged. |
 | **Remove imported effect** | Removes the selected imported package from the persistent store. If it was active, the selector falls back to `No effect` and the opaque paused output; other imported packages remain. |
 | **Tracking state (diagnostic)** | `Use detected face (normal)`, or inject `tracking lost`, `multiple faces`, or `unreliable tracking` to exercise the output policy. Injected states are labelled in the diagnostics; the real detector is authoritative when set back to normal. |
 | **Recheck input** | Re-runs fixture size/checksum validation. Use after fetching a fixture that was missing at launch. |
@@ -73,8 +75,9 @@ If `npm install` blocks install scripts (newer npm releases gate them), run
 | **Restart virtual camera** | Re-runs the native camera host (for example after an elevated install or a camera error). |
 
 The app never opens a physical camera in this slice. There is no passthrough mode: the output is
-either a processed replay frame (with a mask, a color treatment, or an imported complete effect) or
-the opaque "Tracking paused" screen, in the preview **and** in the virtual camera. While an imported
+either a processed replay frame (with a mask, a color treatment, a bounded face distortion, or an
+imported complete effect) or the opaque "Tracking paused" screen, in the preview **and** in the
+virtual camera. While an imported
 mask loads, the whole output stays on the opaque paused screen; a failed load leaves it hidden with
 an explanation. Closing Shymask stops its camera output.
 
@@ -127,8 +130,19 @@ an explanation. Closing Shymask stops its camera output.
   an invalid/removed active effect, a failed imported-effect load, tracking readiness, tracking
   loss, multiple faces, and unreliable tracking. Manual pause is evaluated before tracking and
   switching so automatic recovery or a switch cannot override it. It has no raw-passthrough branch.
-- **Declarative effects.** Color treatments and the bundled rigid mask are data/ids
-  (`src/core/treatments.ts`); an imported effect is a validated package descriptor
+- **Bounded face distortion.** `src/renderer/face-distortion-renderer.ts` applies one fixed radial
+  shader (`bulge` or `pinch`) to the replay frame inside an ellipse recomputed every frame from the
+  tracked face box (`src/core/face-distortion.ts`). The package supplies only a mode and bounded
+  numbers (`strength` 0-1, `radiusScale` 0.25-2.5, `centerOffset` ±0.5), never geometry, shader code
+  or per-frame displacement. The offscreen warp canvas is drawn through the same
+  `src/core/pipeline.ts` output canvas, so preview and camera share one frame path; outside the
+  ellipse the source pixels are untouched. The public **Face distortion** diagnostic reports the
+  face box, ellipse, main-thread warp submission time and a measured inside/outside change ratio;
+  the published-output proof is a held-frame warp ON/OFF A/B in preview and camera. See
+  [`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md).
+- **Declarative effects.** Color treatments, the bundled rigid mask and the bounded face distortion
+  are data/ids (`src/core/treatments.ts`, `src/core/effect-package-contract.ts`); an imported effect
+  is a validated package descriptor
   (`src/core/effects.ts`, `src/core/effect-package-contract.ts`) whose mask is a declared GLB and
   whose treatment is a fixed filter built from bounded parameters. No arbitrary executable effect
   code is loaded, and the renderer never receives archive bytes. The package contract, validation,
@@ -138,10 +152,12 @@ an explanation. Closing Shymask stops its camera output.
   validated archive and declared asset under `userData`, and serves only that asset from the local
   `shymask://app/packages/...` route. Validation rejects zip-slip, absolute paths, symlinks,
   oversized entries, executable/script content, unsupported schema versions, unknown behaviors,
-  missing assets, out-of-range color parameters and unsupported glTF features with structured,
-  actionable codes. Imported effects persist across restarts and can be removed in the app. The
-  spike choices and replay-based package evidence are in
-  [`docs/notes/0004-effect-packages.md`](docs/notes/0004-effect-packages.md).
+  missing assets, out-of-range color or distortion parameters and unsupported glTF features with
+  structured, actionable codes. Imported effects persist across restarts and can be removed in the
+  app. The spike choices and replay-based package evidence are in
+  [`docs/notes/0004-effect-packages.md`](docs/notes/0004-effect-packages.md); the face-distortion
+  contract and evidence are in
+  [`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md).
 - **Virtual camera publication.** While the app runs, `src/main/virtual-camera.ts` serves the output
   canvas to the native Windows virtual camera over a loopback frame transport, and
   `src/renderer/renderer.ts` pushes every drawn output frame plus a 100 ms heartbeat (only while a
@@ -234,7 +250,8 @@ for the architecture, the registration failure that was investigated, and the me
 npm run typecheck        # strict TypeScript across src and tests
 npm test                 # unit tests for the output policy, tracking state machine, bounded pose
                          # smoothing, replay clock, frame watchdog, treatments, package schema/ZIP
-                         # safety/GLB validation and the effect registry (115 tests)
+                         # safety/GLB validation, face-distortion geometry/validation and the effect
+                         # registry (129 tests)
 npm run build:face-occluder # regenerate the committed canonical face-occluder table (fetches once)
 npm run build:packages   # regenerate the committed sample + negative effect-package fixtures
 npm run validate:package -- <file.zip>  # validate one package with the app's pure validator
@@ -256,7 +273,7 @@ npm run fetch:motion-fixture
 ```
 
 The public-workflow check asserts, through the app's visible controls, its diagnostics and the
-independent camera consumer:
+independent camera consumer (83/83 checks passed in the latest run at this head):
 
 1. Startup is the opaque "Tracking paused" screen; no raw feed.
 2. Start renders a processed replay frame through the treatment control.
@@ -380,12 +397,44 @@ independent camera consumer:
     keep the previous effect rendering, and cause no crash or renderer console error. Removing the
     active imported effect leaves the paused no-effect output, and another imported package still
     renders after an app restart.
+36. The schema v2 `face-distortion` sample imports through **Import package…**, appears in the Effect
+    selector, is selected, and reports `mode=bulge`, `strength=0.6`, `radiusScale=1.35` and an ellipse
+    that matches the independent `diag-face` tracking box (rendering each sampled frame). A held-frame
+    public A/B then turns only the warp off: exact 1280×720 ON/OFF PNGs captured through the public
+    **Capture evidence frame** control differ by 32,036 px, all inside the independently derived
+    tracked-face ellipse and none outside, with two same-state captures pixel-identical (0 self-diff)
+    and the independent camera receiving the identical change. This is the published-output proof;
+    the 64×36 same-texture warp delta remains a diagnostic only.
+37. On the recorded turn/nod/lean window, the distortion ellipse's centre moves at least 30 px with
+    the tracked face, every sampled frame passes the independent `diag-face` geometry check and the
+    inside/outside change gates, and three screenshots are saved. The published A/B is repeated at the
+    held 47.7 s and 16.0 s poses: the changed-region centroid moves 117.8 px with a 108.2 px face move,
+    so the change is anchored to the tracked face rather than a fixed screen-space overlay.
+38. The distortion follows every paused-output rule: manual pause, injected tracking loss, injected
+    multiple faces, injected processing failure, switching to an imported mask (paused while it loads)
+    and back, explicit `No effect`, and removal of the active package all keep the output hidden.
+    Manual pause, tracking loss, multiple faces, processing failure, context loss, `No effect` and
+    removal are camera-captured in preview and the independent camera; the switching case is asserted
+    by the public `switchingPausedFrames` counter and status text (the six other paused states are the
+    captured ones). Recovery is automatic after the injection clears. The four distortion negative
+    fixtures (v1 declaration, unsupported mode, out-of-range strength, unknown field) are rejected
+    with `schema-version-unsupported` or `distortion-invalid` and leave the previous effect rendering.
+39. Replay-based timing for the distortion path is recorded at 1280×720: main-thread warp submission
+    time (no GPU sync/readback), the full render/composite cost and the presented-frame interval,
+    plus a color-only package baseline on the same fixture. The render-cost and frame-interval
+    differences are sequential-window observations, not isolated distortion costs. These are
+    observations for the later complete-effect benchmark, not the final performance target.
+40. Injecting a WebGL context loss on the distortion renderer through the public diagnostic control
+    makes it non-drawable; the 250 ms undrawable guard shows the opaque paused screen in preview and
+    camera (never a stale or raw frame). The diagnostic reports `drawable=false`/`contextLost=true`,
+    and a browser restore returns `drawable=true` and resumes the effect.
 
 Artifacts are written to the gitignored `evidence/check-<timestamp>/` directory: per-state canvas
 screenshots, the full app window (including import-error feedback), captured output frames,
 camera-consumer PNGs under `camera-frames/`, and `summary.json` with the derived base SHA, timing
 baseline, tracking/model evidence, effect-package import/negative/rapid-switch/attachment evidence
-(including the displayed complexity subset in each import message), hardware, workload, measured
+(including the displayed complexity subset in each import message), face-distortion preview/camera,
+motion-following and replay-based timing evidence, hardware, workload, measured
 boundaries, commands, validation-gate facts and the tested head SHA. It also records
 `virtualCamera.captureAttempts`: every processed camera capture's attempt count and its
 app-published/native-fallback frame counts, so the bounded retries and the consumer-frame capture
@@ -402,8 +451,10 @@ time to the first dark frame's receive time), and the validated run recorded a 1
 
 ### Measured baseline (replay-based, virtual camera)
 
-From a passing `npm run check` run on 2026-11-13 (the head SHA validated by the latest full check run
-is recorded in `evidence/check-<timestamp>/summary.json`, `evidence/vcam-check/summary.json`, and
+From a passing `npm run check` run on 2026-11-13 at head `0e0e1a8c6e417ff73b6f14de83afc48735788746`
+(`evidence/check-2026-11-13T21-25-31-655Z/summary.json`, 83/83 checks, all values below are from that
+run unless marked as earlier-run observations; the head SHA validated by the latest full check run is
+recorded in `evidence/check-<timestamp>/summary.json`, `evidence/vcam-check/summary.json`, and
 `evidence/logs/*-final.log`; later documentation-only commits do not change the validated behavior),
 source clip 3.379 s:
 
@@ -418,13 +469,13 @@ source clip 3.379 s:
 | Measurement | Value |
 | --- | --- |
 | Camera media type | RGB32 1280×720 @ 30/1 |
-| Camera frames observed | 212 over 6.94 s (30.4 Hz sample rate) |
-| Camera frame interval, p95 | 48 ms |
-| Replay-to-camera latency, p50 / p95 | 34 ms / 62 ms (canvas capture time → consumer receive time; 32–35 / 55–77 ms across recent runs) |
+| Camera frames observed | 212 over 6.89–6.94 s (30.4–30.5 Hz sample rate) |
+| Camera frame interval, p95 | 47–48 ms |
+| Replay-to-camera latency, p50 / p95 | 32–33 ms / 54–62 ms across recent runs (canvas capture time → consumer receive time) |
 | Camera mean-RGB spread across the window | 19 (replay content changes across loops) |
 | Replay loops crossed during the camera window | 2 |
-| Source frame interval, p95 | 55.4 ms in this run; ~42–55 ms across passing runs (the clip presents at ~18–24 Hz here; no 30 FPS forcing) |
-| Render + filter cost, p95 | 16.7 ms in the latest run (main-thread draw/filter plus the diagnostics mean-RGB sample; a connected camera adds canvas readback) |
+| Source frame interval, p95 | 48.8–55.5 ms across recent runs; ~42–55 ms across passing runs (the clip presents at ~18–24 Hz here; no 30 FPS forcing) |
+| Render + filter cost, p95 | 16.9–17.1 ms in recent runs (main-thread draw/filter plus the diagnostics mean-RGB sample; a connected camera adds canvas readback) |
 | Mask render + composite cost, p95 | 10–15 ms across recent runs (offscreen mask render plus the drawImage composite into the output canvas, including the diagnostics sample) |
 | Tracker inference, steady-state p95 | 13.2–13.8 ms per presented frame |
 | Tracker inference, first-call warm-up | ~0.28 s in recent runs; ~0.3–2.0 s observed across runs (excluded from the p95) |
@@ -434,9 +485,16 @@ source clip 3.379 s:
 | Smoothing added lag / cost | p95 raw-vs-smoothed offset 3.6–4.3 px origin and 1.7–1.9° rotation; implied constant-velocity delay p95 60.2–61.6 ms; filter cost 0.1 ms p95. The ~50.9 ms reference-interval figure is not a global maximum (effective alpha ~0.34 at the observed ~35 ms interval) |
 | Occlusion A/B at two turned frames (47.7 s about −20° to −22°, 16.0 s about +9° to +14°) | bundled mask 15,705–17,414 px changed (89–94% inside the tracked-face bbox); `guard-visor` 5,319–5,700 px (92–96.5%); `rose-visor` 2,257–2,306 px (100%); same-state repeats pixel-identical. ON reveal is proved by exact colour: package material ≥97% of changed pixels in OFF and ≤3% in ON (observed 0.3–1.5%); bundled dominant palette ≥90% coverage and ≤1% reappearance in ON (observed ≤0.1%, including 4 px in one opposite-view run) |
 | Occlusion camera A/B | the independent consumer received the same change on the held frame: total and inside-bbox pixel counts are asserted equal to the preview's for the bundled mask and `guard-visor`, with 0 same-state self-diff |
-| Loop cycles observed | 3 seam crossings inside an 8.27 s sampling window |
+| Face-distortion main-thread warp submission, p95 | 0.4 ms at 1280×720 (`performance.now()` around `renderer.render()` of the fixed radial shader, rolling p95 after warm-up). This is submission cost only: there is no GPU sync or readback, so the GPU/compositor cost lands later in the composite and is **not** included |
+| Face-distortion render + composite, p95 | 14.6 ms with the color-only baseline 14.0 ms on the same fixture in the cited run (observed sequential delta 0.6 ms, including the diagnostics sampling); earlier runs observed 14.9–15.4 ms vs 13.8–15.1 ms. This is not an isolated distortion cost |
+| Face-distortion presented-frame interval, p95 | 69.5 ms vs 48.7 ms in the cited run's sequential 2.2 s windows (observed delta 20.8 ms); earlier runs observed 62.5–76.5 ms vs 48.7–56 ms. The windows are not isolated and the delta is not attributed to the warp |
+| Face-distortion published-output A/B (held default-clip frame at 1.5 s) | 32,036 pixels changed, 100% inside the ellipse derived from the independent `diag-face` tracking box and 0 outside; two ON and two OFF captures are each pixel-identical (0 self-diff); the independent Media Foundation camera PNG changed by the identical 32,036 pixels |
+| Face-distortion recorded-motion following | 18/18 sampled frames tracked on `pose-loop-v1` in the cited run (enforced ≥12 of 18); warp centre moved 93 × 68 px with the tracked face box; inside-ellipse change 55.7–71.6% (every sample passes the ≥8% inside / ≤3% outside gates) |
+| Face-distortion face-following A/B (two held poses) | at 47.7 s and 16.0 s the published change was 62,236 and 62,763 px, all inside the independent `diag-face` ellipse and 0 outside, with the camera receiving the identical change and 0 same-state self-diff; the changed-region centroid moved 117.8 px with a 108.2 px face move |
+| Face-distortion WebGL context loss | public `WEBGL_lose_context` injection made the renderer non-drawable (`drawable=false`, `contextLost=true`); the 250 ms undrawable guard showed the opaque paused screen in preview (10,13,18) and camera (12,15,20). A browser restore returned `drawable=true` and the effect resumed (preview 143,54,47) |
+| Loop cycles observed | 3 seam crossings inside an 8.36–8.60 s sampling window |
 | Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
-| Replay pacing ratio | 1.004 processing time / wall time in this run |
+| Replay pacing ratio | 0.99–1.005 processing time / wall time across recent runs |
 
 Effect-package evidence from the same run (replay-based): the committed `guard-visor` sample is a
 1,715-byte archive with 2 entries and a 693-byte manifest, containing a 2,284-byte GLB with 96
@@ -450,6 +508,20 @@ the exact material-colour count is always asserted.
 `rose-visor` is a mask-only sample with nonzero `position`/`rotationDeg`/`scale` whose distinct
 material colour (RGB 32,196,128) is asserted in both preview and camera (about 38,000–40,000 pixels;
 enforced >25,000), and a rapid double switch must leave only the later package's mask committed.
+`face-distortion` is a 415-byte schema v2 distortion-only archive. Its offscreen identity-vs-warped
+diagnostic changed 72.5% of inside-ellipse samples and 0.0% outside in the cited run; that same-texture
+comparison is a diagnostic, not published-output proof. The published-output proof is a held-frame A/B
+through the public controls: the effect stays active while a diagnostic toggle draws the same uploaded
+frame through the identity shader, and exact 1280×720 ON/OFF captures through the public Capture control
+differ by 32,036 pixels, all inside the ellipse derived from the independent `diag-face` tracking box and
+none outside, with same-state repeats pixel-identical and the independent camera receiving the identical
+change. Repeating the A/B at the 47.7 s and 16.0 s `pose-loop-v1` poses moved the changed-region centroid
+117.8 px with a 108.2 px face move, so the change is anchored to the tracked face rather than a fixed
+screen-space overlay. A regression that drops the warp makes ON == OFF; the identity pass still comes
+from the effect renderer canvas, never from the raw video element. The schema v2 sample and the four
+distortion negative fixtures are generated by `npm run build:packages`; replay-based timing for the
+distortion path is recorded for the later complete-effect benchmark (see the table above and
+[`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md)).
 Package complexity is reported, not budgeted; no triangle/mesh threshold is asserted.
 
 Replay-derived tracking measurements from the same run are documented in
@@ -466,17 +538,25 @@ compatibility, or laptop integrated-graphics suitability. The camera latency inc
 publish cadence (a frame waits up to one 33 ms sample slot), so p95 is dominated by pacing rather than
 transport. The mask has face-based occlusion and bounded face anchoring but no secondary motion; the
 canonical face occluder is rigid, has no hair/ears/neck or full head silhouette, and does not deform
-with expressions, and the policy cannot detect every possible visual defect. See
+with expressions, and the policy cannot detect every possible visual defect. The packaged face
+distortion is a bounded whole-face radial warp (`bulge`/`pinch`) whose ellipse follows the tracked
+face box; it is not a per-landmark/expression warp or a 3D mesh deformation. Its renderer treats a
+lost WebGL context as non-drawable, so the undrawable guard hides both outputs instead of publishing
+a stale or raw frame; the check exercises that through a public `WEBGL_lose_context` injection and
+asserts that a browser restore resumes the effect. The distortion's timing figures measure main-thread
+submission only, not GPU/compositor cost. See
 `docs/notes/0001-preview-stack-and-loop.md`,
 `docs/notes/0002-windows-virtual-camera-spike.md`,
-`docs/notes/0003-face-tracking-and-mask.md` and
-`docs/notes/0005-face-occlusion-and-anchoring.md`.
+`docs/notes/0003-face-tracking-and-mask.md`,
+`docs/notes/0005-face-occlusion-and-anchoring.md` and
+`docs/notes/0006-face-distortion.md`.
 
 ## Fixtures
 
 The default input is a CC0-1.0 webcam-style recording of one person facing the camera
 (`webcam-loop-v1`). A second CC0 Wikitongues clip (`pose-loop-v1`, 49.6 s, 480p) supplies real head
-turns, nods and leaning for the tracking check; the app's default input is unchanged. Their source,
+turns, nods and leaning for the tracking check and the face-distortion motion-following evidence; the
+app's default input is unchanged. Their source,
 license, attribution, checksums, acquisition commands, content coverage and gaps are documented in
 [`docs/fixture-webcam-loop.md`](docs/fixture-webcam-loop.md) and
 [`docs/fixture-pose-loop.md`](docs/fixture-pose-loop.md). Media bytes and the face-tracker model are
@@ -490,8 +570,8 @@ src/core/       output policy, tracking state machine, bounded pose smoothing, r
 src/main/       Electron main process, local asset protocol, fixture/tracker validation, effect-package
                 store/import/remove, IPC, virtual camera lifecycle
 src/renderer/   desktop preview UI (HTML/CSS/TS), MediaPipe tracker wrapper, Three.js mask renderer
-                with the depth-only canonical face occluder (bundled + package GLB), and camera frame
-                publication
+                with the depth-only canonical face occluder (bundled + package GLB), the fixed
+                face-distortion shader, and camera frame publication
 scripts/        build, start, fixture/model fetch, canonical face-occluder generation, package fixture
                 generation/validation, public-workflow check, native camera scripts
 native/         Windows virtual camera: Media Foundation media source, host, consumer harness
@@ -547,7 +627,8 @@ docs/           fixture notes, preview/loop + virtual camera + tracking + effect
 
 Delivered by this slice: recorded input acquisition and validation, real-time looping, monotonic
 processing timestamps, selectable declarative effects (color treatments, a bundled rigid mask, and
-imported validated effect packages combining a declared GLB mask and/or bounded color treatment),
+imported validated effect packages combining a declared GLB mask, a bounded face distortion and/or
+bounded color treatment, schema v1/v2),
 one-face tracking with readiness/loss hysteresis, face-based occlusion through a depth-only canonical
 face mesh, bounded pose smoothing measured against raw tracking, the opaque paused-output policy in
 the preview and the virtual camera (including tracking loss, multiple faces, unreliable tracking,
@@ -558,9 +639,11 @@ with no physical camera or human participation. The imported-effect async switch
 switching-interruption sub-case: the whole output stays on the opaque paused screen until the new
 effect loads, or remains hidden with an explanation if the load fails.
 
-Deferred: physical webcam capture, live-human acceptance, secondary motion (issue #8), distortion
-(issue #7), the Blender/AI authoring flow (issue #9), real Zoom/Meet/OBS compatibility (issue #10),
+Deferred: physical webcam capture, live-human acceptance, secondary motion (issue #8), the
+Blender/AI authoring flow (issue #9), real Zoom/Meet/OBS compatibility (issue #10),
 final live acceptance, NV12 support, complexity budgets (issue #11), laptop integrated-graphics
 validation, and the 720p/30 FPS / ≤100 ms target. Two-person footage is not part of this slice;
 multiple faces are exercised through a labelled diagnostic injection and the `numFaces: 2` detector
-configuration. Hand-over-mask occlusion remains out of scope.
+configuration. Hand-over-mask occlusion remains out of scope. The face distortion is a bounded
+whole-face radial warp with two modes; per-landmark/expression warps and package-supplied distortion
+meshes or shaders remain unsupported.

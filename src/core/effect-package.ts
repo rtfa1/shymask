@@ -1,5 +1,5 @@
 /**
- * Pure, unit-testable validation for Shymask effect packages (contract v1).
+ * Pure, unit-testable validation for Shymask effect packages (schema v1/v2).
  *
  * `validateEffectPackage` takes archive bytes and returns either a validated,
  * in-memory package (manifest + declared asset bytes + complexity measurements)
@@ -9,21 +9,27 @@
  * arbitrary executable effect code".
  *
  * See docs/effect-packages.md for the schema, the error codes and what is
- * explicitly unsupported in v1.
+ * explicitly unsupported.
  */
 
 import {
   COLOR_PARAMETER_BOUNDS,
+  DEFAULT_FACE_DISTORTION,
   DEFAULT_MASK_ATTACHMENT,
-  EFFECT_PACKAGE_SCHEMA_VERSION,
+  FACE_DISTORTION_LIMITS,
+  FACE_DISTORTION_MODES,
+  FACE_DISTORTION_SCHEMA_VERSION,
   MASK_ATTACHMENT_LIMITS,
   PACKAGE_ASSET_PREFIX,
   PACKAGE_MANIFEST_PATH,
   PACKAGE_SAFETY_LIMITS,
+  SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS,
   countDeclaredColorParameters,
   type ColorTreatmentParameters,
   type EffectPackageAuthor,
-  type EffectPackageManifestV1,
+  type EffectPackageManifest,
+  type EffectPackageSchemaVersion,
+  type FaceDistortionParameters,
   type MaskAttachment,
   type PackageComplexity,
   type PackageIssue,
@@ -32,7 +38,7 @@ import { inspectGlb } from './glb';
 import { readZip, type ZipEntry } from './zip';
 
 export interface ValidatedEffectPackage {
-  manifest: EffectPackageManifestV1;
+  manifest: EffectPackageManifest;
   /** Archive path -> bytes, only for entries the manifest declares. */
   assets: ReadonlyMap<string, Uint8Array>;
   complexity: PackageComplexity;
@@ -82,12 +88,14 @@ const MANIFEST_KEYS = new Set([
   'author',
   'mask',
   'colorTreatment',
+  'faceDistortion',
   'expressionReactions',
   'behaviors',
 ]);
 const AUTHOR_KEYS = new Set(['name', 'attribution', 'license', 'url']);
 const MASK_KEYS = new Set(['asset', 'attachment']);
 const ATTACHMENT_KEYS = new Set(['position', 'rotationDeg', 'scale']);
+const FACE_DISTORTION_KEYS = new Set(['mode', 'strength', 'radiusScale', 'centerOffset']);
 const ASSET_PATH_PATTERN = /^assets\/[A-Za-z0-9][A-Za-z0-9._-]*\.glb$/;
 const PACKAGE_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{1,62}$/;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
@@ -329,6 +337,129 @@ function validateColorTreatment(value: unknown): { treatment: ColorTreatmentPara
   return { treatment, issues };
 }
 
+function validateFaceDistortion(value: unknown): {
+  distortion: FaceDistortionParameters | null;
+  issues: PackageIssue[];
+} {
+  const issues: PackageIssue[] = [];
+  if (!isRecord(value)) {
+    issues.push(
+      error(
+        'distortion-invalid',
+        'manifest faceDistortion must be an object with a supported mode ("bulge" or "pinch") and a bounded strength.',
+        'faceDistortion',
+      ),
+    );
+    return { distortion: null, issues };
+  }
+  for (const key of Object.keys(value)) {
+    if (!FACE_DISTORTION_KEYS.has(key)) {
+      issues.push(
+        error(
+          'distortion-invalid',
+          `Unknown faceDistortion field "${key}". Supported fields: mode, strength, radiusScale, centerOffset.`,
+          `faceDistortion.${key}`,
+        ),
+      );
+    }
+  }
+  const mode = value.mode;
+  if (typeof mode !== 'string' || !(FACE_DISTORTION_MODES as readonly string[]).includes(mode)) {
+    issues.push(
+      error(
+        'distortion-invalid',
+        `faceDistortion.mode must be one of ${FACE_DISTORTION_MODES.map((entry) => `"${entry}"`).join(', ')}; got ${JSON.stringify(mode)}.`,
+        'faceDistortion.mode',
+      ),
+    );
+  }
+  const rawStrength = value.strength;
+  let strength: number = FACE_DISTORTION_LIMITS.minStrength;
+  if (
+    !isFiniteNumber(rawStrength) ||
+    rawStrength < FACE_DISTORTION_LIMITS.minStrength ||
+    rawStrength > FACE_DISTORTION_LIMITS.maxStrength
+  ) {
+    issues.push(
+      error(
+        'distortion-invalid',
+        `faceDistortion.strength must be a finite number between ${FACE_DISTORTION_LIMITS.minStrength} and ${FACE_DISTORTION_LIMITS.maxStrength}; got ${JSON.stringify(rawStrength)}.`,
+        'faceDistortion.strength',
+      ),
+    );
+  } else {
+    strength = rawStrength;
+  }
+  let radiusScale: number = DEFAULT_FACE_DISTORTION.radiusScale;
+  if (value.radiusScale !== undefined) {
+    if (
+      !isFiniteNumber(value.radiusScale) ||
+      value.radiusScale < FACE_DISTORTION_LIMITS.minRadiusScale ||
+      value.radiusScale > FACE_DISTORTION_LIMITS.maxRadiusScale
+    ) {
+      issues.push(
+        error(
+          'distortion-invalid',
+          `faceDistortion.radiusScale must be a finite number between ${FACE_DISTORTION_LIMITS.minRadiusScale} and ${FACE_DISTORTION_LIMITS.maxRadiusScale}; got ${JSON.stringify(value.radiusScale)}.`,
+          'faceDistortion.radiusScale',
+        ),
+      );
+    } else {
+      radiusScale = value.radiusScale;
+    }
+  }
+  let centerOffset = DEFAULT_FACE_DISTORTION.centerOffset;
+  if (value.centerOffset !== undefined) {
+    const parsed = readVec2(
+      value.centerOffset,
+      'faceDistortion.centerOffset',
+      -FACE_DISTORTION_LIMITS.maxCenterOffset,
+      FACE_DISTORTION_LIMITS.maxCenterOffset,
+      issues,
+    );
+    if (parsed) centerOffset = parsed;
+  }
+  if (issues.length > 0) return { distortion: null, issues };
+  return {
+    distortion: {
+      mode: mode as FaceDistortionParameters['mode'],
+      strength,
+      radiusScale,
+      centerOffset,
+    },
+    issues,
+  };
+}
+
+/** Reads a bounded two-number point (used only by faceDistortion.centerOffset). */
+function readVec2(
+  value: unknown,
+  field: string,
+  minimum: number,
+  maximum: number,
+  issues: PackageIssue[],
+): readonly [number, number] | null {
+  if (!Array.isArray(value) || value.length !== 2) {
+    issues.push(error('distortion-invalid', `${field} must be an array of two numbers.`, field));
+    return null;
+  }
+  const numbers: number[] = [];
+  for (const [index, item] of value.entries()) {
+    if (!isFiniteNumber(item) || item < minimum || item > maximum) {
+      issues.push(
+        error(
+          'distortion-invalid',
+          `${field}[${index}] must be a finite number between ${minimum} and ${maximum}; got ${JSON.stringify(item)}.`,
+          `${field}[${index}]`,
+        ),
+      );
+      return null;
+    }
+    numbers.push(item);
+  }
+  return [numbers[0] as number, numbers[1] as number];
+}
+
 function validateMask(value: unknown): {
   mask: { asset: string; attachment: MaskAttachment } | null;
   issues: PackageIssue[];
@@ -410,22 +541,39 @@ function validateEntryPaths(entries: ZipEntry[]): PackageIssue[] {
 }
 
 /** Parses/validates the manifest JSON. Returns issues and a typed manifest. */
-function validateManifestObject(value: unknown, issues: PackageIssue[], warnings: PackageIssue[]): EffectPackageManifestV1 | null {
+function validateManifestObject(value: unknown, issues: PackageIssue[], warnings: PackageIssue[]): EffectPackageManifest | null {
   if (!isRecord(value)) {
     issues.push(error('manifest-schema-invalid', 'manifest.json must contain a JSON object.'));
     return null;
   }
   for (const key of Object.keys(value)) {
     if (!MANIFEST_KEYS.has(key)) {
-      warnings.push(warning('unknown-field', `Unknown manifest field "${key}" is ignored by schema v1.`, key));
+      warnings.push(warning('unknown-field', `Unknown manifest field "${key}" is ignored by this schema.`, key));
     }
   }
-  if (value.schemaVersion !== EFFECT_PACKAGE_SCHEMA_VERSION) {
+  const schemaVersion =
+    typeof value.schemaVersion === 'number' &&
+    (SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS as readonly number[]).includes(value.schemaVersion)
+      ? (value.schemaVersion as EffectPackageSchemaVersion)
+      : null;
+  if (schemaVersion === null) {
     issues.push(
       error(
         'schema-version-unsupported',
-        `schemaVersion ${JSON.stringify(value.schemaVersion)} is not supported. This build reads effect package schema version ${EFFECT_PACKAGE_SCHEMA_VERSION} only.`,
+        `schemaVersion ${JSON.stringify(value.schemaVersion)} is not supported. This build reads effect package schema versions ${SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS.join(' and ')}.`,
         'schemaVersion',
+      ),
+    );
+  }
+  // A v1 manifest declaring faceDistortion is rejected, not silently ignored:
+  // a v1-only build would accept the package, warn about an unknown field, and
+  // drop the declared distortion.
+  if (value.faceDistortion !== undefined && schemaVersion !== null && schemaVersion < FACE_DISTORTION_SCHEMA_VERSION) {
+    issues.push(
+      error(
+        'schema-version-unsupported',
+        `faceDistortion requires schemaVersion ${FACE_DISTORTION_SCHEMA_VERSION}; this manifest declares schemaVersion ${schemaVersion}. Raise schemaVersion or remove the distortion declaration.`,
+        'faceDistortion',
       ),
     );
   }
@@ -466,7 +614,7 @@ function validateManifestObject(value: unknown, issues: PackageIssue[], warnings
       issues.push(
         error(
           'unsupported-behavior',
-          `manifest ${reserved} declares ${declared.length} behavior(s), which schema v1 does not support. Remove the declaration or use a package without it; unsupported behavior is rejected rather than ignored.`,
+          `manifest ${reserved} declares ${declared.length} behavior(s), which this schema version does not support. Remove the declaration or use a package without it; unsupported behavior is rejected rather than ignored.`,
           reserved,
         ),
       );
@@ -485,18 +633,24 @@ function validateManifestObject(value: unknown, issues: PackageIssue[], warnings
     issues.push(...parsed.issues);
     treatment = parsed.treatment;
   }
-  if (value.mask === undefined && value.colorTreatment === undefined) {
+  let distortion: FaceDistortionParameters | null = null;
+  if (value.faceDistortion !== undefined && schemaVersion !== null && schemaVersion >= FACE_DISTORTION_SCHEMA_VERSION) {
+    const parsed = validateFaceDistortion(value.faceDistortion);
+    issues.push(...parsed.issues);
+    distortion = parsed.distortion;
+  }
+  if (value.mask === undefined && value.colorTreatment === undefined && value.faceDistortion === undefined) {
     issues.push(
       error(
         'empty-effect',
-        'The package declares no effect. Add a "mask" component, a "colorTreatment" component, or both to make one complete effect.',
+        'The package declares no effect. Add a "mask" component, a "colorTreatment" component, a "faceDistortion" component, or a combination to make one complete effect.',
       ),
     );
   }
 
   if (issues.length > 0) return null;
   return {
-    schemaVersion: EFFECT_PACKAGE_SCHEMA_VERSION,
+    schemaVersion: schemaVersion as EffectPackageSchemaVersion,
     id: id as string,
     name: name as string,
     version: version as string,
@@ -504,6 +658,7 @@ function validateManifestObject(value: unknown, issues: PackageIssue[], warnings
     author: author as EffectPackageAuthor,
     ...(mask ? { mask: { asset: mask.asset, attachment: mask.attachment } } : {}),
     ...(treatment ? { colorTreatment: treatment } : {}),
+    ...(distortion ? { faceDistortion: distortion } : {}),
   };
 }
 
@@ -521,7 +676,7 @@ export function validateEffectPackage(bytes: Uint8Array): EffectPackageValidatio
     errors.push(
       error(
         'manifest-missing',
-        'The archive has no root manifest.json. Add a schema v1 manifest at the archive root (not inside a folder).',
+        'The archive has no root manifest.json. Add a schema manifest at the archive root (not inside a folder).',
       ),
     );
     return { ok: false, errors, warnings };
@@ -636,6 +791,7 @@ export function validateEffectPackage(bytes: Uint8Array): EffectPackageValidatio
     textures,
     declaredBehaviors,
     colorParameters: manifest.colorTreatment ? countDeclaredColorParameters(manifest.colorTreatment) : 0,
+    distortionParameters: manifest.faceDistortion ? 1 : 0,
   };
   return { ok: true, package: { manifest, assets, complexity, warnings } };
 }

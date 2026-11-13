@@ -986,6 +986,45 @@ async function releaseReplayFrame(page) {
 }
 
 /**
+ * Restarts live replay through the public Recheck/Start controls after a held
+ * A/B. Resuming a long-held replay in this Electron/Playwright environment can
+ * stall the video frame-callback pipeline at the next loop seam (a known
+ * harness/decoder artifact documented in the scenario comments); a fresh replay
+ * load is deterministic and still uses the normal public processing path.
+ */
+async function restartReplayAfterHold(page, label) {
+  await page.locator('[data-testid="recheck"]').click();
+  await waitFor(
+    `${label} fixture rechecked`,
+    async () => {
+      const text = await readDiagnostic(page, 'diag-fixture');
+      return text.includes(metadata.id) ? text : null;
+    },
+    20000,
+    100,
+  );
+  await waitFor(
+    `${label} start enabled after replay restart`,
+    async () => {
+      return (await page.locator('[data-testid="start"]').isDisabled()) ? null : true;
+    },
+    30000,
+    100,
+  );
+  await page.locator('[data-testid="start"]').click();
+  await waitForTrackingPhase(page);
+  return waitFor(
+    `${label} rendered output after replay restart`,
+    async () => {
+      const status = await readStatus(page);
+      return status.mode === 'render' ? status : null;
+    },
+    20000,
+    100,
+  );
+}
+
+/**
  * Resets the paired jitter counters through the public smoothing control. The
  * toggles are the normal public diagnostic control; no private state is poked.
  */
@@ -1127,6 +1166,38 @@ async function captureCameraState(page, prefix, frames = 4) {
   const run = await runCameraConsumer(prefix, frames);
   assert.equal(run.code, 0, `camera consumer ${prefix} exited ${run.code}: ${run.lines.slice(-3).join(' | ')}`);
   return run;
+}
+
+/**
+ * Paused capture with bounded retries. A newly started consumer can receive
+ * only the native paused fallback until the app notices the client and its
+ * 100 ms heartbeat publishes the opaque paused canvas; with only four consumer
+ * frames that race can lose. Retry a bounded number of times and still require
+ * an app-published frame in the caller, so a persistent fallback fails.
+ */
+async function capturePausedCameraState(page, prefix, label, frames = 8) {
+  const attempts = [];
+  let lastRun = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    lastRun = await captureCameraState(page, prefix, frames);
+    const appFrames = lastRun.frames.filter((frame) => frame.captureUnixMs > 0).length;
+    attempts.push({
+      attempt: attempt + 1,
+      frames: lastRun.frames.length,
+      appFrames,
+      nativePausedFallbackFrames: lastRun.frames.length - appFrames,
+    });
+    log(`[${label}] paused camera attempt ${attempt + 1}/3: frames=${lastRun.frames.length} appFrames=${appFrames}`);
+    if (appFrames >= 1) {
+      cameraCaptureAttempts.push({ label, prefix, frames, state: 'paused', attempts });
+      lastRun.captureAttempts = attempts;
+      return lastRun;
+    }
+    await page.waitForTimeout(400);
+  }
+  cameraCaptureAttempts.push({ label, prefix, frames, state: 'paused', attempts, failed: true });
+  if (lastRun) lastRun.captureAttempts = attempts;
+  return lastRun;
 }
 
 /**
@@ -1534,13 +1605,24 @@ const PACKAGE_NEGATIVE_DIR = path.join(PACKAGE_FIXTURES_DIR, 'negative');
 const GUARD_VISOR_EFFECT_ID = 'package:shymask.guard-visor';
 const ROSE_VISOR_EFFECT_ID = 'package:shymask.rose-visor';
 const VERDANT_TINT_EFFECT_ID = 'package:shymask.verdant-tint';
+const FACE_DISTORTION_EFFECT_ID = 'package:shymask.face-distortion';
+/**
+ * Documented default-clip frame used for the warp on/off A/B. The clip is a
+ * 3.379 s replay loop; 1.5 s is a tracked, non-paused frame with the face
+ * roughly centred, and the check holds it before capturing exact output PNGs.
+ */
+const DISTORTION_AB_CAPTURE_SECONDS = 1.5;
 /**
  * Required negative package fixtures and the actionable code each must produce.
  * They are generated reproducibly by `npm run build:packages`.
  */
 const NEGATIVE_PACKAGE_CASES = [
   { name: 'malformed-json', code: 'manifest-invalid-json' },
-  { name: 'schema-version-2', code: 'schema-version-unsupported' },
+  { name: 'schema-version-3', code: 'schema-version-unsupported' },
+  { name: 'distortion-schema-v1', code: 'schema-version-unsupported' },
+  { name: 'distortion-invalid-mode', code: 'distortion-invalid' },
+  { name: 'distortion-out-of-range', code: 'distortion-invalid' },
+  { name: 'distortion-unknown-field', code: 'distortion-invalid' },
   { name: 'unsupported-behavior', code: 'unsupported-behavior' },
   { name: 'missing-asset', code: 'missing-asset' },
   { name: 'invalid-color', code: 'color-parameter-out-of-range' },
@@ -2504,7 +2586,7 @@ async function trackingMaskScenario() {
 async function recordedMotionScenario() {
   log('\n== Scenario G: recorded head turns, nods and leaning (larger-motion CC0 clip) ==');
   const motionMetadata = verifyFixtureManifest('pose-loop.json');
-  const evidence = { states: {}, motion: {}, smoothing: {}, occlusion: {}, timing: {} };
+  const evidence = { states: {}, motion: {}, smoothing: {}, occlusion: {}, distortion: {}, timing: {} };
   // Isolated package store so the imported-mask parity evidence in this
   // scenario does not touch the developer's installed packages.
   const motionPackageDir = path.join(evidenceDir, 'motion-effect-packages');
@@ -2802,6 +2884,121 @@ async function recordedMotionScenario() {
       `rendered p95 sliding=${slidingEvidence.slideP95Px}px (${(100 * slidingEvidence.slideP95FractionOfFaceWidth).toFixed(1)}% of face width; enforced bound ${slidingEvidence.boundPx}px), raw-mode p95=${rawSlidingEvidence.slideP95Px}px, smoothed-vs-raw change=${(100 * slidingReduction).toFixed(1)}%, anchor offset p95=${slidingEvidence.anchorOffsetP95Px}px (bound 60 px)`,
     );
 
+    // --- The bounded face distortion follows the recorded face ---------------
+    // Run this pass while playback is live, before the long held occlusion A/Bs:
+    // the automated session can stall frame callbacks after resuming a long hold,
+    // which would turn the motion sample into a decoder artifact.
+    const motionDistortionImport = await importPackageThroughControl(
+      app,
+      page,
+      path.join(PACKAGE_FIXTURES_DIR, 'face-distortion.zip'),
+    );
+    assert.equal(
+      motionDistortionImport.state,
+      'success',
+      `face-distortion import must succeed in the motion scenario: ${motionDistortionImport.text}`,
+    );
+    await waitForEffectLoaded(page, FACE_DISTORTION_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Face distortion/);
+    await page.evaluate((startSeconds) => {
+      const video = document.querySelector('video');
+      if (!video) throw new Error('expected a replay video element');
+      video.currentTime = startSeconds;
+    }, MOTION_WINDOW_START_SECONDS);
+    await waitFor(
+      'distortion motion window media time',
+      async () => {
+        const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+        return Number(timestamp.mediaMs ?? 0) >= MOTION_WINDOW_START_MS ? timestamp : null;
+      },
+      15000,
+      100,
+    );
+    await waitFor(
+      'rendered output before distortion motion sampling',
+      async () => {
+        const status = await readStatus(page);
+        return status.mode === 'render' ? status : null;
+      },
+      15000,
+      40,
+    );
+    const distortionMotionSamples = [];
+    const distortionMotionShots = [];
+    let previousDistortionMediaMs = null;
+    for (let index = 0; index < 18; index += 1) {
+      await page.waitForTimeout(400);
+      const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+      const mediaMs = Number(timestamp.mediaMs ?? 0);
+      if (
+        mediaMs > MOTION_WINDOW_END_MS ||
+        (previousDistortionMediaMs !== null && mediaMs < previousDistortionMediaMs - LOOP_SEAM_THRESHOLD_MS)
+      ) {
+        break;
+      }
+      previousDistortionMediaMs = mediaMs;
+      const tracking = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
+      if (tracking.phase !== 'tracking') continue;
+      const distortion = await readDistortion(page);
+      if (distortion.active !== 'true' || Number(distortion.insidePixels) < 8) continue;
+      const independentFace = await readFace(page);
+      assertDistortionGeometry(distortion, `distortion motion sample ${index}`, independentFace, 8);
+      distortionMotionSamples.push({
+        mediaMs,
+        faceX: Number(distortion.faceX),
+        faceY: Number(distortion.faceY),
+        faceW: Number(distortion.faceW),
+        faceH: Number(distortion.faceH),
+        centerX: Number(distortion.centerX),
+        centerY: Number(distortion.centerY),
+        radiusX: Number(distortion.radiusX),
+        radiusY: Number(distortion.radiusY),
+        changedInsidePct: Number(distortion.changedInsidePct),
+        changedOutsidePct: Number(distortion.changedOutsidePct),
+        warpDelta: Number(distortion.warpDelta),
+        costMsLast: Number(distortion.costMsLast),
+      });
+      if (index === 3 || index === 9 || index === 15) {
+        distortionMotionShots.push(await screenshotCanvas(page, `18b-motion-distortion-${index}.png`));
+      }
+    }
+    assert.ok(
+      distortionMotionSamples.length >= 12,
+      `expected most distortion motion-window frames tracked, got ${distortionMotionSamples.length}/18`,
+    );
+    assert.ok(
+      distortionMotionSamples.every(
+        (sample) => sample.mediaMs >= MOTION_WINDOW_START_MS && sample.mediaMs <= MOTION_WINDOW_END_MS,
+      ),
+      `distortion motion samples must fall inside the documented window: ${distortionMotionSamples.map((sample) => sample.mediaMs).join(', ')}`,
+    );
+    const distortionCenterXRange = spread(distortionMotionSamples.map((sample) => sample.centerX));
+    const distortionCenterYRange = spread(distortionMotionSamples.map((sample) => sample.centerY));
+    assert.ok(
+      Math.max(distortionCenterXRange, distortionCenterYRange) >= 30,
+      `the distortion ellipse must move with the recorded face, got x=${distortionCenterXRange} y=${distortionCenterYRange}px`,
+    );
+    evidence.distortion = {
+      fixture: motionMetadata.id,
+      windowStartSeconds: MOTION_WINDOW_START_SECONDS,
+      windowSeconds: MOTION_WINDOW_SECONDS,
+      windowStartMediaMs: MOTION_WINDOW_START_MS,
+      windowEndMediaMs: MOTION_WINDOW_END_MS,
+      trackedSamples: distortionMotionSamples.length,
+      centerXRange: distortionCenterXRange,
+      centerYRange: distortionCenterYRange,
+      screenshots: distortionMotionShots,
+      samples: distortionMotionSamples,
+    };
+    pass(
+      'The face distortion follows recorded head movement instead of a static screen overlay',
+      `tracked=${distortionMotionSamples.length}/18 warp centre moved ${distortionCenterXRange}x${distortionCenterYRange}px with the face box, changedInside=${distortionMotionSamples[0]?.changedInsidePct}%..${distortionMotionSamples[distortionMotionSamples.length - 1]?.changedInsidePct}% ${distortionMotionShots.join(' ')}`,
+    );
+
+    // Return to the bundled mask for the occlusion A/B and camera evidence.
+    await selectEffectThroughControl(page, 'mask');
+    await waitForStatusTitle(page, /Effect active: Rigid mask/);
+
     // Side-view occlusion A/B on two documented held frames in opposite yaw
     // directions. The capture control writes exact 1280x720 output PNGs; the
     // on/off diff must sit inside the tracked face's axis-aligned bounding box,
@@ -2947,6 +3144,20 @@ async function recordedMotionScenario() {
       'The camera consumer receives the masked output for the held motion-window frame as well',
       `heldFrame=${OCCLUSION_CAPTURE_SECONDS}s camera=${JSON.stringify(evidence.camera.camera)} eyePixels=${eyePixels} ${cameraPng.png}`,
     );
+
+    // --- Published-output warp A/B at the held 47.7 s pose ------------------
+    // Same held frame, warp ON vs identity OFF, exact 1280x720 captures through
+    // the public control plus the independent camera. This is the primary pose
+    // for the face-following centroid comparison below.
+    await selectEffectThroughControl(page, FACE_DISTORTION_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Face distortion/);
+    await waitForDistortionActive(page, 'motion distortion A/B');
+    const primaryDistortionAb = await distortionAbEvidence(page, 'distortion-ab-primary', { captureCamera: true });
+    evidence.distortion.ab = { captureSeconds: OCCLUSION_CAPTURE_SECONDS, ...primaryDistortionAb };
+    pass(
+      'The published preview and camera outputs contain the face-following warp on the held 47.7 s pose',
+      `held=${OCCLUSION_CAPTURE_SECONDS}s changed=${primaryDistortionAb.changedPixels}px inside-ellipse=${primaryDistortionAb.changedInsideEllipsePixels}px (${(100 * primaryDistortionAb.insideEllipseFraction).toFixed(2)}%) outside=${primaryDistortionAb.changedOutsideEllipsePixels}px centroid=(${primaryDistortionAb.centroid.x},${primaryDistortionAb.centroid.y}) face-ellipse=(${primaryDistortionAb.ellipse.centerX.toFixed(0)},${primaryDistortionAb.ellipse.centerY.toFixed(0)}) self-diff ON ${primaryDistortionAb.selfDiffPixels}px OFF ${primaryDistortionAb.offSelfDiffPixels}px camera changed=${primaryDistortionAb.camera?.changedPixels}px ${primaryDistortionAb.on} ${primaryDistortionAb.off} ${primaryDistortionAb.camera?.onPng ?? ''}`,
+    );
     // Resume the replay only after the camera evidence is captured; the opposite
     // side view uses a fresh app instance.
     await releaseReplayFrame(page);
@@ -3018,6 +3229,56 @@ async function recordedMotionScenario() {
       pass(
         'The virtual camera receives the same occlusion change on the opposite side view too',
         `camera change=${oppositeCamera.changedPixels}px inside=${oppositeCamera.changedInsideFacePixels}px self-diff=${oppositeCamera.selfDiffPixels}px`,
+      );
+
+      // --- Second documented pose: the changed region must follow the face --
+      // Same public A/B at the 16.0 s held frame. The face is at a different
+      // position than the 47.7 s pose, so the published changed-region centroid
+      // must move with it. A static screen-space overlay would keep the change at
+      // a fixed location and fall outside the tracked face ellipse at one pose.
+      await selectEffectThroughControl(opposite.page, FACE_DISTORTION_EFFECT_ID);
+      await waitForStatusTitle(opposite.page, /Effect active: Face distortion/);
+      await waitForDistortionActive(opposite.page, 'opposite distortion A/B');
+      const oppositeDistortionAb = await distortionAbEvidence(opposite.page, 'distortion-ab-opposite', {
+        captureCamera: true,
+      });
+      const poseDistancePx = Math.hypot(
+        oppositeDistortionAb.ellipse.centerX - primaryDistortionAb.ellipse.centerX,
+        oppositeDistortionAb.ellipse.centerY - primaryDistortionAb.ellipse.centerY,
+      );
+      const centroidDistancePx = Math.hypot(
+        oppositeDistortionAb.centroid.x - primaryDistortionAb.centroid.x,
+        oppositeDistortionAb.centroid.y - primaryDistortionAb.centroid.y,
+      );
+      assert.ok(
+        poseDistancePx >= 40,
+        `the two documented A/B poses must have different face positions, got ${poseDistancePx.toFixed(1)}px apart`,
+      );
+      assert.ok(
+        centroidDistancePx >= 40,
+        `the published changed-region centroid must move with the face between poses, got ${centroidDistancePx.toFixed(1)}px`,
+      );
+      assert.ok(
+        centroidDistancePx >= poseDistancePx * 0.5,
+        `the changed-region centroid must follow the face movement (centroid ${centroidDistancePx.toFixed(1)}px vs face ${poseDistancePx.toFixed(1)}px)`,
+      );
+      evidence.distortion.abOpposite = {
+        captureSeconds: OCCLUSION_CAPTURE_SECONDS_OPPOSITE,
+        ...oppositeDistortionAb,
+      };
+      evidence.distortion.faceFollowingPoses = {
+        primaryCaptureSeconds: OCCLUSION_CAPTURE_SECONDS,
+        oppositeCaptureSeconds: OCCLUSION_CAPTURE_SECONDS_OPPOSITE,
+        primaryFaceCenter: primaryDistortionAb.ellipse,
+        oppositeFaceCenter: oppositeDistortionAb.ellipse,
+        primaryCentroid: primaryDistortionAb.centroid,
+        oppositeCentroid: oppositeDistortionAb.centroid,
+        poseDistancePx: Number(poseDistancePx.toFixed(1)),
+        centroidDistancePx: Number(centroidDistancePx.toFixed(1)),
+      };
+      pass(
+        'The published warp change follows the recorded face between two documented held poses',
+        `pose ${OCCLUSION_CAPTURE_SECONDS}s centroid=(${primaryDistortionAb.centroid.x},${primaryDistortionAb.centroid.y}) -> ${OCCLUSION_CAPTURE_SECONDS_OPPOSITE}s centroid=(${oppositeDistortionAb.centroid.x},${oppositeDistortionAb.centroid.y}) moved ${centroidDistancePx.toFixed(1)}px with a ${poseDistancePx.toFixed(1)}px face move; inside-ellipse ${oppositeDistortionAb.changedInsideEllipsePixels}px (${(100 * oppositeDistortionAb.insideEllipseFraction).toFixed(2)}%), outside ${oppositeDistortionAb.changedOutsideEllipsePixels}px; camera changed=${oppositeDistortionAb.camera?.changedPixels}px ${oppositeDistortionAb.on} ${oppositeDistortionAb.off}`,
       );
       assert.deepEqual(
         opposite.consoleErrors,
@@ -3120,6 +3381,7 @@ function verifyPackageFixtures() {
   const required = [
     path.join(PACKAGE_FIXTURES_DIR, 'guard-visor.zip'),
     path.join(PACKAGE_FIXTURES_DIR, 'verdant-tint.zip'),
+    path.join(PACKAGE_FIXTURES_DIR, 'face-distortion.zip'),
     ...NEGATIVE_PACKAGE_CASES.map((entry) => path.join(PACKAGE_NEGATIVE_DIR, `${entry.name}.zip`)),
   ];
   for (const file of required) {
@@ -3186,6 +3448,340 @@ function colorNear(actual, expected, tolerance = 16) {
   );
 }
 
+async function readDistortion(page) {
+  return parseKeyValues(await readDiagnostic(page, 'diag-distortion'));
+}
+
+/**
+ * Waits for the imported face distortion to be active *and* for the pipeline's
+ * warp-delta diagnostic to have compared at least one presented frame, so the
+ * assertion is about observed pixel change rather than configuration metadata.
+ */
+async function waitForDistortionActive(page, label, timeoutMs = 20000) {
+  return waitFor(
+    `${label} active face distortion`,
+    async () => {
+      const values = await readDistortion(page);
+      if (values.active !== 'true') return null;
+      if (Number(values.insidePixels) < 8) return null;
+      return values;
+    },
+    timeoutMs,
+    100,
+  );
+}
+
+/**
+ * Asserts the warp ellipse follows the tracked face and that the distortion
+ * changed real pixels inside it while leaving the rest of the frame unchanged.
+ *
+ * `independentFace` is the face box read from the *tracking* diagnostic
+ * (`diag-face`, populated from the detector's `faceBbox`), not the distortion's
+ * own `faceX/faceY/faceW/faceH` fields. Comparing the ellipse against that
+ * independent source is what makes this assertion meaningful: a static or
+ * mis-anchored warp cannot satisfy it. When supplied, the expected centre and
+ * radii are derived from the independent box and the declared parameters.
+ */
+function assertDistortionGeometry(values, label, independentFace = null, tolerancePx = 2) {
+  const faceX = Number(values.faceX);
+  const faceY = Number(values.faceY);
+  const faceW = Number(values.faceW);
+  const faceH = Number(values.faceH);
+  assert.ok(faceW > 40 && faceH > 40, `${label}: the warp must have a measurable tracked face box, got ${faceW}x${faceH}`);
+  assert.ok(
+    Math.abs(Number(values.centerX) - (faceX + faceW / 2)) <= 2,
+    `${label}: the warp centre must follow the tracked face box centre: ${JSON.stringify(values)}`,
+  );
+  assert.ok(
+    Math.abs(Number(values.centerY) - (faceY + faceH / 2)) <= 2,
+    `${label}: the warp centre must follow the tracked face box centre: ${JSON.stringify(values)}`,
+  );
+  const expectedRadiusX = (faceW / 2) * Number(values.radiusScale);
+  const expectedRadiusY = (faceH / 2) * Number(values.radiusScale);
+  assert.ok(
+    Math.abs(Number(values.radiusX) - expectedRadiusX) <= 2 &&
+      Math.abs(Number(values.radiusY) - expectedRadiusY) <= 2,
+    `${label}: the warp size must scale with the tracked face: ${JSON.stringify(values)}`,
+  );
+  if (independentFace) {
+    const independent = {
+      x: Number(independentFace.x),
+      y: Number(independentFace.y),
+      w: Number(independentFace.w),
+      h: Number(independentFace.h),
+    };
+    assert.ok(
+      independent.w > 40 && independent.h > 40,
+      `${label}: the independent tracking diagnostic must report a measurable face box, got ${independent.w}x${independent.h}`,
+    );
+    const [offsetX, offsetY] = String(values.centerOffset ?? '0,0').split(',').map(Number);
+    const expectedCenterX = independent.x + independent.w * (0.5 + offsetX);
+    const expectedCenterY = independent.y + independent.h * (0.5 + offsetY);
+    const expectedIndependentRadiusX = (independent.w / 2) * Number(values.radiusScale);
+    const expectedIndependentRadiusY = (independent.h / 2) * Number(values.radiusScale);
+    assert.ok(
+      Math.abs(Number(values.centerX) - expectedCenterX) <= tolerancePx &&
+        Math.abs(Number(values.centerY) - expectedCenterY) <= tolerancePx,
+      `${label}: the warp centre must follow the independent diag-face box (centre ${expectedCenterX},${expectedCenterY}, tolerance ${tolerancePx}px): ${JSON.stringify({ values, independentFace })}`,
+    );
+    assert.ok(
+      Math.abs(Number(values.radiusX) - expectedIndependentRadiusX) <= tolerancePx + 1 &&
+        Math.abs(Number(values.radiusY) - expectedIndependentRadiusY) <= tolerancePx + 1,
+      `${label}: the warp radius must scale with the independent diag-face box (radius ${expectedIndependentRadiusX},${expectedIndependentRadiusY}): ${JSON.stringify({ values, independentFace })}`,
+    );
+  }
+  assert.ok(
+    Number(values.changedInsidePct) >= 8,
+    `${label}: the distortion must change pixels inside the tracked face region, got ${values.changedInsidePct}% (warpDelta=${values.warpDelta})`,
+  );
+  assert.ok(
+    Number(values.changedOutsidePct) <= 3,
+    `${label}: the distortion must stay localized to the tracked face region, got ${values.changedOutsidePct}% changed outside`,
+  );
+  assert.ok(
+    Number(values.warpDelta) >= 0.25,
+    `${label}: the warp-delta diagnostic must measure a real image change, got ${values.warpDelta}`,
+  );
+}
+
+/**
+ * Independent expected warp ellipse for a tracked face box and a distortion
+ * declaration parsed from the public `diag-effect` line (`mode:strength:
+ * radiusScale:centerOffset`). Derived from the face box and the manifest values,
+ * not from the distortion diagnostic's own geometry fields.
+ */
+function distortionEllipse(face, distortion) {
+  const x = Number(face.x);
+  const y = Number(face.y);
+  const width = Number(face.w);
+  const height = Number(face.h);
+  const radiusScale = Number(distortion.radiusScale);
+  const [offsetX, offsetY] = String(distortion.centerOffset).split(',').map(Number);
+  return {
+    centerX: x + width * (0.5 + offsetX),
+    centerY: y + height * (0.5 + offsetY),
+    radiusX: (width / 2) * radiusScale,
+    radiusY: (height / 2) * radiusScale,
+  };
+}
+
+/**
+ * Counts pixels that differ between two saved PNGs and classifies each changed
+ * pixel inside or outside the expected warp ellipse. The changed-region centroid
+ * is the published-output location of the warp: for a face-following distortion
+ * it must sit on the tracked face, and it must move when the face moves.
+ */
+function pngEllipseDiff(fileA, fileB, ellipse, tolerance = 4) {
+  const a = decodePng(fileA);
+  const b = decodePng(fileB);
+  assert.equal(a.width, b.width, 'compared PNGs must have the same width');
+  assert.equal(a.height, b.height, 'compared PNGs must have the same height');
+  let count = 0;
+  let inside = 0;
+  let outside = 0;
+  let sumX = 0;
+  let sumY = 0;
+  for (let y = 0; y < a.height; y += 1) {
+    for (let x = 0; x < a.width; x += 1) {
+      const index = y * a.stride + x * a.channels;
+      const changed =
+        Math.abs(a.pixels[index] - b.pixels[index]) > tolerance ||
+        Math.abs(a.pixels[index + 1] - b.pixels[index + 1]) > tolerance ||
+        Math.abs(a.pixels[index + 2] - b.pixels[index + 2]) > tolerance;
+      if (!changed) continue;
+      count += 1;
+      sumX += x + 0.5;
+      sumY += y + 0.5;
+      const dx = (x + 0.5 - ellipse.centerX) / ellipse.radiusX;
+      const dy = (y + 0.5 - ellipse.centerY) / ellipse.radiusY;
+      if (dx * dx + dy * dy < 1) inside += 1;
+      else outside += 1;
+    }
+  }
+  return {
+    count,
+    inside,
+    outside,
+    width: a.width,
+    height: a.height,
+    centroidX: count > 0 ? sumX / count : 0,
+    centroidY: count > 0 ? sumY / count : 0,
+  };
+}
+
+function parseDistortionDeclaration(effectValues) {
+  const [mode, strength, radiusScale, centerOffset] = String(effectValues.distortion ?? '').split(':');
+  return { mode, strength: Number(strength), radiusScale: Number(radiusScale), centerOffset };
+}
+
+/**
+ * Public A/B proof that the *published* output contains the face-following warp.
+ *
+ * The caller holds a documented replay frame. This captures exact 1280x720
+ * output PNGs through the public Capture control in two states that differ only
+ * in the warp: the effect stays selected and the offscreen renderer still
+ * produces the frame, but `warp off` draws the same uploaded frame through the
+ * identity shader. The changed region must be substantial, must sit inside the
+ * independent diag-face-derived ellipse and be ~zero outside it, same-state
+ * captures must be pixel-identical, and the independent Media Foundation camera
+ * must receive the identical change. This fails for a dropped warp (ON == OFF)
+ * and for a raw passthrough (OFF would not come from the effect renderer at
+ * all). A fixed screen-space overlay is excluded by the cross-pose centroid
+ * gate in the caller: the two tracked ellipses overlap, so containment alone
+ * cannot exclude it, but the changed-region centroid must move at least 40 px
+ * and at least 50% of the face-box movement between the two documented poses.
+ */
+async function distortionAbEvidence(page, label, options = {}) {
+  const captureCamera = options.captureCamera === true;
+  const statusBefore = await readStatus(page);
+  assert.equal(
+    statusBefore.mode,
+    'render',
+    `${label}: the held A/B frame must be rendered, not the paused screen (${statusBefore.explanation})`,
+  );
+  const effectBefore = await readEffectDiagnostic(page);
+  assert.notEqual(effectBefore.distortion, 'none', `${label}: a distortion effect must be selected`);
+  const declaration = parseDistortionDeclaration(effectBefore);
+  const tracking = await readTracking(page);
+  assert.equal(tracking.phase, 'tracking', `${label}: the held A/B frame must be tracked`);
+  const distortionBefore = await readDistortion(page);
+  assert.equal(distortionBefore.active, 'true', `${label}: the distortion effect must be active`);
+  assert.equal(distortionBefore.warpEnabled, 'true', `${label}: the warp must start enabled`);
+  const face = await readFace(page);
+  assert.equal(face.count, '1', `${label}: exactly one face must be tracked for the distortion A/B`);
+  assertDistortionGeometry(distortionBefore, label, face, 2);
+  const ellipse = distortionEllipse(face, declaration);
+
+  const on = await captureOutputThroughControl(page, `${label}-warp-on.png`);
+  await page.waitForTimeout(250);
+  const onRepeat = await captureOutputThroughControl(page, `${label}-warp-on-repeat.png`);
+  const onFace = await readFace(page);
+  const onDistortion = await readDistortion(page);
+
+  await page.locator('[data-testid="distortion-warp-toggle"]').uncheck();
+  await page.waitForTimeout(250);
+  const offDistortion = await readDistortion(page);
+  assert.equal(offDistortion.active, 'true', `${label}: disabling only the warp must keep the distortion effect active`);
+  assert.equal(offDistortion.warpEnabled, 'false', `${label}: the diagnostic control must disable only the warp term`);
+  const offEffect = await readEffectDiagnostic(page);
+  assert.equal(offEffect.distortion, effectBefore.distortion, `${label}: the effect declaration must not change in the A/B`);
+  const off = await captureOutputThroughControl(page, `${label}-warp-off.png`);
+  await page.waitForTimeout(250);
+  const offRepeat = await captureOutputThroughControl(page, `${label}-warp-off-repeat.png`);
+
+  await page.locator('[data-testid="distortion-warp-toggle"]').check();
+  await page.waitForTimeout(250);
+  const restored = await readDistortion(page);
+  assert.equal(restored.active, 'true', `${label}: the effect must stay active after the A/B`);
+  assert.equal(restored.warpEnabled, 'true', `${label}: the warp must be restored after the A/B`);
+  const faceAfter = await readFace(page);
+  // The held frame must not move between captures, otherwise a diff could be
+  // video drift rather than the warp A/B.
+  assert.equal(faceAfter.x, face.x, `${label}: held face x must not move during the A/B`);
+  assert.equal(faceAfter.y, face.y, `${label}: held face y must not move during the A/B`);
+  assert.equal(faceAfter.w, face.w, `${label}: held face width must not move during the A/B`);
+  assert.equal(faceAfter.h, face.h, `${label}: held face height must not move during the A/B`);
+
+  const selfDiff = pngPixelDiff(on, onRepeat);
+  const offSelfDiff = pngPixelDiff(off, offRepeat);
+  const change = pngEllipseDiff(on, off, ellipse);
+  const insideFraction = change.count === 0 ? 0 : change.inside / change.count;
+  assert.equal(selfDiff.count, 0, `${label}: two ON captures of the same held frame must be pixel-identical, got ${selfDiff.count} changed pixels`);
+  assert.equal(offSelfDiff.count, 0, `${label}: two OFF captures of the same held frame must be pixel-identical, got ${offSelfDiff.count} changed pixels`);
+  assert.ok(
+    change.inside >= 1500,
+    `${label}: the warp must visibly change published pixels inside the tracked face ellipse, changed ${change.inside} inside (${change.count} total)`,
+  );
+  assert.ok(
+    insideFraction >= 0.97,
+    `${label}: the warp change must stay inside the tracked face ellipse (inside fraction ${insideFraction.toFixed(3)}, ${change.inside}/${change.count})`,
+  );
+  assert.ok(
+    change.outside <= Math.max(40, Math.round(change.count * 0.01)),
+    `${label}: the warp must not change the frame outside the tracked face ellipse, got ${change.outside} outside pixels (allowed ${Math.max(40, Math.round(change.count * 0.01))})`,
+  );
+  const centroidDx = (change.centroidX - ellipse.centerX) / ellipse.radiusX;
+  const centroidDy = (change.centroidY - ellipse.centerY) / ellipse.radiusY;
+  assert.ok(
+    centroidDx * centroidDx + centroidDy * centroidDy <= 0.36,
+    `${label}: the changed-region centroid must sit on the tracked face ellipse centre (${change.centroidX.toFixed(1)},${change.centroidY.toFixed(1)} vs ${ellipse.centerX.toFixed(1)},${ellipse.centerY.toFixed(1)})`,
+  );
+
+  let camera = null;
+  if (captureCamera) {
+    // The independent camera must receive the same change on the held frame.
+    const previewOn = await readRgb(page);
+    const onRun = await captureProcessedCameraState(
+      page,
+      `${label}-warp-on-camera`,
+      PROCESSED_CAMERA_FRAMES,
+      previewOn,
+      `${label} warp on camera`,
+    );
+    const onPngs = onRun.frames.filter((frame) => frame.png && frame.captureUnixMs > 0).map((frame) => frame.png);
+    assert.ok(onPngs.length >= 2, `${label}: expected two app-published camera PNGs in the warp-on state, got ${onPngs.length}`);
+    await page.locator('[data-testid="distortion-warp-toggle"]').uncheck();
+    await page.waitForTimeout(300);
+    const previewOff = await readRgb(page);
+    const offRun = await captureProcessedCameraState(
+      page,
+      `${label}-warp-off-camera`,
+      PROCESSED_CAMERA_FRAMES,
+      previewOff,
+      `${label} warp off camera`,
+    );
+    const offPng = offRun.frames.find((frame) => frame.png && frame.captureUnixMs > 0)?.png;
+    assert.ok(offPng, `${label}: expected an app-published camera PNG in the warp-off state`);
+    await page.locator('[data-testid="distortion-warp-toggle"]').check();
+    await page.waitForTimeout(300);
+    const cameraSelfDiff = pngPixelDiff(onPngs[0], onPngs[1]);
+    const cameraChange = pngEllipseDiff(onPngs[0], offPng, ellipse);
+    assert.equal(
+      cameraSelfDiff.count,
+      0,
+      `${label}: two camera PNGs of the same held frame must match, got ${cameraSelfDiff.count} changed pixels`,
+    );
+    assert.equal(
+      cameraChange.count,
+      change.count,
+      `${label}: camera and preview must receive the identical warp change (camera ${cameraChange.count}px, preview ${change.count}px)`,
+    );
+    assert.equal(
+      cameraChange.inside,
+      change.inside,
+      `${label}: camera and preview must receive the identical inside-ellipse warp change (camera ${cameraChange.inside}px, preview ${change.inside}px)`,
+    );
+    camera = {
+      onPng: onPngs[0],
+      onRepeatPng: onPngs[1],
+      offPng,
+      selfDiffPixels: cameraSelfDiff.count,
+      changedPixels: cameraChange.count,
+      changedInsideEllipsePixels: cameraChange.inside,
+    };
+  }
+
+  return {
+    declared: declaration,
+    face,
+    ellipse,
+    distortion: onDistortion,
+    offDistortion,
+    on,
+    onRepeat,
+    off,
+    offRepeat,
+    selfDiffPixels: selfDiff.count,
+    offSelfDiffPixels: offSelfDiff.count,
+    changedPixels: change.count,
+    changedInsideEllipsePixels: change.inside,
+    changedOutsideEllipsePixels: change.outside,
+    insideEllipseFraction: Number(insideFraction.toFixed(3)),
+    centroid: { x: Number(change.centroidX.toFixed(1)), y: Number(change.centroidY.toFixed(1)) },
+    camera,
+  };
+}
+
 async function waitForPackageMask(page, label, expected = PACKAGE_MASK_RGB) {
   const mask = await waitFor(`${label} mask projection`, async () => {
     const values = await readMask(page);
@@ -3219,7 +3815,15 @@ async function waitForPackageMask(page, label, expected = PACKAGE_MASK_RGB) {
  */
 async function effectPackageScenario() {
   log('\n== Scenario I: effect package import, selection, switching and removal ==');
-  const evidence = { imports: {}, negative: [], switching: {}, removal: {}, persistence: {}, camera: {} };
+  const evidence = {
+    imports: {},
+    distortion: {},
+    negative: [],
+    switching: {},
+    removal: {},
+    persistence: {},
+    camera: {},
+  };
   // Isolated store so a check run never mutates the developer's userData.
   const packageDir = path.join(evidenceDir, 'effect-packages');
   mkdirSync(packageDir, { recursive: true });
@@ -3595,6 +4199,321 @@ async function effectPackageScenario() {
       `preview=${JSON.stringify(interruptedRgb)} camera=${JSON.stringify(evidence.switching.processingInterruption.camera)} recovered=${JSON.stringify(interruptionRecovered)}`,
     );
 
+    // --- Schema v2 bounded face-distortion package ---------------------------
+    const distortionImport = await importPackageThroughControl(
+      app,
+      page,
+      path.join(PACKAGE_FIXTURES_DIR, 'face-distortion.zip'),
+    );
+    assert.equal(distortionImport.state, 'success', `valid distortion import must succeed: ${distortionImport.text}`);
+    assert.match(distortionImport.text, /Imported "Face distortion" v1\.0\.0/);
+    const optionsAfterDistortion = await effectOptionValues(page);
+    assert.ok(optionsAfterDistortion.includes(FACE_DISTORTION_EFFECT_ID), 'the distortion effect must appear in the selector');
+    const distortionLoaded = await waitForEffectLoaded(page, FACE_DISTORTION_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Face distortion/);
+    assert.equal(await page.locator('[data-testid="effect-select"]').inputValue(), FACE_DISTORTION_EFFECT_ID);
+    assert.equal(distortionLoaded.source, 'package');
+    assert.equal(distortionLoaded.mask, 'none');
+    assert.equal(distortionLoaded.treatment, 'no');
+    assert.equal(distortionLoaded.distortion, 'bulge:0.6:1.35:0,0');
+    const distortionActive = await waitForDistortionActive(page, 'imported face distortion');
+    assertDistortionGeometry(distortionActive, 'imported face distortion', await readFace(page), 6);
+    // Let the rolling cost and warp-delta diagnostics collect a steady window.
+    await page.waitForTimeout(2200);
+    const distortionSample = await waitForDistortionActive(page, 'settled imported face distortion');
+    assertDistortionGeometry(distortionSample, 'settled imported face distortion', await readFace(page), 6);
+    const distortionPreview = await readProcessedRgb(page, 'imported face distortion preview');
+    const distortionShot = await screenshotCanvas(page, '22d-imported-face-distortion-preview.png');
+    const distortionPng = await captureOutputThroughControl(page, '22e-imported-face-distortion-output.png');
+    const distortionPngMean = pngMeanRgb(distortionPng);
+    assert.ok(
+      rgbSum(distortionPngMean) > 60,
+      `the captured distortion output must be processed content, not the paused canvas: ${JSON.stringify(distortionPngMean)}`,
+    );
+    const distortionFrameDelta = parseKeyValues(await readDiagnostic(page, 'diag-frame-delta'));
+    const distortionRenderCost = parseKeyValues(await readDiagnostic(page, 'diag-render-cost'));
+    const distortionCameraRun = await captureProcessedCameraState(
+      page,
+      'imported-face-distortion',
+      PROCESSED_CAMERA_FRAMES,
+      distortionPreview,
+      'imported face distortion',
+    );
+    const distortionCameraPng = assertProcessedPng(distortionCameraRun.frames, distortionPreview, 'imported face distortion');
+    evidence.distortion.preview = {
+      importMessage: distortionImport.text,
+      effect: distortionLoaded,
+      active: distortionSample,
+      rgb: distortionPreview,
+      screenshot: distortionShot,
+      png: distortionPng,
+      pngMean: distortionPngMean,
+    };
+    evidence.distortion.timing = {
+      warpSubmissionCostP95Ms: Number(distortionSample.costMsP95),
+      renderCostP95Ms: Number(distortionRenderCost.p95Ms ?? 0),
+      frameIntervalP95Ms: Number(distortionFrameDelta.p95Ms ?? 0),
+    };
+    evidence.camera.faceDistortion = {
+      preview: distortionPreview,
+      camera: averageFrameRgb(distortionCameraRun.frames),
+      png: distortionCameraPng.png,
+      pngRgb: distortionCameraPng.rgb,
+    };
+    pass(
+      'A schema v2 face-distortion package imports through the public control and warps the tracked face in preview and camera',
+      `effect=${FACE_DISTORTION_EFFECT_ID} centre=(${distortionSample.centerX},${distortionSample.centerY}) radius=${distortionSample.radiusX}x${distortionSample.radiusY} changedInside=${distortionSample.changedInsidePct}% changedOutside=${distortionSample.changedOutsidePct}% warpDelta=${distortionSample.warpDelta} camera=${JSON.stringify(evidence.camera.faceDistortion.camera)} ${distortionShot} ${distortionCameraPng.png}`,
+    );
+
+    // --- Public published-output A/B: warped vs identity on a held frame ---
+    // The effect stays selected and the offscreen renderer still produces the
+    // frame; the diagnostic toggle removes only the warp term. This proves the
+    // published 1280x720 output (and the independent camera) really contains the
+    // face-following warp, which the offscreen warp-delta diagnostic cannot.
+    await holdRenderedFrameAt(page, DISTORTION_AB_CAPTURE_SECONDS, 'default distortion A/B');
+    const distortionAb = await distortionAbEvidence(page, '22f-distortion-warp-ab', { captureCamera: true });
+    evidence.distortion.ab = { captureSeconds: DISTORTION_AB_CAPTURE_SECONDS, ...distortionAb };
+    pass(
+      'The published preview and camera outputs contain the face-following warp (warp ON vs identity OFF on a held frame)',
+      `held=${DISTORTION_AB_CAPTURE_SECONDS}s changed=${distortionAb.changedPixels}px inside-ellipse=${distortionAb.changedInsideEllipsePixels}px (${(100 * distortionAb.insideEllipseFraction).toFixed(2)}%) outside=${distortionAb.changedOutsideEllipsePixels}px centroid=(${distortionAb.centroid.x},${distortionAb.centroid.y}) centroid-face=(${distortionAb.ellipse.centerX.toFixed(0)},${distortionAb.ellipse.centerY.toFixed(0)}) self-diff ON ${distortionAb.selfDiffPixels}px OFF ${distortionAb.offSelfDiffPixels}px camera changed=${distortionAb.camera?.changedPixels}px ${distortionAb.on} ${distortionAb.off} ${distortionAb.camera?.onPng ?? ''}`,
+    );
+    await restartReplayAfterHold(page, 'default distortion A/B');
+
+    // --- Distortion obeys the paused-output policy in preview and camera -----
+    await page.locator('[data-testid="pause-toggle"]').click();
+    const distortionManualPause = await waitFor('distortion manual pause status', async () => {
+      const status = await readStatus(page);
+      return /paused manually/i.test(status.explanation) ? status : null;
+    });
+    await page.waitForTimeout(300);
+    const distortionManualRun = await capturePausedCameraState(page, 'distortion-manual-pause', 'face distortion manual pause');
+    assertAllPausedFrames(distortionManualRun.frames, 'face distortion manual pause');
+    const distortionManualPng = assertPausedPng(distortionManualRun.frames, 'face distortion manual pause');
+    await page.locator('[data-testid="pause-toggle"]').click();
+    await waitForStatusTitle(page, /Effect active: Face distortion/);
+
+    await page.locator('[data-testid="tracking-injection"]').selectOption('lost');
+    const distortionLost = await waitFor('distortion tracking loss', async () => {
+      const status = await readStatus(page);
+      return /tracking was lost/i.test(status.explanation) ? status : null;
+    });
+    await page.waitForTimeout(300);
+    const distortionLostRgb = await readRgb(page);
+    assert.ok(rgbSum(distortionLostRgb) < 120, `tracking loss must hide the distortion, got ${JSON.stringify(distortionLostRgb)}`);
+    const distortionLostRun = await capturePausedCameraState(page, 'distortion-tracking-lost', 'face distortion tracking loss');
+    assertAllPausedFrames(distortionLostRun.frames, 'face distortion tracking loss');
+    const distortionLostPng = assertPausedPng(distortionLostRun.frames, 'face distortion tracking loss');
+    await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
+    await waitForStatusTitle(page, /Effect active: Face distortion/);
+
+    await page.locator('[data-testid="tracking-injection"]').selectOption('multiple');
+    const distortionMultiple = await waitFor('distortion multiple faces', async () => {
+      const status = await readStatus(page);
+      return /more than one face is visible/i.test(status.explanation) ? status : null;
+    });
+    await page.waitForTimeout(300);
+    const distortionMultipleRgb = await readRgb(page);
+    assert.ok(rgbSum(distortionMultipleRgb) < 120, `multiple faces must hide the distortion, got ${JSON.stringify(distortionMultipleRgb)}`);
+    const distortionMultipleRun = await capturePausedCameraState(page, 'distortion-multiple-faces', 'face distortion multiple faces');
+    assertAllPausedFrames(distortionMultipleRun.frames, 'face distortion multiple faces');
+    const distortionMultiplePng = assertPausedPng(distortionMultipleRun.frames, 'face distortion multiple faces');
+    await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
+    await waitForStatusTitle(page, /Effect active: Face distortion/);
+
+    await page.locator('[data-testid="simulate-failure"]').check();
+    const distortionInterrupted = await waitFor('distortion processing interruption', async () => {
+      const status = await readStatus(page);
+      return /simulated by the diagnostic control/i.test(status.explanation) ? status : null;
+    });
+    await page.waitForTimeout(300);
+    const distortionInterruptedRgb = await readRgb(page);
+    assert.ok(rgbSum(distortionInterruptedRgb) < 120, `a processing failure must hide the distortion, got ${JSON.stringify(distortionInterruptedRgb)}`);
+    const distortionInterruptedRun = await capturePausedCameraState(page, 'distortion-processing-failure', 'face distortion processing failure');
+    assertAllPausedFrames(distortionInterruptedRun.frames, 'face distortion processing failure');
+    const distortionInterruptedPng = assertPausedPng(distortionInterruptedRun.frames, 'face distortion processing failure');
+    await page.locator('[data-testid="simulate-failure"]').uncheck();
+    await waitForStatusTitle(page, /Effect active: Face distortion/);
+    const distortionRecovered = await readProcessedRgb(page, 'distortion recovered after processing failure');
+
+    // Switching to an imported mask that is not already loaded paints the
+    // paused output first (a cached mask switch is synchronous and does not);
+    // switching back to the distortion renders it again. The distortion itself
+    // needs no async asset load, so its switch is synchronous and cannot expose
+    // a frame.
+    const beforeDistortionSwitch = await readEffectDiagnostic(page);
+    await page.locator('[data-testid="effect-select"]').selectOption(ROSE_VISOR_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Rose visor/);
+    const afterDistortionSwitch = await readEffectDiagnostic(page);
+    assert.ok(
+      Number(afterDistortionSwitch.switchingPausedFrames) > Number(beforeDistortionSwitch.switchingPausedFrames),
+      `switching from the distortion to an imported mask must paint the paused output: before=${beforeDistortionSwitch.switchingPausedFrames} after=${afterDistortionSwitch.switchingPausedFrames}`,
+    );
+    await selectEffectThroughControl(page, FACE_DISTORTION_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Face distortion/);
+    const distortionAfterSwitchBack = await waitForDistortionActive(page, 'distortion after switching back');
+
+    // --- WebGL context loss on the distortion renderer ----------------------
+    // A real context loss must hide the whole output through the existing
+    // 250 ms undrawable guard, not composite a stale/blank canvas and never
+    // reveal the raw replay frame. The public control injects the failure with
+    // WEBGL_lose_context; unchecking requests a browser restore.
+    await page.locator('[data-testid="distortion-context-loss"]').check();
+    const contextLostStatus = await waitFor(
+      'distortion context-loss paused output',
+      async () => {
+        const status = await readStatus(page);
+        return status.mode === 'paused' && /WebGL context|not drawable/i.test(status.explanation) ? status : null;
+      },
+      10000,
+      100,
+    );
+    const contextLostDiagnostic = parseKeyValues(await readDiagnostic(page, 'diag-distortion'));
+    assert.equal(contextLostDiagnostic.active, 'true', 'the distortion effect must stay selected during context loss');
+    assert.equal(contextLostDiagnostic.drawable, 'false', 'a lost WebGL context must make the renderer non-drawable');
+    assert.equal(contextLostDiagnostic.contextLost, 'true', 'the context-loss diagnostic must report the lost context');
+    await page.waitForTimeout(300);
+    const contextLostRgb = await readRgb(page);
+    assert.ok(rgbSum(contextLostRgb) < 120, `a lost distortion context must hide the output, got ${JSON.stringify(contextLostRgb)}`);
+    const contextLostRun = await capturePausedCameraState(page, 'distortion-context-lost', 'face distortion context loss');
+    assertAllPausedFrames(contextLostRun.frames, 'face distortion context loss');
+    const contextLostPng = assertPausedPng(contextLostRun.frames, 'face distortion context loss');
+    await page.locator('[data-testid="distortion-context-loss"]').uncheck();
+    const contextRestored = await waitFor(
+      'distortion recovered after context restore',
+      async () => {
+        const status = await readStatus(page);
+        if (status.mode !== 'render') return null;
+        const distortion = await readDistortion(page);
+        return distortion.drawable === 'true' && distortion.active === 'true' ? { status, distortion } : null;
+      },
+      20000,
+      100,
+    );
+    const contextRestoredRgb = await readProcessedRgb(page, 'distortion recovered after context restore');
+    evidence.distortion.contextLoss = {
+      status: contextLostStatus,
+      diagnostic: contextLostDiagnostic,
+      preview: contextLostRgb,
+      camera: averageFrameRgb(contextLostRun.frames),
+      png: contextLostPng.png,
+      recovered: { status: contextRestored.status, diagnostic: contextRestored.distortion, preview: contextRestoredRgb },
+    };
+    pass(
+      'A lost face-distortion WebGL context hides the output in preview and camera instead of compositing a stale frame, and restoring the context resumes the effect',
+      `paused=${JSON.stringify(contextLostStatus.explanation)} camera=${JSON.stringify(evidence.distortion.contextLoss.camera)} contextLost=${contextLostDiagnostic.contextLost} drawable=${contextLostDiagnostic.drawable} restoredDrawable=${contextRestored.distortion.drawable} ${contextLostPng.png}`,
+    );
+
+    // Disabling the effect (explicit No effect) hides the output instead of
+    // passing the raw replay frame through.
+    await page.locator('[data-testid="effect-select"]').selectOption('none');
+    await waitForStatusTitle(page, /^Tracking paused$/);
+    const distortionDisabled = await readStatus(page);
+    assert.match(distortionDisabled.explanation, /No effect is active/i);
+    await page.waitForTimeout(300);
+    const distortionDisabledRgb = await readRgb(page);
+    assert.ok(rgbSum(distortionDisabledRgb) < 120, `No effect must hide the distortion output, got ${JSON.stringify(distortionDisabledRgb)}`);
+    const distortionDisabledRun = await capturePausedCameraState(page, 'distortion-no-effect', 'face distortion disabled');
+    assertAllPausedFrames(distortionDisabledRun.frames, 'face distortion disabled');
+    const distortionDisabledPng = assertPausedPng(distortionDisabledRun.frames, 'face distortion disabled');
+
+    // Removing the active distortion package also falls back to the opaque
+    // paused no-effect output in both paths.
+    await selectEffectThroughControl(page, FACE_DISTORTION_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Face distortion/);
+    await page.locator('[data-testid="remove-package"]').click();
+    await waitFor('distortion removal result', async () => {
+      const state = await page.locator('[data-testid="package-result"]').getAttribute('data-state');
+      const text = ((await page.locator('[data-testid="package-result"]').textContent()) ?? '').trim();
+      return state === 'success' && /Removed the imported effect/.test(text) ? text : null;
+    });
+    await waitForStatusTitle(page, /^Tracking paused$/);
+    await page.waitForTimeout(300);
+    const distortionRemovedRgb = await readRgb(page);
+    assert.ok(rgbSum(distortionRemovedRgb) < 120, `removing the distortion must leave the paused output, got ${JSON.stringify(distortionRemovedRgb)}`);
+    const distortionRemovedRun = await capturePausedCameraState(page, 'distortion-removed', 'face distortion removed');
+    assertAllPausedFrames(distortionRemovedRun.frames, 'face distortion removed');
+    const distortionRemovedPng = assertPausedPng(distortionRemovedRun.frames, 'face distortion removed');
+    const optionsAfterDistortionRemoval = await effectOptionValues(page);
+    assert.ok(!optionsAfterDistortionRemoval.includes(FACE_DISTORTION_EFFECT_ID), 'the removed distortion must leave the selector');
+    const packagesAfterDistortionRemoval = parseKeyValues(await readDiagnostic(page, 'diag-packages'));
+    assert.equal(
+      packagesAfterDistortionRemoval.installed,
+      '3',
+      `the distortion removal must leave the other packages installed: ${JSON.stringify(packagesAfterDistortionRemoval)}`,
+    );
+    evidence.distortion.pausedOutput = {
+      manualPause: {
+        status: distortionManualPause,
+        camera: averageFrameRgb(distortionManualRun.frames),
+        png: distortionManualPng.png,
+      },
+      trackingLoss: {
+        status: distortionLost,
+        preview: distortionLostRgb,
+        camera: averageFrameRgb(distortionLostRun.frames),
+        png: distortionLostPng.png,
+      },
+      multipleFaces: {
+        status: distortionMultiple,
+        preview: distortionMultipleRgb,
+        camera: averageFrameRgb(distortionMultipleRun.frames),
+        png: distortionMultiplePng.png,
+      },
+      processingFailure: {
+        status: distortionInterrupted,
+        preview: distortionInterruptedRgb,
+        camera: averageFrameRgb(distortionInterruptedRun.frames),
+        png: distortionInterruptedPng.png,
+        recovered: distortionRecovered,
+      },
+      switching: { before: beforeDistortionSwitch, afterMaskSwitch: afterDistortionSwitch, afterSwitchBack: distortionAfterSwitchBack },
+      disabled: {
+        status: distortionDisabled,
+        preview: distortionDisabledRgb,
+        camera: averageFrameRgb(distortionDisabledRun.frames),
+        png: distortionDisabledPng.png,
+      },
+      removed: {
+        preview: distortionRemovedRgb,
+        camera: averageFrameRgb(distortionRemovedRun.frames),
+        png: distortionRemovedPng.png,
+      },
+    };
+    pass(
+      'Face distortion obeys manual pause, tracking loss, multiple faces, processing failure, switching, no-effect and removal in preview and camera',
+      `manual=${JSON.stringify(evidence.distortion.pausedOutput.manualPause.camera)} lost=${JSON.stringify(evidence.distortion.pausedOutput.trackingLoss.camera)} multiple=${JSON.stringify(evidence.distortion.pausedOutput.multipleFaces.camera)} failure=${JSON.stringify(evidence.distortion.pausedOutput.processingFailure.camera)} switchingPausedFrames=${afterDistortionSwitch.switchingPausedFrames}`,
+    );
+
+    // Baseline for the later complete-effect benchmark: a color-only package on
+    // the same fixture and output path, so the distortion's added cost is
+    // reported relative to an effect with no warp. Replay-derived only.
+    await selectEffectThroughControl(page, VERDANT_TINT_EFFECT_ID);
+    await page.waitForTimeout(2200);
+    const treatmentFrameDelta = parseKeyValues(await readDiagnostic(page, 'diag-frame-delta'));
+    const treatmentRenderCost = parseKeyValues(await readDiagnostic(page, 'diag-render-cost'));
+    evidence.distortion.timingBaseline = {
+      effect: VERDANT_TINT_EFFECT_ID,
+      renderCostP95Ms: Number(treatmentRenderCost.p95Ms ?? 0),
+      frameIntervalP95Ms: Number(treatmentFrameDelta.p95Ms ?? 0),
+    };
+    // The two 2.2 s sampling windows run sequentially, so the frame-interval
+    // difference is an observed delta rather than an isolated causal cost. The
+    // render-cost delta and the warp submission time are the attributable numbers.
+    evidence.distortion.timing.observedRenderCostDeltaP95Ms = Number(
+      (evidence.distortion.timing.renderCostP95Ms - evidence.distortion.timingBaseline.renderCostP95Ms).toFixed(2),
+    );
+    evidence.distortion.timing.observedFrameIntervalDeltaP95Ms = Number(
+      (evidence.distortion.timing.frameIntervalP95Ms - evidence.distortion.timingBaseline.frameIntervalP95Ms).toFixed(2),
+    );
+    evidence.distortion.timing.frameIntervalNote =
+      'Observed difference between sequential 2.2 s windows; not isolated and not attributed to the distortion. The warp submission time and the render-cost delta are the attributable main-thread numbers; the GPU cost is not measured.',
+    evidence.distortion.timing.warpSubmissionNote =
+      'costMsP95 is main-thread WebGL submission only (performance.now() around renderer.render() at 1280x720); there is no GPU sync or readback, so it is not the total warp cost.';
+    pass(
+      'Replay-based timing for the distortion path is recorded for the later complete-effect benchmark',
+      `warp submission p95=${evidence.distortion.timing.warpSubmissionCostP95Ms}ms (main-thread only) render p95=${evidence.distortion.timing.renderCostP95Ms}ms baseline render p95=${evidence.distortion.timingBaseline.renderCostP95Ms}ms observed frame interval ${evidence.distortion.timing.frameIntervalP95Ms}ms vs ${evidence.distortion.timingBaseline.frameIntervalP95Ms}ms (sequential, not isolated)`,
+    );
+
     // --- Negative imports keep the current effect and never crash ------------
     await selectEffectThroughControl(page, GUARD_VISOR_EFFECT_ID);
     for (const negative of NEGATIVE_PACKAGE_CASES) {
@@ -3857,6 +4776,9 @@ async function main() {
       'Effect-package evidence uses an isolated SHYMASK_PACKAGE_DIR and stubs only the Electron OS file picker in the main process; validation, archive safety checks, storage, asset protocol loading and GLTFLoader parsing are the real paths. A rejected dialog cancellation is not exercised.',
       'The sample packages are committed generated fixtures (deterministic GLB writer + `npm run build:packages`), not Blender output; the contract and validator are what the later Blender/AI authoring slice will use.',
       'Package complexity measurements (triangles, meshes, materials, bytes) are reported for the later budget slice; they are not final complexity budgets and nothing here asserts an unmeasured threshold.',
+      'Face distortion is a fixed radial shader (bulge/pinch) applied to the replay frame inside an ellipse computed from the tracked face box. The warp centre and radius are recalculated every processed frame; the public diag-distortion diagnostic reports the ellipse and a 64x36 identity-versus-warped comparison of the same uploaded frame texture (so the outside-ellipse delta is zero apart from GPU rounding). That warp-delta number is a diagnostic, not published-output proof. The published-output proof is a separate public A/B: a documented frame is held, the diagnostic Warp toggle keeps the effect selected but draws the same uploaded frame through the identity shader, and exact 1280x720 PNGs captured through the public Capture control must differ substantially inside the independent diag-face-derived ellipse, be ~0 outside it, be pixel-identical for same-state repeats, and the independent camera must receive the identical change. The A/B is repeated at a second documented held pose with a different face position and the changed-region centroid must move with the face (at least 40 px and at least 50% of the face-box movement). The ellipses overlap, so the centroid gate - not ellipse containment - is what excludes a fixed overlay. A dropped warp makes ON==OFF and fails; the identity pass still comes from the effect renderer canvas, so this is not raw-element passthrough. The A/B proves a localized published change and a face-relative changed-region centroid; it is not a measurement of the radial displacement kernel, and OFF provenance rests on the effect-selection assertions and code path.',
+      'Face-distortion timing is replay-derived. costMsP95 is only the main-thread WebGL submission time around renderer.render() for the 1280x720 warp pass, with no GPU sync or readback, so the GPU cost lands later in the composite and is not included. diag-render-cost p95 includes the composite and diagnostic sampling; the baseline is a color-only package on the same fixture and output path. The render-cost and frame-interval deltas are sequential-window observations, not isolated distortion costs. These are observations for the later complete-effect benchmark, not a performance target.',
+      'A lost WebGL context on the distortion renderer marks it non-drawable, so the processed-frame path returns false, the existing 250 ms undrawable guard hides the whole output in preview and camera, and no stale or raw frame is published. The public context-loss control injects the loss with WEBGL_lose_context and requests a browser restore; three.js re-initialises on restore and the effect resumes. Actual driver/GPU resets outside this injection are not reproduced, and a context that the browser refuses to restore stays hidden until the tracker renderer is rebuilt.',
     ],
     commands: {
       build: 'npm run build',
@@ -3940,17 +4862,37 @@ async function main() {
     },
     effectPackages: {
       contract: {
-        schemaVersion: 1,
-        shape: 'ZIP with a root manifest.json (schemaVersion: 1) and declared assets under assets/; mask (self-contained GLB + face attachment) and/or declarative color treatment; one complete effect selected at a time.',
+        schemaVersion: 2,
+        supportedSchemaVersions: [1, 2],
+        shape: 'ZIP with a root manifest.json (schemaVersion 1 or 2) and declared assets under assets/; mask (self-contained GLB + face attachment), declarative color treatment and/or a bounded faceDistortion (schema v2); one complete effect selected at a time.',
+        faceDistortion: {
+          modes: ['bulge', 'pinch'],
+          bounds: {
+            strength: [0, 1],
+            radiusScale: [0.25, 2.5],
+            centerOffset: [-0.5, 0.5],
+            maxWarpFactor: 0.75,
+          },
+          shape: 'Applied by a fixed radial shader inside an ellipse computed from the tracked face box; the package cannot supply geometry, shader code or per-frame displacement.',
+        },
         unsupported: [
           'arbitrary executable/script content (rejected)',
           'expression reactions and other declared behaviors (reserved; non-empty declarations rejected)',
           'glTF animations, skins, cameras, lights and external resources (rejected)',
+          'faceDistortion in a schema v1 manifest (rejected; raise schemaVersion to 2)',
+          'distortion modes, strengths, radii or offsets outside the documented bounds (rejected as distortion-invalid)',
           'stacking multiple complete effects (no UI)',
         ],
       },
       validationCodes: NEGATIVE_PACKAGE_CASES.map((entry) => entry.code),
       negativeFixtures: effectPackages.negative,
+      faceDistortion: {
+        sample: 'fixtures/packages/face-distortion.zip (schema v2, distortion-only)',
+        evidence: effectPackages.distortion,
+        motionFollowing: recordedMotion.distortion,
+        timingBasis:
+          'replay-derived main-thread measurements on the development desktop; the warp submission cost is performance.now() around renderer.render() only (no GPU sync/readback), the render cost includes the composite, and the baseline is a color-only package on the same fixture. The render/frame-interval deltas are sequential-window observations. Not the final benchmark or a performance target.',
+      },
       evidence: effectPackages,
     },
     timing: {
@@ -3977,6 +4919,11 @@ async function main() {
       'Occlusion evidence quantifies the removed mask pixels inside the tracked face bounding box at two recorded side views in opposite yaw directions; it does not prove clean occlusion at poses outside the recorded clip (larger yaw/pitch, fast motion, hair/ear/neck overlap) and it is not asserted continuously during the moving motion window. The residual extreme-pose limitations are stated in docs/notes/0005.',
       'Measured on this development desktop with a discrete GPU; laptop integrated-graphics behavior is unverified.',
       'Color treatments use canvas CSS filters in this spike; a later effect-package slice may replace the implementation.',
+      'Face distortion is a bounded whole-face radial warp (bulge or pinch) centred on the tracked face box. It does not warp individual landmarks, expressions or features (for example separate eyes and mouth), and it is not a 3D mesh deformation; a package cannot express those. The warp ellipse follows the face box, but the warp itself is a screen-space sampling of the recorded frame, so it carries no pose orientation beyond the ellipse position and size.',
+      'Face-distortion motion evidence is replay-only on the recorded pose-loop fixture and desktop-only; no physical-camera, laptop integrated-graphics or call-application evidence exists in this slice.',
+      'Effect-switch pauses for the distortion are asserted by the public switchingPausedFrames counter and the status text; a separate camera capture while a switch is in flight is not taken (the same shared output policy and camera paused captures in every other state cover the camera path). The combined mask+distortion effect is supported by the contract and unit-tested through package resolution, but no committed combined sample/end-to-end check exists in this slice.',
+      'Distortion context loss is injected through WEBGL_lose_context in the public control; a real driver/GPU reset is not reproduced. Restore depends on the browser/three.js re-initialisation, which the check asserts for the injected case; a browser that refuses to restore leaves the output hidden.',
+      'Face-distortion timing measures main-thread WebGL submission only (no GPU sync/readback); the GPU/compositor cost is not isolated and the render-cost and frame-interval deltas are sequential-window observations.',
       'No CI or branch protection exists; these local checks are the validation gate.',
     ],
   };
@@ -4006,6 +4953,15 @@ async function main() {
   log(`occlusion A/B (rose):        ${recordedMotion.occlusion.roseVisor.changedPixels}px changed, ${(100 * recordedMotion.occlusion.roseVisor.insideFaceFraction).toFixed(1)}% inside face bbox, material OFF ${(100 * recordedMotion.occlusion.roseVisor.reveal.changedMaterialFractionOff).toFixed(1)}% -> ON ${(100 * recordedMotion.occlusion.roseVisor.reveal.changedMaterialFractionOn).toFixed(1)}%, video match=${recordedMotion.occlusion.roseVisor.videoMatch?.matchFraction ?? 'n/a'}, self-diff ON ${recordedMotion.occlusion.roseVisor.selfDiffPixels}px OFF ${recordedMotion.occlusion.roseVisor.offSelfDiffPixels}px`);
   log(`occlusion A/B (camera):      bundled ${recordedMotion.occlusion.camera.changedPixels}px, guard ${recordedMotion.occlusion.guardVisorCamera.changedPixels}px (identical to preview, self-diff 0)`);
   log(`occlusion A/B (opposite):    ${recordedMotion.occlusion.opposite.bundled.changedPixels}px changed at yaw=${recordedMotion.occlusion.opposite.bundled.mask.yaw}, ${(100 * recordedMotion.occlusion.opposite.bundled.insideFaceFraction).toFixed(1)}% inside face bbox; camera ${recordedMotion.occlusion.opposite.camera.changedPixels}px; guard ${recordedMotion.occlusion.opposite.guardVisor.changedPixels}px`);
+  log('\n== Face distortion (replay-based) ==');
+  log(`distortion warp submit p95: ${effectPackages.distortion.timing.warpSubmissionCostP95Ms}ms (main-thread WebGL submission only; no GPU sync/readback)`);
+  log(`distortion render cost p95:  ${effectPackages.distortion.timing.renderCostP95Ms}ms vs ${effectPackages.distortion.timingBaseline.renderCostP95Ms}ms color-only baseline (observed delta ${effectPackages.distortion.timing.observedRenderCostDeltaP95Ms}ms)`);
+  log(`distortion frame pacing p95: ${effectPackages.distortion.timing.frameIntervalP95Ms}ms vs ${effectPackages.distortion.timingBaseline.frameIntervalP95Ms}ms baseline (sequential windows; observed delta ${effectPackages.distortion.timing.observedFrameIntervalDeltaP95Ms}ms, not isolated or attributed to the warp)`);
+  log(`distortion face following:   ${recordedMotion.distortion.trackedSamples}/18 samples, warp centre moved ${recordedMotion.distortion.centerXRange}x${recordedMotion.distortion.centerYRange}px with the tracked face box`);
+  log(`distortion pixel evidence:   changedInsidePct=${effectPackages.distortion.preview.active.changedInsidePct}% changedOutsidePct=${effectPackages.distortion.preview.active.changedOutsidePct}% warpDelta=${effectPackages.distortion.preview.active.warpDelta} on the default clip (offscreen diagnostic)`);
+  log(`distortion A/B (published):  ${effectPackages.distortion.ab.changedPixels}px changed on the held default-clip frame, ${(100 * effectPackages.distortion.ab.insideEllipseFraction).toFixed(2)}% inside the independent diag-face ellipse, self-diff ON ${effectPackages.distortion.ab.selfDiffPixels}px OFF ${effectPackages.distortion.ab.offSelfDiffPixels}px, camera ${effectPackages.distortion.ab.camera?.changedPixels}px (identical to preview)`);
+  log(`distortion A/B (poses):      centroid ${recordedMotion.distortion.faceFollowingPoses.poseDistancePx}px face move -> ${recordedMotion.distortion.faceFollowingPoses.centroidDistancePx}px centroid move (${OCCLUSION_CAPTURE_SECONDS}s and ${OCCLUSION_CAPTURE_SECONDS_OPPOSITE}s)`);
+  log(`distortion context loss:     output hidden in preview and camera (${effectPackages.distortion.contextLoss.diagnostic.contextLost}), restored drawable=${effectPackages.distortion.contextLoss.recovered.diagnostic.drawable}`);
   log(`tracker model:               ${trackerMetadata.id} sha256=${trackerMetadata.sha256.slice(0, 12)}…`);
   log('These numbers are replay-derived. They do not establish physical-camera tracking, laptop suitability,');
   log('or the 720p/30 FPS / 100 ms target, and the policy cannot detect every possible visual defect.');

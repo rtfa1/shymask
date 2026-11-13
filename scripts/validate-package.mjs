@@ -46,8 +46,10 @@ if (result.ok) {
           id: pkg.manifest.id,
           name: pkg.manifest.name,
           version: pkg.manifest.version,
+          schemaVersion: pkg.manifest.schemaVersion,
           effect: {
             mask: pkg.manifest.mask ?? null,
+            faceDistortion: pkg.manifest.faceDistortion ?? null,
             colorTreatment: pkg.manifest.colorTreatment ?? null,
           },
           assets: [...pkg.assets.keys()],

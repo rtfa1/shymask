@@ -52,7 +52,8 @@ test('the valid sample mask package validates and reports complexity measurement
   assert.equal(result.ok, true);
   if (!result.ok) return;
   const pkg = result.package;
-  assert.equal(pkg.manifest.schemaVersion, EFFECT_PACKAGE_SCHEMA_VERSION);
+  // v1 packages remain valid unchanged under the v2-aware validator.
+  assert.equal(pkg.manifest.schemaVersion, 1);
   assert.equal(pkg.manifest.id, 'shymask.guard-visor');
   assert.equal(pkg.manifest.name, 'Guard visor');
   assert.equal(pkg.manifest.version, '1.0.0');
@@ -60,18 +61,110 @@ test('the valid sample mask package validates and reports complexity measurement
   assert.equal(pkg.manifest.mask?.asset, 'assets/guard-visor.glb');
   assert.deepEqual(pkg.manifest.mask?.attachment?.position, [0, 0, 0]);
   assert.equal(pkg.manifest.colorTreatment?.saturation, 1.15);
+  assert.equal(pkg.manifest.faceDistortion, undefined);
   assert.equal(pkg.assets.size, 1);
   assert.ok(pkg.assets.get('assets/guard-visor.glb'));
   assert.equal(pkg.complexity.triangles, 96);
   assert.equal(pkg.complexity.meshes, 1);
   assert.equal(pkg.complexity.materials, 1);
   assert.equal(pkg.complexity.colorParameters, 3);
+  assert.equal(pkg.complexity.distortionParameters, 0);
   assert.equal(pkg.complexity.declaredBehaviors, 0);
   assert.deepEqual(pkg.warnings, []);
   assert.equal(
     buildTreatmentCssFilter(pkg.manifest.colorTreatment ?? {}),
     'contrast(1.05) saturate(1.15) hue-rotate(-8deg)',
   );
+});
+
+test('the schema v2 face-distortion sample validates without a mask or treatment', () => {
+  const result = validateEffectPackage(fixtureBytes('face-distortion.zip'));
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  const pkg = result.package;
+  assert.equal(pkg.manifest.schemaVersion, EFFECT_PACKAGE_SCHEMA_VERSION);
+  assert.equal(pkg.manifest.schemaVersion, 2);
+  assert.equal(pkg.manifest.id, 'shymask.face-distortion');
+  assert.equal(pkg.manifest.mask, undefined);
+  assert.equal(pkg.manifest.colorTreatment, undefined);
+  assert.deepEqual(pkg.manifest.faceDistortion, {
+    mode: 'bulge',
+    strength: 0.6,
+    radiusScale: 1.35,
+    centerOffset: [0, 0],
+  });
+  assert.equal(pkg.complexity.distortionParameters, 1);
+  assert.equal(pkg.complexity.colorParameters, 0);
+  assert.equal(pkg.complexity.triangles, 0);
+  assert.deepEqual(pkg.warnings, []);
+});
+
+test('faceDistortion optional fields resolve to bounded defaults', () => {
+  const bytes = mutateManifest(fixtureBytes('face-distortion.zip'), (manifest) => {
+    manifest.faceDistortion = { mode: 'pinch', strength: 0.25 };
+  });
+  const result = validateEffectPackage(bytes);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.deepEqual(result.package.manifest.faceDistortion, {
+    mode: 'pinch',
+    strength: 0.25,
+    radiusScale: 1,
+    centerOffset: [0, 0],
+  });
+});
+
+test('a v1 manifest declaring faceDistortion is rejected instead of silently dropping it', () => {
+  const bytes = mutateManifest(fixtureBytes('face-distortion.zip'), (manifest) => {
+    manifest.schemaVersion = 1;
+  });
+  const result = validateEffectPackage(bytes);
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  const issue = result.errors.find((entry) => entry.code === 'schema-version-unsupported');
+  assert.ok(issue, `expected schema-version-unsupported, got ${result.errors.map((entry) => entry.code).join(', ')}`);
+  assert.equal(issue.path, 'faceDistortion');
+  assert.match(issue.message, /requires schemaVersion 2/);
+});
+
+test('invalid or unsupported face-distortion declarations are rejected with distortion-invalid', () => {
+  const cases: Array<{ name: string; mutate: (distortion: Record<string, unknown>) => void }> = [
+    { name: 'unsupported mode', mutate: (distortion) => { distortion.mode = 'twist'; } },
+    { name: 'strength above the bound', mutate: (distortion) => { distortion.strength = 4; } },
+    { name: 'non-finite strength', mutate: (distortion) => { distortion.strength = Number.POSITIVE_INFINITY; } },
+    { name: 'radiusScale below the bound', mutate: (distortion) => { distortion.radiusScale = 0; } },
+    { name: 'centerOffset out of range', mutate: (distortion) => { distortion.centerOffset = [2, 0]; } },
+    { name: 'centerOffset wrong shape', mutate: (distortion) => { distortion.centerOffset = [0, 0, 0]; } },
+    { name: 'unknown field', mutate: (distortion) => { distortion.swirl = 1; } },
+  ];
+  for (const entry of cases) {
+    const bytes = mutateManifest(fixtureBytes('face-distortion.zip'), (manifest) => {
+      const distortion = manifest.faceDistortion as Record<string, unknown>;
+      entry.mutate(distortion);
+    });
+    const result = validateEffectPackage(bytes);
+    assert.equal(result.ok, false, `${entry.name} must be rejected`);
+    if (result.ok) continue;
+    const issue = result.errors.find((candidate) => candidate.code === 'distortion-invalid');
+    assert.ok(
+      issue,
+      `${entry.name} must report distortion-invalid, got ${result.errors.map((candidate) => candidate.code).join(', ')}`,
+    );
+    assert.ok(issue.message.length > 20, `${entry.name}: message must be actionable: ${issue.message}`);
+    assert.ok(issue.path?.startsWith('faceDistortion'), `${entry.name}: issue path must name the field, got ${issue.path}`);
+  }
+});
+
+test('schema v2 accepts a mask without faceDistortion, keeping v1 effects forward-compatible', () => {
+  const bytes = mutateManifest(fixtureBytes('guard-visor.zip'), (manifest) => {
+    manifest.schemaVersion = 2;
+  });
+  const result = validateEffectPackage(bytes);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.package.manifest.schemaVersion, 2);
+  assert.equal(result.package.manifest.faceDistortion, undefined);
+  assert.ok(result.package.manifest.mask);
 });
 
 test('the valid sample color-only package validates without a mask', () => {
@@ -85,13 +178,13 @@ test('the valid sample color-only package validates without a mask', () => {
   assert.equal(result.package.complexity.colorParameters, 4);
 });
 
-test('an unsupported schemaVersion is rejected with the supported version named', () => {
-  const result = validateEffectPackage(negativeBytes('schema-version-2'));
+test('an unsupported schemaVersion is rejected with the supported versions named', () => {
+  const result = validateEffectPackage(negativeBytes('schema-version-3'));
   assert.equal(result.ok, false);
   if (result.ok) return;
   const issue = result.errors.find((entry) => entry.code === 'schema-version-unsupported');
   assert.ok(issue);
-  assert.match(issue.message, /schema version 1/);
+  assert.match(issue.message, /schema versions 1 and 2/);
 });
 
 test('malformed manifest JSON is rejected as actionable JSON feedback', () => {

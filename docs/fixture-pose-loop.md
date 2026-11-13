@@ -75,6 +75,13 @@ mask through the camera. So the A/B covers both turn directions in the preview
 (bundled and `guard-visor`) and the imported-mask camera path for `guard-visor`
 only.
 
+The same 8 s window supplies the **face-distortion motion evidence** (issue #7):
+the imported `face-distortion` package is sampled over the window and its warp
+ellipse must move with the tracked face box (see
+[`docs/notes/0006-face-distortion.md`](notes/0006-face-distortion.md)). This is
+the motion coverage the default clip lacks; it does not imply the distortion
+was validated on a physical camera.
+
 Gaps still relevant to later slices:
 
 - No second person (multiple-face policy uses the labelled diagnostic injection).

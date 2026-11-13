@@ -265,7 +265,8 @@ the mask pixels removed inside the face bounding box by the occluder in each A/B
 - **Rigid neutral face:** the occluder is the canonical neutral surface, so a
   large expression (for example a wide open mouth) is not reconstructed; the
   mask is rigid as well. Hand-over-mask occlusion is explicitly out of scope, as
-  is secondary motion (issue #8) and distortion (issue #7).
+  is secondary motion (issue #8); face distortion is delivered separately in
+  [note 0006](0006-face-distortion.md).
 - **Face surface only:** the occluder has no hair, ears, neck or full head
   silhouette. Mask geometry that passes through those regions, or through the
   head outline outside the canonical face surface, is not hidden by this

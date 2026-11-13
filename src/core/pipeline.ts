@@ -18,6 +18,19 @@ export interface FrameStats {
  * path. Keeping the mask as an offscreen WebGL canvas that is composited with
  * `drawImage` means the preview and camera cannot diverge.
  */
+export interface ProcessedFrameOptions {
+  /** The replay frame, or the distortion renderer canvas when one is used. */
+  source: CanvasImageSource;
+  treatment: ColorTreatment | null;
+  overlay?: HTMLCanvasElement | null;
+  /**
+   * Distorted full-frame canvas produced from the same source frame. When
+   * supplied it takes the source's place so the treatment and mask composite
+   * still happen in this one pipeline.
+   */
+  warpedFrame?: CanvasImageSource | null;
+}
+
 export class PreviewPipeline {
   private readonly context: CanvasRenderingContext2D;
   private readonly sampleCanvas: HTMLCanvasElement;
@@ -49,21 +62,17 @@ export class PreviewPipeline {
    * optional transparent overlay (the rigid mask). Both effects share the same
    * output canvas and the same single frame path.
    */
-  renderProcessedFrame(
-    source: CanvasImageSource,
-    treatment: ColorTreatment | null,
-    overlay: HTMLCanvasElement | null = null,
-  ): FrameStats {
+  renderProcessedFrame(options: ProcessedFrameOptions): FrameStats {
     const startedAt = performance.now();
     this.context.save();
-    this.context.filter = treatment?.cssFilter ?? 'none';
-    this.context.drawImage(source, 0, 0, this.width, this.height);
+    this.context.filter = options.treatment?.cssFilter ?? 'none';
+    this.context.drawImage(options.warpedFrame ?? options.source, 0, 0, this.width, this.height);
     this.context.restore();
 
-    if (overlay) {
+    if (options.overlay) {
       this.context.save();
       this.context.filter = 'none';
-      this.context.drawImage(overlay, 0, 0, this.width, this.height);
+      this.context.drawImage(options.overlay, 0, 0, this.width, this.height);
       this.context.restore();
     }
     return this.finishFrame(startedAt);

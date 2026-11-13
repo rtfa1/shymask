@@ -223,7 +223,14 @@ function scenarios(): Scenario[] {
     {
       expected: 'schema-version-unsupported',
       run: () => validate(mutateManifest((manifest) => {
-        manifest.schemaVersion = 2;
+        manifest.schemaVersion = 3;
+      })),
+    },
+    {
+      expected: 'schema-version-unsupported',
+      // faceDistortion is a v2 capability; a v1 declaration must not be ignored.
+      run: () => validate(mutateManifest((manifest) => {
+        manifest.faceDistortion = { mode: 'bulge', strength: 0.5 };
       })),
     },
     {
@@ -267,6 +274,13 @@ function scenarios(): Scenario[] {
       expected: 'attachment-invalid',
       run: () => validate(mutateManifest((manifest) => {
         manifest.mask = { asset: 'assets/mask.glb', attachment: { scale: 90 } };
+      })),
+    },
+    {
+      expected: 'distortion-invalid',
+      run: () => validate(mutateManifest((manifest) => {
+        manifest.schemaVersion = 2;
+        manifest.faceDistortion = { mode: 'bulge', strength: 4 };
       })),
     },
     {

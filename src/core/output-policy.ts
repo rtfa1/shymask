@@ -27,6 +27,8 @@ export interface PreviewState {
   effectHasMask?: boolean;
   /** Whether the complete effect applies a color treatment. */
   effectHasTreatment?: boolean;
+  /** Whether the complete effect applies a bounded face distortion. */
+  effectHasDistortion?: boolean;
   /** False when the selected id no longer resolves (for example a removed package). */
   effectValid?: boolean;
   /** Set when an imported effect failed to load; output stays paused. */
@@ -170,12 +172,29 @@ export function resolveOutput(state: PreviewState): OutputDecision {
   const label = state.effectLabel ?? getEffectLabel(state.effect);
   const effectHasMask = state.effectHasMask ?? isMaskEffect(state.effect);
   const effectHasTreatment = state.effectHasTreatment ?? getTreatment(state.effect) !== null;
+  const effectHasDistortion = state.effectHasDistortion ?? false;
+  // Compose the explanation from independent component phrases instead of one
+  // branch per combination, so adding a component cannot silently miss a case.
+  const labelLower = label.toLowerCase();
+  // A sample named "Face distortion" should not become "face distortion face
+  // distortion"; other labels keep the component noun for clarity.
+  const distortionNoun = /distortion/i.test(labelLower) ? labelLower : `${labelLower} face distortion`;
+  let subject: string;
+  if (effectHasMask && effectHasDistortion) {
+    subject = `the ${labelLower} mask and face distortion attached to the tracked face`;
+  } else if (effectHasMask) {
+    subject = effectHasTreatment
+      ? `the ${labelLower} mask attached to the tracked face`
+      : `the ${labelLower} attached to the tracked face`;
+  } else if (effectHasDistortion) {
+    subject = `the ${distortionNoun} applied around the tracked face`;
+  } else {
+    subject = `the ${labelLower} color treatment`;
+  }
   const explanation =
-    effectHasMask && effectHasTreatment
-      ? `Processing the replay input with the ${label.toLowerCase()} mask attached to the tracked face and its color treatment applied.`
-      : effectHasMask
-        ? `Processing the replay input with the ${label.toLowerCase()} attached to the tracked face.`
-        : `Processing the replay input with the ${label.toLowerCase()} color treatment.`;
+    effectHasTreatment && (effectHasMask || effectHasDistortion)
+      ? `Processing the replay input with ${subject}${effectHasMask && effectHasDistortion ? ',' : ''} and its color treatment applied.`
+      : `Processing the replay input with ${subject}.`;
   return {
     mode: 'render',
     reason: 'ready',
