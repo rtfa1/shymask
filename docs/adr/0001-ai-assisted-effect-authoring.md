@@ -1,0 +1,5 @@
+# Use an external AI-assisted workflow for effect creation
+
+Creators will use Codex or another AI assistant or harness, guided by reusable skills and preconfigured Blender, to create new Shymask effects. The assistant produces an effect that the creator imports and previews in Shymask; the webcam app runs independently after creation. This keeps AI integration outside the webcam app and supports more than one harness instead of tying creation to an embedded assistant or requiring an in-app visual editor. Unreal authoring can follow if it can produce the same supported effect format.
+
+The workflow will enforce effect-complexity limits and flag effects that fail performance checks. Shymask handles tracking and playback, including reactive movement for a small number of parts such as ears or a hair tuft. Initial creation capabilities cover face-attached 3D objects, face distortion, and color treatments, including effects that intentionally reveal the face. The effect format, integration mechanism, and need for manual intervention remain undecided. ADR-0003 defines the hidden-feed behavior during failures.

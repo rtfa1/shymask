@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue Delivery"
+  short_description: "Deliver Shymask issues with independent review"
+  default_prompt: "Use $issue-delivery to deliver one eligible child issue in rtfa1/shymask, following recorded-video development requirements and independent review. Merge only after all gates pass."
