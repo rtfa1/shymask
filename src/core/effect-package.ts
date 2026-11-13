@@ -541,7 +541,7 @@ function validateSecondaryMotion(
       !SECONDARY_MOTION_NODE_PATTERN.test(node)
     ) {
       fail(
-        `${field}.node must be a mask GLB node name of 1-${SECONDARY_MOTION_LIMITS.maxNodeNameLength} ASCII letters, digits, "_" or "-"; got ${JSON.stringify(node)}.`,
+        `${field}.node must be a mask GLB node name of 1-${SECONDARY_MOTION_LIMITS.maxNodeNameLength} characters: an ASCII letter or digit first, then only letters, digits, "_" or "-"; got ${JSON.stringify(node)}.`,
         `${field}.node`,
       );
     } else if (seenNodes.has(node)) {

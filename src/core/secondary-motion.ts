@@ -16,8 +16,9 @@
  * replayed.
  *
  * Determinism and bounds:
- * - a fixed 120 Hz internal sub-step is integrated with semi-implicit Euler, so
- *   the same input sample sequence produces the same angles;
+ * - each frame interval is split into equal sub-steps of at most 1/120 s and
+ *   integrated with semi-implicit Euler, so the same accepted-pose sequence
+ *   produces the same angles;
  * - `dt` is clamped to `[0.5, maxGapMs]` and a gap longer than `maxGapMs`
  *   deliberately resets to rest instead of integrating a stale dt;
  * - a per-sample pose discontinuity, a non-finite sample, a loop seam, a
@@ -33,7 +34,7 @@
  */
 
 import {
-  SECONDARY_MOTION_LIMITS,
+  SECONDARY_MOTION_RUNTIME,
   type SecondaryMotionDrive,
   type SecondaryMotionParameters,
   type SecondaryMotionPart,
@@ -96,7 +97,7 @@ function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
-/** Shortest signed rotation from `from` to `to`, in degrees (-180, 180]. */
+/** Shortest signed rotation from `from` to `to`, in degrees `[-180, 180)`. */
 export function shortestAngleDeltaDegrees(from: number, to: number): number {
   return ((((to - from) % 360) + 540) % 360) - 180;
 }
@@ -123,7 +124,7 @@ function driveValue(velocity: HeadAngularVelocity, drive: SecondaryMotionDrive):
 
 interface PartState {
   readonly part: SecondaryMotionPart;
-  /** Spring offset from the authored rest pose, degrees. */
+  /** Applied angle relative to the authored GLB orientation, degrees. */
   angleDeg: number;
   velocityDegPerSec: number;
 }
@@ -160,15 +161,11 @@ export class SecondaryMotionSimulator {
     };
   }
 
-  get partCount(): number {
-    return this.states.length;
-  }
-
   /**
    * Deliberately drops accumulated spring state. The next update reports the
-   * reason and starts from the authored rest orientation with zero velocity, so
-   * a reacquisition, a loop seam or an explicit caller reset never injects a
-   * synthetic kick.
+   * reason and starts from the declared rest pose (the authored GLB orientation
+   * plus `restAngleDeg`) with zero velocity, so a reacquisition, a loop seam or
+   * an explicit caller reset never injects a synthetic kick.
    */
   reset(reason: SecondaryMotionResetReason = 'explicit'): void {
     this.initialized = false;
@@ -176,10 +173,7 @@ export class SecondaryMotionSimulator {
     this.pendingReset = reason;
     this.lastResetReason = reason;
     this.resetCount += 1;
-    for (const state of this.states) {
-      state.angleDeg = state.part.restAngleDeg;
-      state.velocityDegPerSec = 0;
-    }
+    this.setRestState();
     this.lastFrame = {
       ...this.lastFrame,
       anglesDeg: this.states.map((state) => state.angleDeg),
@@ -201,9 +195,9 @@ export class SecondaryMotionSimulator {
    * update can integrate from the retained angle with zero head velocity
    * instead of treating the hold as a >250 ms tracking gap.
    */
-  resumeAt(sample: HeadRotationSample, nowMs: number): void {
+  resumeAt(sample: HeadRotationSample): void {
     if (!finiteSample(sample)) return;
-    this.lastSample = { ...sample, timeMs: nowMs };
+    this.lastSample = { ...sample };
     this.initialized = true;
   }
 
@@ -222,11 +216,11 @@ export class SecondaryMotionSimulator {
 
   /**
    * Integrates one accepted head-pose sample and returns the part angles to
-   * render. `nowMs` is the monotonic presented-frame time (same clock as the
-   * pose smoother), not the loop-aware media timestamp: a loop seam is reported
-   * separately by the caller and resets state before the next sample.
+   * render. `sample.timeMs` is the monotonic presented-frame time (same clock
+   * as the pose smoother), not the loop-aware media timestamp: a loop seam is
+   * reported separately by the caller and resets state before the next sample.
    */
-  update(sample: HeadRotationSample, nowMs: number): SecondaryMotionFrame {
+  update(sample: HeadRotationSample): SecondaryMotionFrame {
     const startedAt = performance.now();
     const resetReason = this.pendingReset;
     this.pendingReset = null;
@@ -236,9 +230,8 @@ export class SecondaryMotionSimulator {
       return this.finishFrame(0, { ...IDENTITY_VELOCITY }, true, 'discontinuity', 0, startedAt);
     }
 
-    const frameSample: HeadRotationSample = { ...sample, timeMs: nowMs };
     if (!this.initialized || this.lastSample === null) {
-      this.lastSample = frameSample;
+      this.lastSample = { ...sample };
       this.initialized = true;
       this.updateCount += 1;
       return this.finishFrame(
@@ -251,12 +244,12 @@ export class SecondaryMotionSimulator {
       );
     }
 
-    const rawDt = nowMs - this.lastSample.timeMs;
-    if (!Number.isFinite(rawDt) || rawDt <= 0 || rawDt > SECONDARY_MOTION_LIMITS.maxGapMs) {
-      this.snapToRest('gap', frameSample);
+    const rawDt = sample.timeMs - this.lastSample.timeMs;
+    if (!Number.isFinite(rawDt) || rawDt <= 0 || rawDt > SECONDARY_MOTION_RUNTIME.maxGapMs) {
+      this.snapToRest('gap', sample);
       return this.finishFrame(0, { ...IDENTITY_VELOCITY }, true, 'gap', 0, startedAt);
     }
-    const dtMs = clamp(rawDt, 0.5, SECONDARY_MOTION_LIMITS.maxGapMs);
+    const dtMs = clamp(rawDt, SECONDARY_MOTION_RUNTIME.minDtMs, SECONDARY_MOTION_RUNTIME.maxGapMs);
     const dtSeconds = dtMs / 1000;
 
     const delta: HeadAngularVelocity = {
@@ -277,21 +270,22 @@ export class SecondaryMotionSimulator {
     );
     this.updateCount += 1;
     if (
-      maxDelta > SECONDARY_MOTION_LIMITS.maxPoseDeltaDeg ||
-      maxSpeed > SECONDARY_MOTION_LIMITS.maxHeadSpeedDegPerSec
+      maxDelta > SECONDARY_MOTION_RUNTIME.maxPoseDeltaDeg ||
+      maxSpeed > SECONDARY_MOTION_RUNTIME.maxHeadSpeedDegPerSec
     ) {
-      this.snapToRest('discontinuity', frameSample);
+      this.snapToRest('discontinuity', sample);
       return this.finishFrame(0, { ...IDENTITY_VELOCITY }, true, 'discontinuity', 0, startedAt);
     }
-    this.lastSample = frameSample;
+    this.lastSample = { ...sample };
 
-    // Fixed sub-steps: deterministic integration independent of the presented
-    // frame interval. The last sub-step absorbs the remainder.
-    const stepCount = Math.max(1, Math.ceil(dtMs / SECONDARY_MOTION_LIMITS.fixedStepMs));
+    // Split the frame interval into equal sub-steps of at most 1/120 s. The
+    // split (not a per-frame fixed step) is what makes a given accepted-pose
+    // sequence deterministic: no sub-step absorbs a different remainder.
+    const stepCount = Math.max(1, Math.ceil(dtMs / SECONDARY_MOTION_RUNTIME.maxSubStepMs));
     const stepSeconds = dtSeconds / stepCount;
     for (const state of this.states) {
       const part = state.part;
-      const fullScale = SECONDARY_MOTION_LIMITS.driveFullScaleDegPerSec;
+      const fullScale = SECONDARY_MOTION_RUNTIME.driveFullScaleDegPerSec;
       const targetOffset =
         part.maxAngleDeg * clamp(driveValue(headVelocity, part.drive) / fullScale, -1, 1);
       const target = clamp(
@@ -333,9 +327,14 @@ export class SecondaryMotionSimulator {
    */
   private snapToRest(reason: SecondaryMotionResetReason, resumeSample?: HeadRotationSample): void {
     this.initialized = resumeSample !== undefined;
-    this.lastSample = resumeSample ?? null;
+    this.lastSample = resumeSample ? { ...resumeSample } : null;
     this.lastResetReason = reason;
     this.resetCount += 1;
+    this.setRestState();
+  }
+
+  /** Drops every part's accumulated angle and velocity to its declared rest pose. */
+  private setRestState(): void {
     for (const state of this.states) {
       state.angleDeg = state.part.restAngleDeg;
       state.velocityDegPerSec = 0;

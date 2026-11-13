@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   SECONDARY_MOTION_LIMITS,
+  SECONDARY_MOTION_RUNTIME,
   type SecondaryMotionPart,
 } from '../src/core/effect-package-contract';
 import {
@@ -10,7 +11,7 @@ import {
   shortestAngleDeltaDegrees,
 } from '../src/core/secondary-motion';
 
-const STEP_MS = 1000 / 120;
+const STEP_MS = SECONDARY_MOTION_RUNTIME.maxSubStepMs;
 
 function part(overrides: Partial<SecondaryMotionPart> = {}): SecondaryMotionPart {
   return {
@@ -30,15 +31,12 @@ function drive(
   samples: Array<{ timeMs: number; yawDeg?: number; pitchDeg?: number; rollDeg?: number }>,
 ): ReturnType<SecondaryMotionSimulator['update']>[] {
   return samples.map((sample) =>
-    simulator.update(
-      {
-        yawDeg: sample.yawDeg ?? 0,
-        pitchDeg: sample.pitchDeg ?? 0,
-        rollDeg: sample.rollDeg ?? 0,
-        timeMs: sample.timeMs,
-      },
-      sample.timeMs,
-    ),
+    simulator.update({
+      yawDeg: sample.yawDeg ?? 0,
+      pitchDeg: sample.pitchDeg ?? 0,
+      rollDeg: sample.rollDeg ?? 0,
+      timeMs: sample.timeMs,
+    }),
   );
 }
 
@@ -54,7 +52,7 @@ test('a sustained drive never moves a part past its declared maximum angle', () 
   const simulator = new SecondaryMotionSimulator({ parts: [part({ maxAngleDeg: maximum })] });
   const samples = [{ timeMs: 0, yawDeg: 0 }];
   // 900 deg/s is below the documented discontinuity speed but saturates the
-  // drive (full scale is 90 deg/s), so this is the worst bounded case.
+  // drive (full scale is 45 deg/s), so this is the worst bounded case.
   for (let index = 1; index <= 600; index += 1) {
     samples.push({ timeMs: index * 8, yawDeg: index * 8 * 0.9 });
   }
@@ -70,7 +68,7 @@ test('a sustained drive never moves a part past its declared maximum angle', () 
 
 test('the spring keeps moving after the head stops and settles at rest', () => {
   const maximum = 22;
-  // 45 deg/s is half the full-scale drive, so the target is half the part bound.
+  // 45 deg/s is the full-scale drive, so the target is the part bound.
   const simulator = new SecondaryMotionSimulator({ parts: [part({ maxAngleDeg: maximum })] });
   const samples: Array<{ timeMs: number; yawDeg: number }> = [{ timeMs: 0, yawDeg: 0 }];
   const turnSeconds = 0.5;
@@ -105,20 +103,14 @@ test('a time gap resets to rest instead of integrating a stale dt', () => {
   ]);
   const before = simulator.snapshot;
   assert.equal(before.resets, 0);
-  const gapFrame = simulator.update(
-    { yawDeg: 1, pitchDeg: 0, rollDeg: 0, timeMs: 2000 },
-    2000,
-  );
+  const gapFrame = simulator.update({ yawDeg: 1, pitchDeg: 0, rollDeg: 0, timeMs: 2000 });
   assert.equal(gapFrame.reset, true);
   assert.equal(gapFrame.resetReason, 'gap');
   assert.deepEqual(gapFrame.anglesDeg, [0]);
   assert.equal(simulator.snapshot.resets, 1);
   // The gap frame becomes the new continuity baseline; the next sample is a
   // normal, bounded update rather than a second reset.
-  const nextFrame = simulator.update(
-    { yawDeg: 1.5, pitchDeg: 0, rollDeg: 0, timeMs: 2008 },
-    2008,
-  );
+  const nextFrame = simulator.update({ yawDeg: 1.5, pitchDeg: 0, rollDeg: 0, timeMs: 2008 });
   assert.equal(nextFrame.reset, false);
   assert.ok(Math.abs(nextFrame.anglesDeg[0] ?? 0) <= 22);
 });
@@ -130,22 +122,16 @@ test('a pose discontinuity resets instead of injecting an impulse', () => {
     { timeMs: 8, yawDeg: 5 },
     { timeMs: 16, yawDeg: 10 },
   ]);
-  const discontinuity = simulator.update(
-    { yawDeg: 90, pitchDeg: 0, rollDeg: 0, timeMs: 24 },
-    24,
-  );
+  const discontinuity = simulator.update({ yawDeg: 90, pitchDeg: 0, rollDeg: 0, timeMs: 24 });
   assert.equal(discontinuity.reset, true);
   assert.equal(discontinuity.resetReason, 'discontinuity');
   assert.deepEqual(discontinuity.anglesDeg, [0]);
-  const next = simulator.update(
-    { yawDeg: 90.5, pitchDeg: 0, rollDeg: 0, timeMs: 32 },
-    32,
-  );
+  const next = simulator.update({ yawDeg: 90.5, pitchDeg: 0, rollDeg: 0, timeMs: 32 });
   assert.equal(next.reset, false);
   assert.ok(Math.abs(next.anglesDeg[0] ?? 0) < 2, `no impulse after a discontinuity, got ${next.anglesDeg[0]}`);
 });
 
-test('an explicit loop-seam or reacquisition reset starts from the authored rest pose', () => {
+test('an explicit loop-seam or reacquisition reset starts from the declared rest pose', () => {
   const simulator = new SecondaryMotionSimulator({ parts: [part()] });
   drive(simulator, [
     { timeMs: 0, yawDeg: 0 },
@@ -156,19 +142,13 @@ test('an explicit loop-seam or reacquisition reset starts from the authored rest
   simulator.reset('loop-seam');
   assert.deepEqual(simulator.snapshot.anglesDeg, [0]);
   assert.equal(simulator.snapshot.lastResetReason, 'loop-seam');
-  const afterSeam = simulator.update(
-    { yawDeg: 10, pitchDeg: 0, rollDeg: 0, timeMs: 24 },
-    24,
-  );
+  const afterSeam = simulator.update({ yawDeg: 10, pitchDeg: 0, rollDeg: 0, timeMs: 24 });
   assert.equal(afterSeam.reset, true);
   assert.equal(afterSeam.resetReason, 'loop-seam');
   assert.deepEqual(afterSeam.anglesDeg, [0]);
 
   simulator.reset('reacquisition');
-  const afterReacquisition = simulator.update(
-    { yawDeg: 10, pitchDeg: 0, rollDeg: 0, timeMs: 32 },
-    32,
-  );
+  const afterReacquisition = simulator.update({ yawDeg: 10, pitchDeg: 0, rollDeg: 0, timeMs: 32 });
   assert.equal(afterReacquisition.resetReason, 'reacquisition');
   assert.deepEqual(afterReacquisition.anglesDeg, [0]);
 });
@@ -179,10 +159,7 @@ test('a non-finite pose sample resets rather than producing NaN angles', () => {
     { timeMs: 0, yawDeg: 0 },
     { timeMs: 8, yawDeg: 5 },
   ]);
-  const frame = simulator.update(
-    { yawDeg: Number.NaN, pitchDeg: 0, rollDeg: 0, timeMs: 16 },
-    16,
-  );
+  const frame = simulator.update({ yawDeg: Number.NaN, pitchDeg: 0, rollDeg: 0, timeMs: 16 });
   assert.equal(frame.reset, true);
   assert.equal(frame.resetReason, 'discontinuity');
   assert.ok(frame.anglesDeg.every((angle) => Number.isFinite(angle)));
@@ -237,7 +214,7 @@ test('restAngleDeg is honored at rest and stays bounded', () => {
   assert.deepEqual(simulator.snapshot.anglesDeg, [12]);
 });
 
-test('the fixed-step integration is deterministic for the same sample sequence', () => {
+test('the equal-sub-step integration is deterministic for the same sample sequence', () => {
   const samples = [
     { timeMs: 0, yawDeg: 0 },
     { timeMs: 17, yawDeg: 1.1 },
@@ -272,12 +249,12 @@ test('resumeAt preserves the retained spring state and then settles under a stat
   assert.ok(Math.abs(before) > 1, `the drive must leave a retained angle, got ${before}`);
   // The held-frame diagnostic advances wall-clock time while the accepted pose
   // is stationary. resumeAt must not reset the retained angle or velocity.
-  simulator.resumeAt({ yawDeg: 14, pitchDeg: 0, rollDeg: 0, timeMs: 5000 }, 5000);
+  simulator.resumeAt({ yawDeg: 14, pitchDeg: 0, rollDeg: 0, timeMs: 5000 });
   assert.equal(simulator.snapshot.anglesDeg[0], before);
-  let frame = simulator.update({ yawDeg: 14, pitchDeg: 0, rollDeg: 0, timeMs: 5008 }, 5008);
+  let frame = simulator.update({ yawDeg: 14, pitchDeg: 0, rollDeg: 0, timeMs: 5008 });
   assert.equal(frame.reset, false);
   for (let timeMs = 5016; timeMs <= 7000; timeMs += 8) {
-    frame = simulator.update({ yawDeg: 14, pitchDeg: 0, rollDeg: 0, timeMs }, timeMs);
+    frame = simulator.update({ yawDeg: 14, pitchDeg: 0, rollDeg: 0, timeMs });
   }
   assert.ok(
     Math.abs(frame.anglesDeg[0] ?? 0) < Math.abs(before) * 0.25,
@@ -285,10 +262,31 @@ test('resumeAt preserves the retained spring state and then settles under a stat
   );
 });
 
-test('the fixed simulation bounds and reference constants are documented', () => {
+test('the validation bounds and fixed runtime constants are pinned', () => {
+  // Validation bounds the package contract documents.
   assert.equal(SECONDARY_MOTION_LIMITS.maxParts, 4);
-  assert.ok(SECONDARY_MOTION_LIMITS.fixedStepMs > 0);
-  assert.ok(SECONDARY_MOTION_LIMITS.maxGapMs > SECONDARY_MOTION_LIMITS.fixedStepMs);
+  assert.equal(SECONDARY_MOTION_LIMITS.maxNodeNameLength, 64);
+  assert.deepEqual(
+    [SECONDARY_MOTION_LIMITS.minStiffness, SECONDARY_MOTION_LIMITS.maxStiffness],
+    [4, 400],
+  );
+  assert.deepEqual(
+    [SECONDARY_MOTION_LIMITS.minDampingRatio, SECONDARY_MOTION_LIMITS.maxDampingRatio],
+    [0.05, 1.5],
+  );
+  assert.deepEqual(
+    [SECONDARY_MOTION_LIMITS.minMaxAngleDeg, SECONDARY_MOTION_LIMITS.maxMaxAngleDeg],
+    [1, 60],
+  );
+  assert.equal(SECONDARY_MOTION_LIMITS.maxRestAngleDeg, 60);
+  // Runtime constants the simulator uses, pinned so a doc/code drift fails here.
+  assert.equal(SECONDARY_MOTION_RUNTIME.driveFullScaleDegPerSec, 45);
+  assert.equal(SECONDARY_MOTION_RUNTIME.maxSubStepMs, 1000 / 120);
+  assert.equal(SECONDARY_MOTION_RUNTIME.minDtMs, 0.5);
+  assert.equal(SECONDARY_MOTION_RUNTIME.maxGapMs, 250);
+  assert.equal(SECONDARY_MOTION_RUNTIME.maxPoseDeltaDeg, 45);
+  assert.equal(SECONDARY_MOTION_RUNTIME.maxHeadSpeedDegPerSec, 1080);
+  assert.ok(SECONDARY_MOTION_RUNTIME.maxGapMs > SECONDARY_MOTION_RUNTIME.maxSubStepMs);
   const radians = secondaryMotionAnglesRadians([180, -90, 0]);
   assert.ok(Math.abs((radians[0] ?? 0) - Math.PI) < 1e-9);
   assert.ok(Math.abs((radians[1] ?? 0) + Math.PI / 2) < 1e-9);

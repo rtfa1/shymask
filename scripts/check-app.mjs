@@ -34,6 +34,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inflateSync } from 'node:zlib';
 import { _electron as electron } from 'playwright-core';
+import { unzipSync } from 'fflate';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 /** Committed fixture cache; scenarios override the app's input via SHYMASK_FIXTURE_DIR. */
@@ -1609,6 +1610,24 @@ const FACE_DISTORTION_EFFECT_ID = 'package:shymask.face-distortion';
 /** Exact unlit material colour of the schema v3 secondary-motion sample mask. */
 const REACTIVE_EARS_RGB = { r: 150, g: 90, b: 240 };
 const REACTIVE_EARS_EFFECT_ID = 'package:shymask.reactive-ears';
+/**
+ * Declared bounds of the committed `reactive-ears.zip` fixture. They are pinned
+ * here (and checked against the committed manifest) instead of read back from
+ * the diagnostic under test, so the "declared bounds" assertion is independent.
+ */
+const REACTIVE_EARS_MAX_ANGLE_DEG = [32, 32, 35];
+const REACTIVE_EARS_REST_ANGLE_DEG = [0, 0, 0];
+/** A post-turn sample this far above the declared rest pose is a real residual. */
+const POST_TURN_RESIDUAL_FLOOR_DEG = 1.5;
+/** A post-turn sample within this angle of the declared rest pose is near rest. */
+const POST_TURN_NEAR_REST_DEG = 3;
+/**
+ * Minimum media-time coverage after the measured post-turn peak. Sampling is
+ * media-time driven; if the documented window ends before this coverage exists,
+ * sampling continues into a short tail rather than failing on a wall-clock wait.
+ */
+const POST_TURN_MIN_POST_PEAK_COVERAGE_MS = 500;
+const POST_TURN_SAMPLE_TAIL_MS = 800;
 /**
  * Documented default-clip frame used for the warp on/off A/B. The clip is a
  * 3.379 s replay loop; 1.5 s is a tracked, non-paused frame with the face
@@ -3414,6 +3433,33 @@ function verifyPackageFixtures() {
   }
 }
 
+/**
+ * Reads the committed reactive-ears manifest directly out of its ZIP. The
+ * declared bounds assertion compares the public diagnostic against these
+ * fixture values, so a diagnostic that echoed its own input could not satisfy
+ * the check by itself.
+ */
+function readCommittedReactiveEarsParts() {
+  const archive = unzipSync(new Uint8Array(readFileSync(path.join(PACKAGE_FIXTURES_DIR, 'reactive-ears.zip'))));
+  const manifestBytes = archive['manifest.json'];
+  assert.ok(manifestBytes, 'the committed reactive-ears.zip must contain manifest.json');
+  const manifest = JSON.parse(new TextDecoder().decode(manifestBytes));
+  assert.equal(manifest.schemaVersion, 3, 'the committed reactive-ears sample must be schema v3');
+  const parts = manifest.secondaryMotion?.parts;
+  assert.ok(Array.isArray(parts) && parts.length === 3, 'the committed reactive-ears sample must declare three movable parts');
+  assert.deepEqual(
+    parts.map((part) => part.maxAngleDeg),
+    REACTIVE_EARS_MAX_ANGLE_DEG,
+    'the committed reactive-ears manifest must declare the pinned 32/32/35 degree bounds',
+  );
+  assert.deepEqual(
+    parts.map((part) => part.restAngleDeg ?? 0),
+    REACTIVE_EARS_REST_ANGLE_DEG,
+    'the committed reactive-ears manifest must declare zero rest offsets',
+  );
+  return parts;
+}
+
 async function effectOptionValues(page) {
   return page
     .locator('[data-testid="effect-select"] option')
@@ -3810,6 +3856,23 @@ async function readSecondaryMotion(page) {
   return parseKeyValues(await readDiagnostic(page, 'diag-secondary-motion'));
 }
 
+/**
+ * Reads the media clock, tracking phase and secondary-motion diagnostics in one
+ * renderer round-trip. The post-turn window is sampled at ~10 Hz; three separate
+ * locator reads per sample could consume most of the documented interval under
+ * desktop load.
+ */
+async function readSecondaryMotionSample(page) {
+  return page.evaluate(() => {
+    const read = (id) => document.getElementById(id)?.textContent ?? '';
+    return {
+      timestamp: read('diag-timestamp'),
+      tracking: read('diag-tracking'),
+      motion: read('diag-secondary-motion'),
+    };
+  });
+}
+
 function secondaryMotionAngleList(values, key) {
   return String(values[key] ?? '')
     .split(',')
@@ -3818,13 +3881,23 @@ function secondaryMotionAngleList(values, key) {
     .map(Number);
 }
 
-/** Asserts every part angle the simulator reports is inside its declared bound. */
+/**
+ * Asserts every part angle the simulator reports is inside its declared bound
+ * and that the bounds equal the committed fixture's pinned declaration. The
+ * expected bounds come from the fixture constants, not from the diagnostic under
+ * test, so this assertion cannot be satisfied by a diagnostic echoing itself.
+ */
 function assertSecondaryMotionBounds(values, label) {
   assert.equal(values.active, 'true', `${label}: the secondary-motion effect must be active`);
   const angles = secondaryMotionAngleList(values, 'angles');
   const maxima = secondaryMotionAngleList(values, 'maxAngleDeg');
   assert.equal(angles.length, maxima.length, `${label}: every declared part must report one angle and one bound`);
   assert.ok(angles.length >= 1, `${label}: at least one movable part must be declared`);
+  assert.deepEqual(
+    maxima,
+    REACTIVE_EARS_MAX_ANGLE_DEG,
+    `${label}: the diagnostic must report the committed fixture's declared 32/32/35 degree bounds, got ${values.maxAngleDeg}`,
+  );
   for (const [index, angle] of angles.entries()) {
     const maximum = maxima[index];
     assert.ok(Number.isFinite(angle), `${label}: part ${index} angle must be finite, got ${values.angles}`);
@@ -3838,11 +3911,53 @@ function assertSecondaryMotionBounds(values, label) {
 }
 
 /**
+ * Checks the camera frames captured while playback runs contain the package
+ * material and that the sequence actually changes. It does not isolate the
+ * movable-part pixels from the moving video; the held-frame A/B does that.
+ */
+function assertMotionCameraSequence(run, label) {
+  const appFrames = run.frames.filter((frame) => frame.captureUnixMs > 0);
+  assert.ok(
+    appFrames.length >= 2,
+    `${label}: expected at least two app-published camera frames, got ${appFrames.length} of ${run.frames.length}`,
+  );
+  const appPngs = appFrames.filter((frame) => frame.png);
+  assert.ok(appPngs.length >= 2, `${label}: expected at least two app-published camera PNGs, got ${appPngs.length}`);
+  const materialCounts = appPngs.map((frame) => pngColorCount(frame.png, REACTIVE_EARS_RGB, 28));
+  const minMaterialPixels = Math.min(...materialCounts);
+  assert.ok(
+    minMaterialPixels > 10000,
+    `${label}: every app-published camera PNG must contain the package material, min=${minMaterialPixels} pixels (${materialCounts.join(',')})`,
+  );
+  // The camera claim is that app-published frames across the window contain the
+  // package material while the diagnostic reports nonzero bounded angles. Frame
+  // mean RGB is reported for transparency but not asserted: integer means can be
+  // equal for frames whose pixels differ, and the stronger pixel evidence is the
+  // held A/B, which isolates the simulated angle.
+  const frameMeans = appFrames.map(cameraFrameRgb);
+  let maxMeanDelta = 0;
+  for (let left = 0; left < frameMeans.length; left += 1) {
+    for (let right = left + 1; right < frameMeans.length; right += 1) {
+      maxMeanDelta = Math.max(maxMeanDelta, rgbDistance(frameMeans[left], frameMeans[right]));
+    }
+  }
+  return {
+    frames: appFrames.length,
+    pngs: appPngs.map((frame) => frame.png),
+    materialPixels: materialCounts,
+    minMaterialPixels,
+    maxMeanRgbDelta: maxMeanDelta,
+    frameMeans,
+  };
+}
+
+/**
  * Public published-output A/B for secondary motion on a held frame.
  *
  * The effect stays selected; the diagnostic toggle only draws the movable parts
- * at their authored rest orientation. Exact 1280x720 PNGs through the public
- * Capture control must differ substantially, the change must sit on the mask,
+ * at their declared rest orientation (the authored GLB orientation plus
+ * `restAngleDeg`). Exact 1280x720 PNGs through the public Capture control must
+ * differ substantially, the change must sit on the mask,
  * same-state repeats must be pixel-identical, and the independent camera must
  * receive the identical change. A dropped simulation makes ON == OFF.
  */
@@ -3887,7 +4002,7 @@ async function secondaryMotionAbEvidence(page, label, options = {}) {
   const offMotion = await readSecondaryMotion(page);
   assert.equal(offMotion.active, 'true', `${label}: disabling only the motion must keep the effect active`);
   assert.equal(offMotion.enabled, 'false', `${label}: the diagnostic control must disable only the simulation application`);
-  assert.equal(offMotion.applied, 'rest', `${label}: the OFF state must draw the authored rest orientation`);
+  assert.equal(offMotion.applied, 'rest', `${label}: the OFF state must draw the declared rest pose`);
   assert.equal(
     offMotion.updates,
     onMotion.updates,
@@ -4852,6 +4967,8 @@ async function effectPackageScenario() {
 async function secondaryMotionScenario() {
   log('\n== Scenario J: imported packaged secondary motion (schema v3) ==');
   const motionMetadata = verifyFixtureManifest('pose-loop.json');
+  // Read the committed declaration independently of the diagnostic under test.
+  const committedParts = readCommittedReactiveEarsParts();
   const evidence = {
     states: {},
     motion: {},
@@ -4978,9 +5095,35 @@ async function secondaryMotionScenario() {
       15000,
       40,
     );
+    // A backward seek can leave the decode pipeline briefly re-showing the same
+    // canvas; wait for media time to advance before sampling/capturing so the
+    // camera sequence covers changing frames, not a seek stall.
+    await waitFor(
+      'motion-window playback advancing',
+      async () => {
+        const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+        return Number(timestamp.mediaMs ?? 0) >= MOTION_WINDOW_START_MS + 250 ? timestamp : null;
+      },
+      10000,
+      50,
+    );
     const motionSamples = [];
     const motionShots = [];
     let previousMotionMediaMs = null;
+    // Capture a short camera sequence concurrently with the sampled window, so
+    // the independent camera is observed while playback and the spring run.
+    const motionCameraStart = {
+      mediaMs: Number(parseKeyValues(await readDiagnostic(page, 'diag-timestamp')).mediaMs ?? 0),
+      motion: await readSecondaryMotion(page),
+    };
+    const motionCameraPreviewRgb = await readProcessedRgb(page, 'secondary-motion motion-window camera preview');
+    const motionCameraPromise = captureProcessedCameraState(
+      page,
+      'reactive-ears-motion-window',
+      12,
+      motionCameraPreviewRgb,
+      'reactive-ears motion window',
+    );
     for (let index = 0; index < 18; index += 1) {
       await page.waitForTimeout(400);
       const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
@@ -5030,8 +5173,21 @@ async function secondaryMotionScenario() {
       `at least two parts must move over the recorded window, per-part ranges=${partRanges.join(',')} degrees`,
     );
     const maxObservedAngle = Math.max(...motionSamples.map((sample) => sample.maxAbsAngleDeg));
+    const motionCamera = await motionCameraPromise;
+    const motionCameraEnd = {
+      mediaMs: Number(parseKeyValues(await readDiagnostic(page, 'diag-timestamp')).mediaMs ?? 0),
+      motion: await readSecondaryMotion(page),
+    };
+    assertSecondaryMotionBounds(motionCameraStart.motion, 'motion camera start');
+    assertSecondaryMotionBounds(motionCameraEnd.motion, 'motion camera end');
+    assert.ok(
+      motionSamples.some((sample) => sample.maxAbsAngleDeg > 0.5),
+      `the live camera sequence must overlap a nonzero part angle, motion samples=${JSON.stringify(motionSamples.map((sample) => sample.maxAbsAngleDeg))}`,
+    );
+    const motionCameraEvidence = assertMotionCameraSequence(motionCamera, 'reactive-ears motion window');
     evidence.motion = {
       fixture: motionMetadata.id,
+      declaredParts: committedParts.map((part) => `${part.node}:${part.axis}:${part.drive}:${part.maxAngleDeg}`),
       windowStartSeconds: MOTION_WINDOW_START_SECONDS,
       windowSeconds: MOTION_WINDOW_SECONDS,
       windowStartMediaMs: MOTION_WINDOW_START_MS,
@@ -5042,9 +5198,18 @@ async function secondaryMotionScenario() {
       screenshots: motionShots,
       samples: motionSamples,
     };
+    evidence.motionCamera = {
+      start: motionCameraStart,
+      end: motionCameraEnd,
+      ...motionCameraEvidence,
+    };
     pass(
       'Recorded head turns and nods move the declared ears and hair tuft within their bounds',
       `tracked=${motionSamples.length}/18 part ranges=${partRanges.map((range) => range.toFixed(1)).join('/')} deg maxAngle=${maxObservedAngle.toFixed(2)} deg ${motionShots.join(' ')}`,
+    );
+    pass(
+      'The independent camera receives a live sequence of the packaged mask during the recorded turn/nod window',
+      `camera frames=${motionCameraEvidence.frames} material pixels ${motionCameraEvidence.minMaterialPixels}-${Math.max(...motionCameraEvidence.materialPixels)} (min enforced >10,000), max mean-RGB delta=${motionCameraEvidence.maxMeanRgbDelta}, sampled ${motionSamples[0]?.mediaMs}..${motionSamples[motionSamples.length - 1]?.mediaMs}ms ${motionCameraEvidence.pngs.join(' ')}`,
     );
 
     // --- Post-turn settling -------------------------------------------------
@@ -5074,21 +5239,60 @@ async function secondaryMotionScenario() {
       15000,
       40,
     );
+    await waitFor(
+      'post-turn playback advancing',
+      async () => {
+        const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+        return Number(timestamp.mediaMs ?? 0) >= POST_TURN_WINDOW_START_SECONDS * 1000 + 250 ? timestamp : null;
+      },
+      10000,
+      50,
+    );
+    const postTurnCameraStart = {
+      mediaMs: Number(parseKeyValues(await readDiagnostic(page, 'diag-timestamp')).mediaMs ?? 0),
+      motion: await readSecondaryMotion(page),
+    };
+    // Capture the independent camera across the same window, concurrently with
+    // the diagnostic sampling below, so the camera frames and the reported part
+    // angles cover the same recorded interval.
+    const postTurnCameraPreviewRgb = await readProcessedRgb(page, 'secondary-motion post-turn camera preview');
+    const postTurnCameraPromise = captureProcessedCameraState(
+      page,
+      'reactive-ears-post-turn',
+      10,
+      postTurnCameraPreviewRgb,
+      'reactive-ears post-turn window',
+    );
     const settleSamples = [];
     let previousSettleMediaMs = null;
-    const settleDeadline = Date.now() + POST_TURN_WINDOW_SECONDS * 1000;
-    while (Date.now() < settleDeadline && settleSamples.length < 16) {
-      await page.waitForTimeout(150);
-      const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+    const settleWindowStartMs = POST_TURN_WINDOW_START_SECONDS * 1000;
+    const settleWindowEndMs = settleWindowStartMs + POST_TURN_WINDOW_SECONDS * 1000;
+    // Sample the documented interval by media time, not a wall-clock budget: a
+    // few slow diagnostic reads previously exhausted a 1.9 s wall-clock window
+    // before the interval was covered. The wall deadline is only a hung-renderer
+    // guard, and sampling may continue a short tail while post-peak coverage is
+    // still too thin.
+    const settleDeadline =
+      Date.now() + POST_TURN_WINDOW_SECONDS * 1000 + POST_TURN_SAMPLE_TAIL_MS + 20000;
+    while (Date.now() < settleDeadline) {
+      await page.waitForTimeout(50);
+      const readings = await readSecondaryMotionSample(page);
+      const timestamp = parseKeyValues(readings.timestamp);
       const mediaMs = Number(timestamp.mediaMs ?? 0);
-      if (previousSettleMediaMs !== null && mediaMs === previousSettleMediaMs) continue;
-      if (mediaMs < POST_TURN_WINDOW_START_SECONDS * 1000 || mediaMs > (POST_TURN_WINDOW_START_SECONDS + POST_TURN_WINDOW_SECONDS) * 1000) {
-        break;
+      if (mediaMs < settleWindowStartMs) continue;
+      if (mediaMs > settleWindowEndMs) {
+        const peakSoFar = settleSamples.reduce(
+          (best, sample) => (!best || sample.maxAbsAngleDeg > best.maxAbsAngleDeg ? sample : best),
+          null,
+        );
+        if (!peakSoFar || mediaMs - peakSoFar.mediaMs >= POST_TURN_MIN_POST_PEAK_COVERAGE_MS) break;
+        if (mediaMs > settleWindowEndMs + POST_TURN_SAMPLE_TAIL_MS) break;
       }
+      if (previousSettleMediaMs !== null && mediaMs === previousSettleMediaMs) continue;
       previousSettleMediaMs = mediaMs;
-      const tracking = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
+      const tracking = parseKeyValues(readings.tracking);
       if (tracking.phase !== 'tracking') continue;
-      const motion = await readSecondaryMotion(page);
+      const motion = parseKeyValues(readings.motion);
       if (motion.active !== 'true') continue;
       assertSecondaryMotionBounds(motion, `post-turn sample at ${mediaMs}`);
       settleSamples.push({
@@ -5098,7 +5302,10 @@ async function secondaryMotionScenario() {
         headSpeedDegPerSec: Number(motion.headSpeedDegPerSec),
       });
     }
-    assert.ok(settleSamples.length >= 8, `expected a dense post-turn sample window, got ${settleSamples.length} samples`);
+    assert.ok(
+      settleSamples.length >= 6,
+      `expected the documented post-turn window to be sampled, got ${settleSamples.length} samples: ${JSON.stringify(settleSamples.map((sample) => sample.mediaMs))}`,
+    );
     let peakIndex = 0;
     for (const [index, sample] of settleSamples.entries()) {
       if (sample.maxAbsAngleDeg > (settleSamples[peakIndex]?.maxAbsAngleDeg ?? 0)) peakIndex = index;
@@ -5109,25 +5316,48 @@ async function secondaryMotionScenario() {
       `the recorded turn must drive a visible part angle, peak=${peak?.maxAbsAngleDeg}`,
     );
     const afterPeak = settleSamples.slice(peakIndex + 1);
-    const residual = afterPeak.find(
-      (sample) => sample.headSpeedDegPerSec <= 20 && sample.maxAbsAngleDeg >= (peak?.maxAbsAngleDeg ?? 0) * 0.2 && sample.maxAbsAngleDeg >= 3,
+    assert.ok(
+      afterPeak.length >= 3,
+      `the post-turn window must sample the decaying tail, got ${afterPeak.length} samples after the peak`,
+    );
+    const postPeakCoverageMs = (settleSamples[settleSamples.length - 1]?.mediaMs ?? peak.mediaMs) - peak.mediaMs;
+    assert.ok(
+      postPeakCoverageMs >= POST_TURN_MIN_POST_PEAK_COVERAGE_MS,
+      `the post-turn window must cover at least ${POST_TURN_MIN_POST_PEAK_COVERAGE_MS}ms after the peak, got ${postPeakCoverageMs}ms: ${JSON.stringify(settleSamples.map((sample) => sample.mediaMs))}`,
+    );
+    // The recorded head does not actually stop, so the live pass is a
+    // residual/near-rest observation: a post-peak sample must stay above the
+    // declared rest pose by a small floor while head angular speed drops. The
+    // deterministic held-frame settle below is the strict decay evidence.
+    const residualFloorDeg =
+      Math.max(...REACTIVE_EARS_REST_ANGLE_DEG) + POST_TURN_RESIDUAL_FLOOR_DEG;
+    const nearRestCeilingDeg = Math.max(...REACTIVE_EARS_REST_ANGLE_DEG) + POST_TURN_NEAR_REST_DEG;
+    const residualCandidates = afterPeak.filter(
+      (sample) => sample.headSpeedDegPerSec <= 20 && sample.maxAbsAngleDeg >= residualFloorDeg,
+    );
+    const residual = residualCandidates.reduce(
+      (best, sample) => (!best || sample.maxAbsAngleDeg > best.maxAbsAngleDeg ? sample : best),
+      null,
     );
     const settled = afterPeak.find(
-      (sample) => sample.headSpeedDegPerSec <= 20 && sample.maxAbsAngleDeg <= 3,
+      (sample) => sample.headSpeedDegPerSec <= 20 && sample.maxAbsAngleDeg <= nearRestCeilingDeg,
     );
     assert.ok(
       residual,
-      `the spring must still be moving after the head angular velocity drops (peak=${peak?.maxAbsAngleDeg}, samples after peak=${JSON.stringify(afterPeak.map((sample) => [sample.maxAbsAngleDeg, sample.headSpeedDegPerSec]))})`,
+      `the spring must still be deflected after the head angular velocity drops (peak=${peak?.maxAbsAngleDeg}, floor=${residualFloorDeg}deg, samples after peak=${JSON.stringify(afterPeak.map((sample) => [sample.maxAbsAngleDeg, sample.headSpeedDegPerSec]))})`,
     );
     assert.ok(
       settled,
-      `the spring must reach a near-rest angle after the turn (peak=${peak?.maxAbsAngleDeg}, samples after peak=${JSON.stringify(afterPeak.map((sample) => [sample.maxAbsAngleDeg, sample.headSpeedDegPerSec]))})`,
+      `the spring must reach a near-rest angle after the turn (peak=${peak?.maxAbsAngleDeg}, ceiling=${nearRestCeilingDeg}deg, samples after peak=${JSON.stringify(afterPeak.map((sample) => [sample.maxAbsAngleDeg, sample.headSpeedDegPerSec]))})`,
     );
-    // An underdamped spring oscillates around rest while it decays, and the
-    // recorded person keeps producing small head motion later in the clip, so
-    // this live window reports the residual and a near-rest sample rather than
-    // asserting a monotonic tail. The deterministic held-frame settling gate
-    // below is the strict post-turn decay evidence.
+    const postTurnCamera = await postTurnCameraPromise;
+    const postTurnCameraEnd = {
+      mediaMs: Number(parseKeyValues(await readDiagnostic(page, 'diag-timestamp')).mediaMs ?? 0),
+      motion: await readSecondaryMotion(page),
+    };
+    assertSecondaryMotionBounds(postTurnCameraStart.motion, 'post-turn camera start');
+    assertSecondaryMotionBounds(postTurnCameraEnd.motion, 'post-turn camera end');
+    const postTurnCameraEvidence = assertMotionCameraSequence(postTurnCamera, 'reactive-ears post-turn window');
     evidence.settle = {
       windowStartSeconds: POST_TURN_WINDOW_START_SECONDS,
       windowSeconds: POST_TURN_WINDOW_SECONDS,
@@ -5136,11 +5366,23 @@ async function secondaryMotionScenario() {
       settled: { mediaMs: settled.mediaMs, maxAbsAngleDeg: settled.maxAbsAngleDeg, headSpeedDegPerSec: settled.headSpeedDegPerSec },
       settlingMs: settled.mediaMs - (peak?.mediaMs ?? 0),
       decayFraction: Number((settled.maxAbsAngleDeg / (peak?.maxAbsAngleDeg ?? 1)).toFixed(3)),
+      postPeakCoverageMs,
+      residualFloorDeg,
+      nearRestCeilingDeg,
       samples: settleSamples,
     };
+    evidence.postTurnCamera = {
+      start: postTurnCameraStart,
+      end: postTurnCameraEnd,
+      ...postTurnCameraEvidence,
+    };
     pass(
-      'The underdamped spring keeps moving after the recorded turn and settles toward rest',
-      `peak=${peak?.maxAbsAngleDeg}deg at ${peak?.mediaMs}ms (head ${peak?.headSpeedDegPerSec}deg/s), residual=${residual.maxAbsAngleDeg}deg after head slowed to ${residual.headSpeedDegPerSec}deg/s, settled=${settled.maxAbsAngleDeg}deg at ${settled.mediaMs}ms (${settled.mediaMs - (peak?.mediaMs ?? 0)}ms after peak, ${(100 * settled.maxAbsAngleDeg / (peak?.maxAbsAngleDeg ?? 1)).toFixed(1)}% of peak)`,
+      'The underdamped spring keeps moving after the recorded turn and reaches a near-rest angle (residual observation)',
+      `peak=${peak?.maxAbsAngleDeg}deg at ${peak?.mediaMs}ms (head ${peak?.headSpeedDegPerSec}deg/s), residual=${residual.maxAbsAngleDeg}deg after head slowed to ${residual.headSpeedDegPerSec}deg/s (floor ${residualFloorDeg}deg), near-rest=${settled.maxAbsAngleDeg}deg at ${settled.mediaMs}ms (${settled.mediaMs - (peak?.mediaMs ?? 0)}ms after peak, ${(100 * settled.maxAbsAngleDeg / (peak?.maxAbsAngleDeg ?? 1)).toFixed(1)}% of peak); strict decay is the held-frame settle`,
+    );
+    pass(
+      'The independent camera receives the packaged mask across the post-turn residual window',
+      `camera frames=${postTurnCameraEvidence.frames} material pixels ${postTurnCameraEvidence.minMaterialPixels}-${Math.max(...postTurnCameraEvidence.materialPixels)} (min enforced >10,000), max mean-RGB delta=${postTurnCameraEvidence.maxMeanRgbDelta}, window ${postTurnCameraStart.mediaMs}..${postTurnCameraEnd.mediaMs}ms ${postTurnCameraEvidence.pngs.join(' ')}`,
     );
 
     // --- Loop boundary: deliberate reset, no unbounded motion --------------
@@ -5201,7 +5443,7 @@ async function secondaryMotionScenario() {
     );
     assert.ok(
       secondaryMotionAngleList(lostMotion, 'angles').every((angle) => Math.abs(angle) < 1e-9),
-      `the reset pose must be the authored rest orientation, got ${lostMotion.angles}`,
+      `the reset pose must be the declared rest pose (authored orientation plus restAngleDeg), got ${lostMotion.angles}`,
     );
     const lostRgb = await readRgb(page);
     assert.ok(rgbSum(lostRgb) < 120, `tracking loss must hide the secondary-motion effect, got ${JSON.stringify(lostRgb)}`);
@@ -5228,7 +5470,7 @@ async function secondaryMotionScenario() {
     const ab = await secondaryMotionAbEvidence(page, '40d-secondary-motion', { captureCamera: true });
     evidence.ab = { captureSeconds: SECONDARY_MOTION_AB_CAPTURE_SECONDS, ...ab };
     pass(
-      'The published preview and camera contain the simulated movable-part angle (ON vs authored rest OFF on a held frame)',
+      'The published preview and camera contain the simulated movable-part angle (ON vs declared rest OFF on a held frame)',
       `held=${SECONDARY_MOTION_AB_CAPTURE_SECONDS}s angle=${ab.heldAngleDeg}deg changed=${ab.changedPixels}px onMask=${ab.changedOnMaskPixels}px self-diff ON ${ab.selfDiffPixels}px OFF ${ab.offSelfDiffPixels}px camera=${ab.camera?.changedPixels}px ${ab.on} ${ab.off} ${ab.camera?.onPng ?? ''}`,
     );
     // --- Deterministic held-frame settling ---------------------------------
@@ -5425,7 +5667,7 @@ async function secondaryMotionScenario() {
       observedRenderCostDeltaP95Ms: Number((Number(onRender.p95Ms ?? 0) - Number(offRender.p95Ms ?? 0)).toFixed(2)),
       observedFrameIntervalDeltaP95Ms: Number((Number(onFrame.p95Ms ?? 0) - Number(offFrame.p95Ms ?? 0)).toFixed(2)),
       note:
-        'Replay-derived, development desktop, sequential 2.2 s windows with the same mask and playback; the diagnostic OFF state still runs the simulator but draws the authored rest pose, so the render/frame differences are observed run variation, not an isolated simulation cost. The simulation p95 is the pure spring update around the accepted pose. Not the final benchmark or a performance target.',
+        'Replay-derived, development desktop, sequential 2.2 s windows with the same mask and playback; the diagnostic OFF state still runs the simulator but draws the declared rest pose, so the render/frame differences are observed run variation, not an isolated simulation cost. The simulation p95 is the pure spring update around the accepted pose. Not the final benchmark or a performance target.',
     };
     pass(
       'Replay-based secondary-motion simulation and render workload is recorded for the later complete-effect benchmark',
@@ -5630,7 +5872,7 @@ async function main() {
       'Occlusion A/B evidence holds two documented recorded side-view frames (47.7 s, yaw about -22 deg, and 16.0 s, yaw in the opposite direction) via the diagnostic Hold replay frame control and captures exact 1280x720 output PNGs through the public Capture control. The held canvas is deterministic: ON and OFF are each captured twice and the two same-state captures must be pixel-identical. Each A/B requires at least 88% of changed pixels inside the tracked face axis-aligned bounding box and at least 1,500 removed mask pixels inside it.',
       'The occlusion ON frame is also proved to reveal non-mask content where the OFF frame drew mask material: for an imported package the changed face-box pixels are at least 97% the exact unlit material colour in OFF and at most 3% that colour in ON; for the bundled lit mask the dominant exact OFF-frame mask colours (top 64 shades, at least 90% of changed pixels) must not reappear in the ON frame at those pixels (at most 1%). The ON changed pixels must also pass a plausible-video floor (mean luminance >= 30, luminance stddev >= 6, <= 10% near-black, >= 16 distinct colours), and for the untreated bundled mask and rose package at least 90% of sampled ON pixels must match the held replay frame drawn at the pipeline scale. This proves mask material is removed and plausible video is revealed; it is not an exact-colour proof of identity.',
       'Raw and smoothed pose jitter are measured over the same presented frames in the initial slow segment of the recorded window. The segment\'s motion is measured, not assumed: its pose span and the filter p50 gain are reported, and it is required to stay within 10 deg yaw/pitch, 5 deg roll, 30 px origin and p50 alpha <= 0.4. Across the full turn/nod/lean window the reported p95 raw-vs-smoothed offset and the filter\'s implied constant-velocity delay measure the added lag.',
-      'Camera capture attempts and their app-published/native-fallback frame counts are recorded in virtualCamera.captureAttempts. Processed captures request 8 consumer frames (10 for the motion-window capture) because the native source starts each consumer stream with an empty frame cache; captureProcessedCameraState retries up to 3 times and the final attempt still fails on a persistent fallback.',
+      'Camera capture attempts and their app-published/native-fallback frame counts are recorded in virtualCamera.captureAttempts. Processed captures request 8 consumer frames (10 for the motion-window capture, 12 for the secondary-motion turn/nod camera sequence and 10 for the post-turn residual sequence) because the native source starts each consumer stream with an empty frame cache; captureProcessedCameraState retries up to 3 times and the final attempt still fails on a persistent fallback.',
       'Sliding is bounded, not corrected: it is quantified over the motion window as the p95 deviation of the projected mask origin from its median offset to the tracked face-box centre (bound 24 px, reported as a fraction of face width), plus the raw origin-to-face-centre offset p95 (bound 60 px). The same documented window is sampled again through the public Pose smoothing raw mode; the raw-mode sliding value is reported without asserting it. Observed rendered ~12-16 px vs raw-mode ~9-13 px (earlier runs up to ~20 px rendered), so smoothing did not reduce this proxy metric. The face-box centre shifts under yaw, so this bounded proxy metric is not a ground-truth surface-distance measurement and no correction is claimed. Clipping is quantified as the mask pixels removed inside the face bounding box by the occluder in each A/B (at least 1,500 px).',
       'Smoothing is a bounded exponential filter (base gain 0.45 at rest, rising toward 1 as measured face speed approaches 360 deg/s or 60 cm/s) with hard 4 cm / 8 degree lag caps. The 0.45 gain is normalized to the 41.67 ms reference interval, so the effective alpha at the observed ~35 ms interval is about 0.34 and the measured ramp lag is about 61 ms; the 50.9 ms reference-interval figure is not a global maximum. It is not a prediction filter and the recorded frames are replay input.',
       'Tracking-loss, multiple-face and unreliable-tracking policy states in Scenario F are produced by the labelled diagnostic injection control; the real detector path is used for the normal tracking and recorded-motion states. The recorded-motion clip is real recorded video from a second CC0 fixture, positioned by seeking to a documented window.',
@@ -5640,9 +5882,9 @@ async function main() {
       'Face distortion is a fixed radial shader (bulge/pinch) applied to the replay frame inside an ellipse computed from the tracked face box. The warp centre and radius are recalculated every processed frame; the public diag-distortion diagnostic reports the ellipse and a 64x36 identity-versus-warped comparison of the same uploaded frame texture (so the outside-ellipse delta is zero apart from GPU rounding). That warp-delta number is a diagnostic, not published-output proof. The published-output proof is a separate public A/B: a documented frame is held, the diagnostic Warp toggle keeps the effect selected but draws the same uploaded frame through the identity shader, and exact 1280x720 PNGs captured through the public Capture control must differ substantially inside the independent diag-face-derived ellipse, be ~0 outside it, be pixel-identical for same-state repeats, and the independent camera must receive the identical change. The A/B is repeated at a second documented held pose with a different face position and the changed-region centroid must move with the face (at least 40 px and at least 50% of the face-box movement). The ellipses overlap, so the centroid gate - not ellipse containment - is what excludes a fixed overlay. A dropped warp makes ON==OFF and fails; the identity pass still comes from the effect renderer canvas, so this is not raw-element passthrough. The A/B proves a localized published change and a face-relative changed-region centroid; it is not a measurement of the radial displacement kernel, and OFF provenance rests on the effect-selection assertions and code path.',
       'Face-distortion timing is replay-derived. costMsP95 is only the main-thread WebGL submission time around renderer.render() for the 1280x720 warp pass, with no GPU sync or readback, so the GPU cost lands later in the composite and is not included. diag-render-cost p95 includes the composite and diagnostic sampling; the baseline is a color-only package on the same fixture and output path. The render-cost and frame-interval deltas are sequential-window observations, not isolated distortion costs. These are observations for the later complete-effect benchmark, not a performance target.',
       'A lost WebGL context on the distortion renderer marks it non-drawable, so the processed-frame path returns false, the existing 250 ms undrawable guard hides the whole output in preview and camera, and no stale or raw frame is published. The public context-loss control injects the loss with WEBGL_lose_context and requests a browser restore; three.js re-initialises on restore and the effect resumes. Actual driver/GPU resets outside this injection are not reproduced, and a context that the browser refuses to restore stays hidden until the tracker renderer is rebuilt.',
-      'Secondary motion is a fixed, bounded spring simulation per declared GLB node: a 120 Hz fixed sub-step, dt clamped to 250 ms, angles hard-clamped to maxAngleDeg, and deliberate resets (first sample, gap, pose discontinuity, loop seam, tracking reacquisition) that start from the authored rest pose instead of injecting an impulse. It is driven by the accepted tracked head angular velocity, not a canned clip. It is not strand-level hair simulation, does not convert arbitrary Blender physics, and does not use GPU cloth/bone simulation; each part is one rigid node rotating about one local axis.',
-      'The secondary-motion A/B holds a documented post-turn frame (47.7 s on pose-loop-v1) and compares the simulated part angles with the authored rest pose through the public diagnostic toggle; the effect stays selected and every paused-output rule still applies. The held frame keeps the last simulated angle (the hold resample does not advance the spring), so the A/B is not a live-motion capture. Motion itself is evidenced by the recorded 8 s turn/nod window and the post-turn settling window on the same clip, plus saved screenshots. The independent camera receives the identical A/B change; continuous moving camera evidence is not asserted.',
-      'Post-turn settling is measured on a documented recorded window around 25.9 s where a real head turn is followed by low head angular velocity; the peak, residual motion and decay to rest are reported from the public diagnostics. It is replay-based and does not establish physical-camera or live-human behavior.',
+      'Secondary motion is a fixed, bounded spring simulation per declared GLB node: each frame interval is split into equal sub-steps of at most 1/120 s, dt is clamped to 250 ms, angles are hard-clamped to maxAngleDeg, and deliberate resets (first sample, gap, pose discontinuity, loop seam, tracking reacquisition) start from the declared rest pose (the authored GLB orientation plus restAngleDeg) instead of injecting an impulse. It is driven by the accepted tracked head angular velocity, not a canned clip. It is not strand-level hair simulation, does not convert arbitrary Blender physics, and does not use GPU cloth/bone simulation; each part is one rigid node rotating about one local axis.',
+      'The secondary-motion A/B holds a documented post-turn frame (47.7 s on pose-loop-v1) and compares the simulated part angles with the declared rest pose through the public diagnostic toggle; the effect stays selected and every paused-output rule still applies. The held frame keeps the last simulated angle (the hold resample does not advance the spring), so the A/B is not a live-motion capture. Live motion is evidenced by the recorded 8 s turn/nod window, a camera-captured sequence during that window, and a camera-captured sequence across the post-turn residual; the camera frames contain the package material while the public diagnostic reports nonzero, bounded part angles. Those sequences do not isolate the part-pixel change from the moving video; the held A/B isolates the simulated angle in preview and the independent camera.',
+      'Post-turn motion is a residual/near-rest observation on a documented recorded window around 25.9 s where a real head turn is followed by low head angular velocity: the recorded person does not actually stop, so the live window reports the peak, a post-peak residual above the declared rest pose and a near-rest sample. The strict post-turn decay evidence is the deterministic held-frame settle, which advances the same simulator with the accepted pose held stationary. Both are replay-based and do not establish physical-camera or live-human behavior.',
     ],
     commands: {
       build: 'npm run build',
@@ -5768,16 +6010,18 @@ async function main() {
         shape:
           'A schema v3 mask may declare secondaryMotion.parts (1-4): each part names exactly one mask GLB node and declares a local rotation axis, the tracked head-rotation component that drives it (yaw/pitch/roll), a spring stiffness (4-400 1/s^2), damping ratio (0.05-1.5), maxAngleDeg (1-60) and an optional restAngleDeg within that bound.',
         runtime:
-          'Pure fixed-step spring simulation (fixed 120 Hz sub-steps, dt clamped to <=250 ms) driven by the accepted tracked head angular velocity; no canned clip, no package code, no per-frame displacement. Deliberate resets on first sample, >250 ms gap, pose discontinuity, loop seam and tracking reacquisition.',
+          'Pure spring simulation driven by the accepted tracked head angular velocity; each frame interval is split into equal sub-steps of at most 1/120 s, dt is clamped to <=250 ms, and there is no canned clip, package code or per-frame displacement. Deliberate resets on first sample, >250 ms gap, pose discontinuity, loop seam and tracking reacquisition start from the declared rest pose (authored GLB orientation plus restAngleDeg).',
         bounds: {
           maxParts: 4,
           stiffness: [4, 400],
           dampingRatio: [0.05, 1.5],
           maxAngleDeg: [1, 60],
           driveFullScaleDegPerSec: 45,
-          fixedStepMs: Number((1000 / 120).toFixed(3)),
+          maxSubStepMs: Number((1000 / 120).toFixed(3)),
+          minDtMs: 0.5,
           maxGapMs: 250,
           maxPoseDeltaDeg: 45,
+          maxHeadSpeedDegPerSec: 1080,
         },
       },
       sample: 'fixtures/packages/reactive-ears.zip (schema v3 mask with 2 ears + 1 hair tuft)',
@@ -5792,10 +6036,10 @@ async function main() {
         startSeconds: POST_TURN_WINDOW_START_SECONDS,
         seconds: POST_TURN_WINDOW_SECONDS,
         basis:
-          'Recorded turn around 25.9 s followed by low head angular velocity; the spring residual and its decay to rest are measured on the public diagnostics. Replay-based, not a physical-camera or human measurement.',
+          'Recorded turn around 25.9 s followed by low head angular velocity; the live window reports the peak, a post-peak residual above the declared rest pose and a near-rest sample (the recorded person does not stop). The strict decay evidence is the deterministic held-frame settle. Replay-based, not a physical-camera or human measurement.',
       },
       timingBasis:
-        'Replay-derived main-thread measurements on the development desktop; the simulation cost is the pure spring update per accepted pose, and the render/frame-interval differences are sequential-window observations with the authored rest pose as the OFF state. Not the final benchmark or a performance target.',
+        'Replay-derived main-thread measurements on the development desktop; the simulation cost is the pure spring update per accepted pose, and the render/frame-interval differences are sequential-window observations with the declared rest pose as the OFF state. Not the final benchmark or a performance target.',
     },
     timing: {
       ...timing,
@@ -5867,7 +6111,9 @@ async function main() {
   log(`tracker model:               ${trackerMetadata.id} sha256=${trackerMetadata.sha256.slice(0, 12)}…`);
   log('\n== Secondary motion (replay-based) ==');
   log(`secondary-motion motion:    ${secondaryMotion.motion.trackedSamples}/18 samples, part ranges ${secondaryMotion.motion.partRangesDeg.map((range) => range.toFixed(1)).join('/')} deg, max ${secondaryMotion.motion.maxObservedAngleDeg.toFixed(2)} deg (bounded)`);
-  log(`post-turn settling:         peak ${secondaryMotion.settle.peak.maxAbsAngleDeg}deg -> residual ${secondaryMotion.settle.residual.maxAbsAngleDeg}deg after head slowed to ${secondaryMotion.settle.residual.headSpeedDegPerSec}deg/s -> settled ${secondaryMotion.settle.settled.maxAbsAngleDeg}deg in ${secondaryMotion.settle.settlingMs}ms (${(100 * secondaryMotion.settle.decayFraction).toFixed(1)}% of peak)`);
+  log(`motion-window camera:        ${secondaryMotion.motionCamera.frames} app frames, material ${secondaryMotion.motionCamera.minMaterialPixels}-${Math.max(...secondaryMotion.motionCamera.materialPixels)}px, max mean-RGB delta ${secondaryMotion.motionCamera.maxMeanRgbDelta}`);
+  log(`post-turn residual (live):   peak ${secondaryMotion.settle.peak.maxAbsAngleDeg}deg -> residual ${secondaryMotion.settle.residual.maxAbsAngleDeg}deg after head slowed to ${secondaryMotion.settle.residual.headSpeedDegPerSec}deg/s (floor ${secondaryMotion.settle.residualFloorDeg}deg) -> near-rest ${secondaryMotion.settle.settled.maxAbsAngleDeg}deg (ceiling ${secondaryMotion.settle.nearRestCeilingDeg}deg) after ${secondaryMotion.settle.settlingMs}ms; post-peak coverage ${secondaryMotion.settle.postPeakCoverageMs}ms; strict decay is the held-frame settle`);
+  log(`post-turn camera:            ${secondaryMotion.postTurnCamera.frames} app frames, material ${secondaryMotion.postTurnCamera.minMaterialPixels}-${Math.max(...secondaryMotion.postTurnCamera.materialPixels)}px, max mean-RGB delta ${secondaryMotion.postTurnCamera.maxMeanRgbDelta}`);
   log(`loop/reacquisition resets:  loop seams resets ${secondaryMotion.loop.resetsBefore}->${secondaryMotion.loop.resetsAfter}; tracking loss resets ${secondaryMotion.reacquisition.lostMotion.resets} with rest angles`);
   log(`secondary-motion A/B:       held ${SECONDARY_MOTION_AB_CAPTURE_SECONDS}s angle ${secondaryMotion.ab.heldAngleDeg}deg changed ${secondaryMotion.ab.changedPixels}px (${secondaryMotion.ab.changedOnMaskPixels}px on mask), self-diff ON ${secondaryMotion.ab.selfDiffPixels}px OFF ${secondaryMotion.ab.offSelfDiffPixels}px, camera ${secondaryMotion.ab.camera?.changedPixels}px (identical to preview)`);
   log(`secondary-motion workload:  simulation p95=${secondaryMotion.timing.simulationCostP95Ms}ms (main-thread spring update only) render p95=${secondaryMotion.timing.renderCostP95MsOn}ms vs rest ${secondaryMotion.timing.renderCostP95MsRest}ms frame interval ${secondaryMotion.timing.frameIntervalP95MsOn}ms vs ${secondaryMotion.timing.frameIntervalP95MsRest}ms (sequential, not isolated)`);

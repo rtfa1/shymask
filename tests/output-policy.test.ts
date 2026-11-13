@@ -303,6 +303,41 @@ test('a face-distortion-only package renders with face-distortion wording', () =
   assert.doesNotMatch(decision.explanation, /color treatment/i);
 });
 
+test('a mask with secondary motion renders wording for the movable parts', () => {
+  const decision = resolveOutput(
+    state({
+      effect: 'package:studio.reactive-ears',
+      effectLabel: 'Reactive ears',
+      effectHasMask: true,
+      effectHasTreatment: false,
+      effectHasDistortion: false,
+      effectHasSecondaryMotion: true,
+    }),
+  );
+  assert.equal(decision.mode, 'render');
+  assert.equal(decision.title, 'Effect active: Reactive ears');
+  assert.match(decision.explanation, /mask with reactive movable parts attached to the tracked face/);
+  assert.doesNotMatch(decision.explanation, /face distortion/);
+});
+
+test('a mask with distortion and secondary motion keeps both component phrases', () => {
+  const decision = resolveOutput(
+    state({
+      effect: 'package:studio.combined',
+      effectLabel: 'Combined',
+      effectHasMask: true,
+      effectHasTreatment: true,
+      effectHasDistortion: true,
+      effectHasSecondaryMotion: true,
+    }),
+  );
+  assert.equal(decision.mode, 'render');
+  assert.match(decision.explanation, /reactive movable parts/);
+  assert.match(decision.explanation, /face distortion/);
+  assert.match(decision.explanation, /color treatment/);
+  assert.match(decision.explanation, /combined mask with reactive movable parts and face distortion attached/);
+});
+
 test('a face distortion is paused by every tracking and effect failure state', () => {
   const distortion = {
     effect: 'package:studio.face-distortion',

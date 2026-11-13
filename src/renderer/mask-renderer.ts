@@ -382,8 +382,9 @@ export class MaskRenderer {
 
   /**
    * Applies one simulated angle per declared movable part, relative to the
-   * node's authored rest orientation. Angles are clamped to the validated part
-   * bound as defense in depth; the simulator already enforces the same bound.
+   * node's authored orientation plus the declared rest offset. Angles are
+   * clamped to the validated part bound as defense in depth; the simulator
+   * already enforces the same bound.
    */
   setSecondaryMotionAngles(anglesRad: readonly number[]): void {
     for (const [index, motion] of this.motionNodes.entries()) {
@@ -394,10 +395,6 @@ export class MaskRenderer {
       this.motionQuaternion.setFromAxisAngle(motion.axis, angle);
       motion.node.quaternion.copy(motion.restQuaternion).multiply(this.motionQuaternion);
     }
-  }
-
-  get secondaryMotionPartCount(): number {
-    return this.motionNodes.length;
   }
 
   /**

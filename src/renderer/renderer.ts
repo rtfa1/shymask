@@ -212,7 +212,7 @@ const poseSmoother = new PoseSmoother();
 
 // Secondary motion: the pure spring simulator feeds part angles to the mask
 // renderer. The diagnostic A/B toggle keeps the effect selected and simply
-// draws the same mask with the parts at their authored rest orientation.
+// draws the same mask with the parts at their declared rest pose.
 let secondarySimulator: SecondaryMotionSimulator | null = null;
 let secondaryParametersKey = '';
 let secondaryMotionEnabled = true;
@@ -989,7 +989,7 @@ function resetPoseTrackingState(): void {
 
 /**
  * Creates (or reuses) the pure simulator for the active effect's declaration.
- * A new declaration starts from the authored rest pose; the simulator then
+ * A new declaration starts from the declared rest pose; the simulator then
  * integrates accepted tracked head samples. Returns null when the selected
  * effect declares no movable parts.
  */
@@ -1015,7 +1015,7 @@ function ensureSecondarySimulator(): SecondaryMotionSimulator | null {
 /**
  * Deliberately drops spring state. Called on effect switches, tracking
  * reacquisition, loop seams, rechecks and window teardown so the animation
- * restarts from the authored rest pose instead of injecting an impulse.
+ * restarts from the declared rest pose instead of injecting an impulse.
  */
 function resetSecondaryMotion(reason: 'explicit' | 'reacquisition' | 'loop-seam'): void {
   stopSecondarySettle();
@@ -1032,11 +1032,17 @@ function resetSecondaryMotion(reason: 'explicit' | 'reacquisition' | 'loop-seam'
   applySecondaryMotionAngles();
 }
 
-/** Applies the current simulated (or rest, for the diagnostic A/B) angles. */
+/** Applies the current simulated (or declared rest, for the diagnostic A/B) angles. */
 function applySecondaryMotionAngles(): void {
   if (!maskRenderer) return;
+  // The OFF state must draw the declared rest pose (authored orientation plus
+  // restAngleDeg), not the authored orientation at zero, so the A/B isolates
+  // the simulated offset for packages with a nonzero rest offset.
+  const restAnglesRad = (activeEffect.secondaryMotion?.parts ?? []).map(
+    (part) => (part.restAngleDeg * Math.PI) / 180,
+  );
   maskRenderer.setSecondaryMotionAngles(
-    secondaryMotionEnabled ? lastSecondaryAnglesRad : lastSecondaryAnglesRad.map(() => 0),
+    secondaryMotionEnabled ? lastSecondaryAnglesRad : restAnglesRad,
   );
 }
 
@@ -1048,10 +1054,12 @@ function applySecondaryMotionAngles(): void {
 function updateSecondaryMotion(pose: { yawDeg: number; pitchDeg: number; rollDeg: number }, nowMs: number): void {
   const simulator = ensureSecondarySimulator();
   if (!simulator) return;
-  const frame = simulator.update(
-    { yawDeg: pose.yawDeg, pitchDeg: pose.pitchDeg, rollDeg: pose.rollDeg, timeMs: nowMs },
-    nowMs,
-  );
+  const frame = simulator.update({
+    yawDeg: pose.yawDeg,
+    pitchDeg: pose.pitchDeg,
+    rollDeg: pose.rollDeg,
+    timeMs: nowMs,
+  });
   lastSecondaryFrame = frame;
   lastSecondaryAnglesRad = secondaryMotionAnglesRadians(frame.anglesDeg);
   secondaryMotionCosts = pushRolling(secondaryMotionCosts, frame.costMs);
@@ -1108,7 +1116,7 @@ function setSecondarySettleEnabled(enabled: boolean): void {
   const now = performance.now();
   // Preserve the retained angle/velocity but reset the sample clock: the hold
   // lasted longer than the simulator's normal gap reset.
-  simulator.resumeAt({ ...lastAcceptedPose, timeMs: now }, now);
+  simulator.resumeAt({ ...lastAcceptedPose, timeMs: now });
   if (secondarySettleTimer !== null) window.clearInterval(secondarySettleTimer);
   secondarySettleTimer = window.setInterval(() => {
     if (secondarySettleTimer === null || !replayFrameHeld || !lastAcceptedPose) return;

@@ -11,11 +11,7 @@
  * docs/adr/0004-declarative-effect-packages.md for the decision.
  */
 
-/**
- * Oldest schema this build still accepts. The supported list below is derived
- * from this value and the current schema version, so the constants cannot drift
- * apart.
- */
+/** Oldest schema this build still accepts. */
 export const MIN_EFFECT_PACKAGE_SCHEMA_VERSION = 1;
 
 /**
@@ -26,7 +22,11 @@ export const MIN_EFFECT_PACKAGE_SCHEMA_VERSION = 1;
  */
 export const EFFECT_PACKAGE_SCHEMA_VERSION = 3;
 
-/** Every schema version this build accepts, in ascending order. */
+/**
+ * Every schema version this build accepts, in ascending order. This literal list
+ * must stay in sync with `MIN_EFFECT_PACKAGE_SCHEMA_VERSION` and
+ * `EFFECT_PACKAGE_SCHEMA_VERSION`; the schema-version tests cover both ends.
+ */
 export const SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS = [1, 2, 3] as const;
 
 export type EffectPackageSchemaVersion = (typeof SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS)[number];
@@ -194,9 +194,10 @@ export const SECONDARY_MOTION_DRIVES = ['yaw', 'pitch', 'roll'] as const;
 export type SecondaryMotionDrive = (typeof SECONDARY_MOTION_DRIVES)[number];
 
 /**
- * Bounds for the fixed runtime spring simulation. These are contract bounds,
- * not complexity budgets. Every part is a named GLB node that rotates about one
- * local axis; the package cannot supply code, geometry or per-frame motion.
+ * Validation bounds for a package's secondary-motion declaration. These are
+ * contract bounds, not complexity budgets: every part is a named GLB node that
+ * rotates about one local axis; the package cannot supply code, geometry or
+ * per-frame motion.
  */
 export const SECONDARY_MOTION_LIMITS = {
   /** A mask may declare at most this many movable parts. */
@@ -212,18 +213,32 @@ export const SECONDARY_MOTION_LIMITS = {
   /** Dimensionless damping ratio; below 1 overshoots, 1 is critically damped. */
   minDampingRatio: 0.05,
   maxDampingRatio: 1.5,
-  /** Hard position bound per part, in degrees from the authored rest pose. */
+  /** Hard position bound per part, in degrees from the declared rest pose. */
   minMaxAngleDeg: 1,
   maxMaxAngleDeg: 60,
   /** Optional constant rest offset from the authored GLB pose, in degrees. */
   maxRestAngleDeg: 60,
+} as const;
+
+/**
+ * Fixed runtime constants for the spring simulation. They are shared by the
+ * simulator and its tests but are deliberately not package-tunable.
+ */
+export const SECONDARY_MOTION_RUNTIME = {
   /**
    * Fixed runtime sensitivity: the spring target reaches `maxAngleDeg` when the
    * tracked head rotates at this many degrees per second around `drive`.
    */
   driveFullScaleDegPerSec: 45,
-  /** Bounded simulation sub-step and the largest input gap accepted. */
-  fixedStepMs: 1000 / 120,
+  /**
+   * Largest integration sub-step. Each frame interval is split into
+   * `ceil(dtMs / maxSubStepMs)` equal sub-steps of at most this long; the
+   * split is deterministic for a given accepted-pose sequence.
+   */
+  maxSubStepMs: 1000 / 120,
+  /** Smallest accepted `dt`; shorter positive intervals are clamped up to this. */
+  minDtMs: 0.5,
+  /** Largest accepted input gap before the state deliberately resets. */
   maxGapMs: 250,
   /** A per-sample pose discontinuity beyond these resets instead of driving. */
   maxPoseDeltaDeg: 45,
@@ -232,9 +247,10 @@ export const SECONDARY_MOTION_LIMITS = {
 
 /**
  * One declarative movable mask part. `node` names a node in the package mask
- * GLB; the runtime records that node's authored orientation as the rest pose and
- * rotates it about `axis` driven by the tracked head angular velocity around
- * `drive`.
+ * GLB; the runtime records that node's authored orientation as the zero-offset
+ * base. The declared rest pose is that orientation plus `restAngleDeg`, and the
+ * simulated angle is applied about `axis` driven by the tracked head angular
+ * velocity around `drive`.
  */
 export interface SecondaryMotionPart {
   /** Node name in the mask GLB (exactly one node must match). */
@@ -249,7 +265,7 @@ export interface SecondaryMotionPart {
   damping: number;
   /** Hard bound on the applied angle in degrees, 1-60. */
   maxAngleDeg: number;
-  /** Optional constant angle offset from the authored rest pose, -60 to 60. */
+  /** Optional constant angle offset from the authored GLB orientation, -60 to 60. */
   restAngleDeg: number;
 }
 
