@@ -28,7 +28,7 @@ If `npm install` blocks install scripts (newer npm releases gate them), run
 
 | Control | Behavior |
 | --- | --- |
-| **Start** | Loads the verified replay fixture and begins real-time playback. Disabled while the fixture is missing, corrupt, or already started. |
+| **Start** | Begins real-time playback of the fixture already validated at launch. Disabled while the fixture is missing, corrupt, or playback has already started. |
 | **Pause / Resume** | Manual pause replaces the whole output with the opaque "Tracking paused" screen and freezes processing. It persists until Resume is pressed. |
 | **Color treatment** | `Warm tint`, `Cool tint`, `Monochrome`, or explicit `No effect`. Choosing `No effect` hides the output; choosing a treatment restores it automatically. |
 | **Recheck input** | Re-runs fixture size/checksum validation. Use after fetching a fixture that was missing at launch. |
@@ -51,7 +51,11 @@ either a processed replay frame or the opaque "Tracking paused" screen.
   `loopIndex × clipDuration + mediaTime`. A loop seam is a deliberate media-time reset, not a
   tracking defect. A one-frame decode gap at a seam keeps the last processed frame visible rather
   than flashing the paused screen; a decode gap longer than 250 ms is treated as a processing
-  failure and hides the output.
+  failure and hides the output. A 50 ms timer watchdog covers the case `requestVideoFrameCallback`
+  cannot report: if the decoder silently stops presenting frames for more than 250 ms while the
+  preview is started, unpaused and an effect is active, the opaque paused screen replaces the last
+  frame, and the next valid frame restores the output automatically. The watchdog is reset on Start,
+  Resume, manual pause and Recheck input.
 - **Failure policy.** The policy in `src/core/output-policy.ts` returns the opaque
   "Tracking paused" decision for startup, first-frame wait, missing/invalid fixture, no active
   effect, manual pause, and effect-processing failure. It has no raw-passthrough branch.
@@ -61,11 +65,19 @@ either a processed replay frame or the opaque "Tracking paused" screen.
 ## Checks
 
 ```powershell
-npm test        # unit tests for the output policy, loop clock and treatments (17 tests)
-npm run check   # builds, launches the real Electron app with Playwright, drives public controls,
-                # writes screenshots + timing summary under evidence/check-<timestamp>/
-npm run check:all
+npm run typecheck   # strict TypeScript across src and tests
+npm test            # unit tests for the output policy, replay clock, frame watchdog and treatments (23 tests)
+npm run check       # builds, launches the real Electron app with Playwright, drives public controls,
+                    # writes screenshots + timing summary under evidence/check-<timestamp>/
+npm run check:all   # npm test && npm run check
 ```
+
+The repository has **no CI** (there is no `.github/workflows` directory) and `main` has **no branch
+protection or rulesets** (verified read-only through the GitHub API on 2026-11-13). These local
+checks are therefore the validation gate, and they must pass at the exact head SHA being delivered.
+The check writes the timing summary, environment, workload and tested head SHA to
+`evidence/check-<timestamp>/summary.json`, and refreshes `evidence/logs/check-final.log` for the run
+it cites.
 
 The public-workflow check asserts, through the app's visible controls and diagnostics:
 
@@ -76,26 +88,44 @@ The public-workflow check asserts, through the app's visible controls and diagno
 4. `No effect` returns to the opaque paused screen, and selecting a treatment restores output.
 5. Manual pause persists, freezes processing timestamps, and Resume continues them.
 6. The replay completes at least three more loops with strictly increasing processing timestamps,
-   one reported seam per loop, and near real-time pacing.
+   near real-time pacing, and reported seams that match independent backward media-time jumps in
+   the sampled diagnostics (not the loop counter that increments alongside them).
 7. A missing fixture and a checksum-corrupt fixture each show an actionable error, hide output and
    keep Start disabled.
 8. The public capture control writes a valid 1280×720 PNG of the output canvas.
 9. No renderer console errors occur, and no physical-camera API appears in application source.
+10. A silent decode stall (media element paused directly, bypassing the manual Pause control) hides
+    the output behind the opaque paused screen after the 250 ms watchdog and recovers on the next
+    frame.
+11. Recheck after enabling the diagnostic failure toggle clears the injected failure and recovers
+    the processed preview on Start.
+12. Rechecking a second, differently corrupt fixture replaces the stale error explanation with the
+    new failure message.
 
 Artifacts are written to the gitignored `evidence/check-<timestamp>/` directory: per-state canvas
 screenshots, the full app window, captured output frames, and `summary.json` with the timing
-baseline and the tested head SHA.
+baseline, hardware, workload, measured boundaries, commands, validation-gate facts and the tested
+head SHA.
 
 ### Measured baseline (replay-based, preview-only)
 
-From a passing run on the development desktop on 2026-11-13 (source clip 3.379 s):
+From a passing `npm run check` run on 2026-11-13 at head
+`46da5873db21a44e9b524cf0f1b739b48aa8edba`, source clip 3.379 s:
+
+- **Hardware:** 11th Gen Intel Core i7-11700K (8 cores / 16 logical), NVIDIA GeForce RTX 3070 Ti,
+  31.8 GiB RAM, Windows 11 Pro 10.0.26100 (build 26100). Node.js 24.19.0, Electron 45.3.1.
+- **Workload and source mode:** recorded replay fixture `fixtures/cache/webcam-loop.webm` decoded by
+  Chromium; Electron development preview only — no physical webcam, call/stream application, or
+  virtual webcam in the path.
+- **Commands:** `npm run typecheck`, `npm test`, `npm run check`.
 
 | Measurement | Value |
 | --- | --- |
-| Source frame interval, p95 | ~42–49 ms across passing runs (the clip presents at ~21–24 Hz here; no 30 FPS forcing) |
+| Source frame interval, p95 | 47.4 ms in this run; ~42–49 ms across passing runs (the clip presents at ~21–24 Hz here; no 30 FPS forcing) |
 | Render + filter cost, p95 | 0.40 ms (main-thread draw/filter submission; compositor/GPU latency not measured) |
-| Loop cycles observed | 3 in ~9.3 s |
-| Replay pacing ratio | ~0.98–0.99 processing time / wall time |
+| Loop cycles observed | 3 seam crossings inside a 9.29 s sampling window; that window spans parts of four clip plays (~2.75 clip durations), so it is a cross-seam observation, not a throughput figure |
+| Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
+| Replay pacing ratio | 0.983 processing time / wall time in this run; ~0.98–0.99 across passing runs |
 
 Run-to-run variation is expected under desktop load; these are observations, not benchmarks. The
 numbers are replay-derived. They do **not** establish the parent spec's 720p/30 FPS / ≤100 ms

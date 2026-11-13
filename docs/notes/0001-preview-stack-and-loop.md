@@ -4,6 +4,10 @@
   virtual webcam comes from later child tickets of spec #1.
 - **Date:** 2026-11-13
 - **Head:** the commit containing this note (the check summary records the exact SHA).
+- **Validated head:** `46da5873db21a44e9b524cf0f1b739b48aa8edba` — `npm run typecheck`, `npm test`
+  and `npm run check` passed at that head. This note's commit changes documentation only; the final
+  re-validation at the documentation head is recorded in `evidence/logs/check-final.log` and the
+  matching `evidence/check-<timestamp>/summary.json`.
 - **Related decisions:** [ADR-0003](../adr/0003-conceal-the-face-on-tracking-failure.md) (paused
   output), [ADR-0004](../adr/0004-declarative-effect-packages.md) (declarative effects). No ADR is
   modified or contradicted by this note.
@@ -82,6 +86,13 @@ can briefly report `readyState < 2` for the first frame after the reset. The imp
   paused screen (which would incorrectly look like a tracking/effect failure);
 - treats a decode gap longer than 250 ms as a processing failure, hiding the output until a valid
   frame returns;
+- runs a 50 ms timer watchdog (`src/core/frame-watchdog.ts`) for the stall that
+  `requestVideoFrameCallback` cannot report: when the decoder stops presenting frames entirely, the
+  watchdog compares `performance.now()` with the last presented frame and, after 250 ms while
+  started, unpaused and an effect is active, renders the opaque paused screen. The next valid frame
+  clears the stall and restores the treatment automatically. The watchdog is armed on Start and
+  Resume and disarmed on manual pause, Recheck input and input disposal, so no stale baseline can
+  hide a healthy preview;
 - does not reinterpret the seam as a tracking discontinuity; tracking does not exist in this slice.
 
 The clip's end and start frames are not guaranteed to match, so a visible cut at the seam is
@@ -89,15 +100,34 @@ possible. That cut is a property of the recorded loop, not a tracking defect.
 
 ## Measured baseline (replay-based, preview-only)
 
-Passing run on the development desktop, 2026-11-13, source clip 3.379 s:
+Passing `npm run check` run at head `46da5873db21a44e9b524cf0f1b739b48aa8edba` on 2026-11-13,
+source clip 3.379 s.
+
+**Hardware:** 11th Gen Intel Core i7-11700K (8 cores / 16 logical), NVIDIA GeForce RTX 3070 Ti,
+31.8 GiB RAM, Windows 11 Pro 10.0.26100 (build 26100). Node.js 24.19.0, Electron 45.3.1.
+
+**Workload and source mode:** recorded replay fixture `fixtures/cache/webcam-loop.webm` decoded by
+Chromium's bundled media stack, driven through the Electron development preview only. No physical
+webcam is opened, no call or stream application runs, and no virtual webcam is published in this
+slice. The display is a 1280×720 canvas upscaled into the app window.
+
+**Exact commands:** `npm run typecheck`, `npm test`, `npm run check` (optionally `npm run check:all`).
+Results and the tested head SHA are written to `evidence/logs/` and
+`evidence/check-<timestamp>/summary.json`.
 
 | Measurement | Value |
 | --- | --- |
-| Source frame interval, p95 | ~42–49 ms across passing runs (~21–24 Hz presentation; 30 FPS is not forced) |
+| Source frame interval, p95 | 47.4 ms in this run; ~42–49 ms across passing runs (~21–24 Hz presentation; 30 FPS is not forced) |
 | Render + filter cost, p95 | 0.40 ms main-thread draw/filter submission |
-| Loops observed | 3 additional cycles in ~9.3 s |
-| Pacing ratio | ~0.98–0.99 processing time / wall time |
+| Loops observed | 3 seam crossings in a 9.29 s sampling window |
+| Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
+| Pacing ratio | 0.983 processing time / wall time in this run; ~0.98–0.99 across passing runs |
 | Output | 1280×720 canvas; PNG capture verified at that resolution |
+
+The "3 loops in ~9.3 s" shorthand needs care: it counts three **seam crossings inside a 9.29 s
+sampling window**. Because the window starts mid-play and spans parts of four clip plays
+(~2.75 clip durations), it is not a claim that three full loops finish in 9.3 s; the clip duration
+and pacing ratio above are the meaningful figures.
 
 Run-to-run variation is expected under desktop load; these are observations from passing runs, not
 benchmarks. Caveats that matter:
@@ -113,17 +143,30 @@ benchmarks. Caveats that matter:
 
 `npm run check` launches the Electron app through Playwright, uses only visible controls
 (Start, Pause/Resume, treatment select, Recheck input, Capture evidence frame, diagnostic failure
-toggle) and reads visible status/diagnostic text plus canvas screenshots. It verifies:
+toggle) and reads visible status/diagnostic text plus canvas screenshots. One deliberate failure
+injection beyond the visible controls pauses the media element directly to simulate a silent decode
+stall without setting the manual-pause state; it is marked as injection in the harness. The check
+verifies:
 
 - exact opaque "Tracking paused" output for startup, no effect, manual pause, simulated processing
-  failure, missing fixture and checksum-corrupt fixture;
+  failure, a silent decode stall, missing fixture and checksum-corrupt fixture;
 - the raw replay feed is hidden in those states (mean RGB of the output canvas is the dark paused
   screen, and no `<video>` element is created when the fixture is missing);
 - treatments visibly change output and monochrome is near-neutral;
-- multiple loop cycles with strictly increasing processing timestamps and one seam per loop;
-- near real-time pacing from timestamp-vs-wall-time sampling;
+- multiple loop cycles with strictly increasing processing timestamps and near real-time pacing,
+  where reported seams are cross-checked against independent backward media-time jumps in the
+  sampled diagnostics;
+- a silent decode stall shows the paused screen after the 250 ms watchdog and recovers on the next
+  frame;
+- Recheck after the diagnostic failure toggle clears the injected failure and recovers the
+  processed preview on Start; a second, different corrupt fixture replaces the stale explanation;
 - the public capture control produces a 1280×720 PNG;
 - no renderer console errors and no physical-camera API in application source.
+
+The repository has no CI configuration (no `.github/workflows`) and `main` has no branch protection
+or rulesets (verified read-only via the GitHub API on 2026-11-13). Local validation is therefore the
+gate, and it must pass at the exact head SHA being delivered; the check summary records the head,
+hardware, workload, measured boundaries, commands and these gate facts.
 
 Limits: RGB/mean-color assertions are coarse and not visual-quality judgments; screenshot evidence
 is from a desktop session, not a headless CI environment; the fixture is short and has limited
