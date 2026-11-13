@@ -1,14 +1,14 @@
 /**
- * Color treatments are declarative data, not executable effect code
- * (see docs/adr/0004-declarative-effect-packages.md). Each entry maps to a
- * single canvas filter string applied to the same replay frame that later
- * slices will feed from a physical camera and publish to the virtual webcam.
+ * Effects are declarative data, not executable effect code
+ * (see docs/adr/0004-declarative-effect-packages.md). A color treatment maps to
+ * a single canvas filter string; the rigid mask is a bundled procedural effect
+ * selected by id. One effect is active at a time.
  */
 
-export type EffectId = 'none' | 'warm' | 'cool' | 'mono';
+export type EffectId = 'none' | 'warm' | 'cool' | 'mono' | 'mask';
 
 export interface ColorTreatment {
-  id: Exclude<EffectId, 'none'>;
+  id: Exclude<EffectId, 'none' | 'mask'>;
   label: string;
   description: string;
   /** CSS filter expression applied while drawing the frame. */
@@ -43,14 +43,20 @@ export interface EffectOption {
 
 export const EFFECT_OPTIONS: readonly EffectOption[] = [
   { id: 'none', label: 'No effect' },
+  { id: 'mask', label: 'Rigid mask' },
   ...COLOR_TREATMENTS.map((treatment) => ({ id: treatment.id, label: treatment.label })),
 ];
 
 export function getTreatment(id: EffectId): ColorTreatment | null {
-  if (id === 'none') return null;
+  if (id === 'none' || id === 'mask') return null;
   return COLOR_TREATMENTS.find((treatment) => treatment.id === id) ?? null;
 }
 
 export function getEffectLabel(id: EffectId): string {
   return EFFECT_OPTIONS.find((option) => option.id === id)?.label ?? id;
+}
+
+/** True for the bundled rigid-mask effect (no color filter, needs a pose). */
+export function isMaskEffect(id: EffectId): boolean {
+  return id === 'mask';
 }

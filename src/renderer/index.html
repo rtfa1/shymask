@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src data:; media-src 'self' file:;"
+      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src data:; media-src 'self'; connect-src 'self';"
     />
     <title>Shymask - development preview</title>
     <link rel="stylesheet" href="./styles.css" />
@@ -15,7 +15,7 @@
         <h1>Shymask</h1>
         <p class="tagline">Development preview &middot; recorded replay input</p>
       </div>
-      <p class="build-tag">Preview / color-treatment spike</p>
+      <p class="build-tag">Preview / face tracking / rigid mask</p>
     </header>
 
     <main class="layout">
@@ -24,9 +24,9 @@
           <canvas id="output" width="1280" height="720" data-testid="output-canvas"></canvas>
         </div>
         <p class="preview-note">
-          This canvas is the complete output. Every processed frame and the exact "Tracking paused"
-          screen are also published as <strong>Shymask Camera</strong> when the Windows virtual
-          camera is available.
+          This canvas is the complete output. Every processed frame, the rigid mask composite and the
+          exact "Tracking paused" screen are also published as <strong>Shymask Camera</strong> when the
+          Windows virtual camera is available.
         </p>
       </section>
 
@@ -45,8 +45,12 @@
             <button id="pause-toggle" data-testid="pause-toggle" type="button" disabled>Pause</button>
           </div>
           <label class="field" for="effect-select">
-            <span>Color treatment</span>
+            <span>Effect</span>
             <select id="effect-select" data-testid="effect-select"></select>
+          </label>
+          <label class="field" for="tracking-injection">
+            <span>Tracking state (diagnostic)</span>
+            <select id="tracking-injection" data-testid="tracking-injection" disabled></select>
           </label>
           <div class="button-row secondary">
             <button id="recheck" data-testid="recheck" type="button">Recheck input</button>
@@ -61,7 +65,7 @@
 
         <section class="panel vcam-panel" id="vcam-panel" data-state="starting" aria-live="polite">
           <h2>Virtual camera</h2>
-          <p class="status-title" id="vcam-state" data-testid="vcam-state">Starting…</p>
+          <p class="status-title" id="vcam-state" data-testid="vcam-state">Starting&hellip;</p>
           <p class="status-detail" id="vcam-detail" data-testid="vcam-detail"></p>
           <p class="status-action" id="vcam-action" data-testid="vcam-action"></p>
           <div class="button-row secondary">
@@ -75,6 +79,13 @@
             <div><dt>Input</dt><dd id="diag-input"></dd></div>
             <div><dt>Output</dt><dd id="diag-output"></dd></div>
             <div><dt>Fixture</dt><dd id="diag-fixture"></dd></div>
+            <div><dt>Model</dt><dd id="diag-model"></dd></div>
+            <div><dt>Tracking</dt><dd id="diag-tracking"></dd></div>
+            <div><dt>Tracker inference</dt><dd id="diag-tracking-timing"></dd></div>
+            <div><dt>Tracked face</dt><dd id="diag-face"></dd></div>
+            <div><dt>Mask</dt><dd id="diag-mask"></dd></div>
+            <div><dt>Mask probe</dt><dd id="diag-mask-probe"></dd></div>
+            <div><dt>Mask probe colour</dt><dd id="diag-mask-color"></dd></div>
             <div><dt>Loops</dt><dd id="diag-loop"></dd></div>
             <div><dt>Processing timestamp</dt><dd id="diag-timestamp"></dd></div>
             <div><dt>Frame interval</dt><dd id="diag-frame-delta"></dd></div>
@@ -87,8 +98,10 @@
     </main>
 
     <footer class="app-footer">
-      Replay-based preview. The same output canvas is published as Shymask Camera when the Windows
-      virtual camera is available; no physical webcam is opened in this slice.
+      Replay-based preview. One tracked face; tracking loss, multiple faces and unavailable tracking all
+      replace the whole output with the opaque paused screen. The same output canvas is published as
+      Shymask Camera when the Windows virtual camera is available; no physical webcam is opened in this
+      slice.
     </footer>
 
     <script src="./renderer.js"></script>

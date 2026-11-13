@@ -25,6 +25,18 @@ The importable collection of assets and declared behaviors that defines one comp
 **Face anchoring**:
 The attachment of an effect's elements to the tracked position and orientation of a person's face.
 
+**Face tracking**:
+The estimation of the position and orientation of a person's face in the video input.
+
+**Tracking readiness**:
+The state before the face tracker has reported one reliable face. The paused output is shown until tracking is ready.
+
+**Tracking loss**:
+The state where no reliable single face is available: no face, an unreliable face pose, or more than one face. The paused output is shown until exactly one face returns and tracking is healthy.
+
+**Rigid mask**:
+A mask whose elements move together as one rigid body attached to the tracked face, without deformation or secondary motion.
+
 **Occlusion**:
 The hiding of an effect's elements where another surface, such as the person's face, should appear in front of them.
 

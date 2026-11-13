@@ -1,14 +1,53 @@
-import type { FixtureInfo, VirtualCameraStatus } from '../core/bridge';
+import type { FixtureInfo, TrackerInfo, VirtualCameraStatus } from '../core/bridge';
 import { DECODE_STALL_THRESHOLD_MS, FrameWatchdog } from '../core/frame-watchdog';
-import { PAUSED_TITLE, resolveOutput, type OutputDecision, type PreviewState } from '../core/output-policy';
+import {
+  PAUSED_TITLE,
+  resolveOutput,
+  type OutputDecision,
+  type PreviewState,
+} from '../core/output-policy';
 import { PreviewPipeline, type FrameStats } from '../core/pipeline';
 import { ReplayTimeline, type ReplayFrameTimestamp } from '../core/replay-clock';
-import { EFFECT_OPTIONS, getTreatment, type EffectId } from '../core/treatments';
+import { EFFECT_OPTIONS, getEffectLabel, getTreatment, isMaskEffect, type EffectId } from '../core/treatments';
+import {
+  initialTrackingSnapshot,
+  TrackingStateMachine,
+  TRACKING_LIMITS,
+  type TrackingSample,
+} from '../core/tracking';
+import { FaceTracker, type DetectedTracking } from './face-tracker';
+import { MaskRenderer, type MaskProjection } from './mask-renderer';
 
 const SIMULATED_FAILURE_MESSAGE =
   'Effect processing is failing (simulated by the diagnostic control). The output is hidden.';
 const DECODE_STALL_MESSAGE = `The replay frame could not be decoded for more than ${DECODE_STALL_THRESHOLD_MS} ms. Output is hidden while the decoder recovers.`;
+const TRACKER_ACTION =
+  'Run `npm run fetch:tracker`, then `npm run build`, and restart Shymask. The output stays hidden; there is no camera fallback.';
 const WATCHDOG_POLL_MS = 50;
+
+/** Diagnostic tracking-state injection. `auto` uses the real detector. */
+type TrackingInjection = 'auto' | 'lost' | 'multiple' | 'unreliable';
+
+const INJECTION_OPTIONS: ReadonlyArray<{ id: TrackingInjection; label: string }> = [
+  { id: 'auto', label: 'Use detected face (normal)' },
+  { id: 'lost', label: 'Inject tracking lost (diagnostic)' },
+  { id: 'multiple', label: 'Inject multiple faces (diagnostic)' },
+  { id: 'unreliable', label: 'Inject unreliable tracking (diagnostic)' },
+];
+
+const EMPTY_MASK_PROJECTION: MaskProjection = {
+  visible: false,
+  originX: 0,
+  originY: 0,
+  centerX: 0,
+  centerY: 0,
+  widthPx: 0,
+  heightPx: 0,
+  pose: null,
+  probeX: 0,
+  probeY: 0,
+  probeColor: null,
+};
 
 function mustGet<T extends HTMLElement>(id: string): T {
   const element = document.getElementById(id);
@@ -20,6 +59,7 @@ const canvas = mustGet<HTMLCanvasElement>('output');
 const startButton = mustGet<HTMLButtonElement>('start');
 const pauseButton = mustGet<HTMLButtonElement>('pause-toggle');
 const effectSelect = mustGet<HTMLSelectElement>('effect-select');
+const injectionSelect = mustGet<HTMLSelectElement>('tracking-injection');
 const recheckButton = mustGet<HTMLButtonElement>('recheck');
 const captureButton = mustGet<HTMLButtonElement>('capture');
 const failureToggle = mustGet<HTMLInputElement>('simulate-failure');
@@ -37,15 +77,23 @@ const vcamRestart = mustGet<HTMLButtonElement>('vcam-restart');
 const pipeline = new PreviewPipeline(canvas);
 const timeline = new ReplayTimeline();
 const watchdog = new FrameWatchdog();
+const tracking = new TrackingStateMachine();
 
 const state: PreviewState = {
   fixture: { state: 'checking', metadata: null },
+  tracker: {
+    state: 'checking',
+    metadata: null,
+    message: 'Checking the face-tracker model and runtime…',
+    action: 'Output returns automatically when the face tracker is ready.',
+  },
   started: false,
   ready: false,
   manualPaused: false,
   effect: 'warm',
   processingHealthy: true,
   processingError: null,
+  tracking: initialTrackingSnapshot(),
 };
 
 let video: HTMLVideoElement | null = null;
@@ -64,17 +112,33 @@ let publishedFrames = 0;
 let latestVirtualCamera: VirtualCameraStatus | null = null;
 let cameraClients = 0;
 
+// Face tracking.
+let faceTracker: FaceTracker | null = null;
+let maskRenderer: MaskRenderer | null = null;
+let trackerPreparing = false;
+let trackerReady = false;
+let trackingInjection: TrackingInjection = 'auto';
+let lastDetection: DetectedTracking | null = null;
+let lastMaskProjection: MaskProjection = EMPTY_MASK_PROJECTION;
+let maskRenderCostMs = 0;
+let detectionErrors = 0;
+let detectionTimings: number[] = [];
+let detectedFrames = 0;
+let warmupInferenceMs = 0;
+let persistentTrackerError: string | null = null;
+
 // The virtual camera and the preview receive the exact same frames. 30 Hz is
 // the camera workload; the replay itself presents at ~21-24 Hz here.
 const CAMERA_FRAME_MIN_INTERVAL_MS = 1000 / 30;
 
 // The app always paints the exact paused output first; no frame is ever shown
-// before the replay fixture has been validated and started.
+// before the replay fixture and tracker have been validated and started.
 pipeline.renderPausedScreen(PAUSED_TITLE);
 publishOutputFrame();
 statusTitle.textContent = PAUSED_TITLE;
 
 buildEffectOptions();
+buildInjectionOptions();
 bindControls();
 updateStaticDiagnostics();
 void refreshVirtualCamera();
@@ -98,6 +162,7 @@ async function bootstrap(): Promise<void> {
   }
   try {
     const info = await window.shymask.getStartupInfo();
+    applyTrackerInfo(info.tracker);
     applyFixture(info.fixture);
   } catch (error) {
     fail(`Startup fixture check failed: ${(error as Error).message}`);
@@ -114,6 +179,16 @@ function buildEffectOptions(): void {
   effectSelect.value = state.effect;
 }
 
+function buildInjectionOptions(): void {
+  for (const option of INJECTION_OPTIONS) {
+    const element = document.createElement('option');
+    element.value = option.id;
+    element.textContent = option.label;
+    injectionSelect.appendChild(element);
+  }
+  injectionSelect.value = trackingInjection;
+}
+
 function bindControls(): void {
   startButton.addEventListener('click', () => {
     void startPreview();
@@ -123,6 +198,22 @@ function bindControls(): void {
     const value = effectSelect.value;
     const match = EFFECT_OPTIONS.find((option) => option.id === value);
     state.effect = (match?.id ?? 'none') as EffectId;
+    renderNow();
+  });
+  injectionSelect.addEventListener('change', () => {
+    const value = injectionSelect.value;
+    const match = INJECTION_OPTIONS.find((option) => option.id === value);
+    trackingInjection = (match?.id ?? 'auto') as TrackingInjection;
+    // Apply the requested state immediately so the public control is
+    // observable without waiting for another replay frame.
+    const now = performance.now();
+    if (trackingInjection !== 'auto') {
+      state.tracking = tracking.update(injectedSample(trackingInjection), now, true);
+    } else {
+      // Real detection becomes authoritative again on the next replay frame;
+      // the normal recovery window keeps the output hidden until then.
+      state.tracking = tracking.snapshot(now);
+    }
     renderNow();
   });
   recheckButton.addEventListener('click', () => {
@@ -150,6 +241,44 @@ function bindControls(): void {
         vcamRestart.disabled = false;
       });
   });
+}
+
+function applyTrackerInfo(info: TrackerInfo): void {
+  state.tracker = info;
+  if (info.state === 'ready') {
+    void initializeTracker(info);
+  } else {
+    trackerReady = false;
+    renderNow();
+  }
+}
+
+async function initializeTracker(info: TrackerInfo): Promise<void> {
+  if (trackerPreparing) return;
+  trackerPreparing = true;
+  try {
+    faceTracker = await FaceTracker.create(info);
+    maskRenderer = new MaskRenderer(pipeline.width, pipeline.height);
+    trackerReady = true;
+    tracking.reset(performance.now());
+    state.tracking = tracking.snapshot(performance.now());
+    state.tracker = info;
+    renderNow();
+    updateStaticDiagnostics();
+  } catch (error) {
+    trackerReady = false;
+    faceTracker = null;
+    maskRenderer = null;
+    state.tracker = {
+      state: 'error',
+      metadata: info.metadata,
+      message: `The face tracker could not start: ${(error as Error).message}`,
+      action: `${TRACKER_ACTION} If the problem persists, the machine may not support WebGL2.`,
+    };
+    renderNow();
+  } finally {
+    trackerPreparing = false;
+  }
 }
 
 async function refreshVirtualCamera(): Promise<void> {
@@ -234,6 +363,14 @@ function publishOutputFrame(): void {
 function updateStaticDiagnostics(): void {
   setDiag('diag-input', 'replay fixture (no physical camera is opened)');
   setDiag('diag-output', `canvas ${pipeline.width}x${pipeline.height} (single output frame path)`);
+  if (state.tracker.metadata) {
+    setDiag(
+      'diag-model',
+      `${state.tracker.metadata.id} sha256=${state.tracker.metadata.sha256.slice(0, 12)}… license=${state.tracker.metadata.license} state=${state.tracker.state}`,
+    );
+  } else {
+    setDiag('diag-model', `state=${state.tracker.state}`);
+  }
 }
 
 function applyFixture(fixture: FixtureInfo): void {
@@ -249,6 +386,17 @@ function applyFixture(fixture: FixtureInfo): void {
   failureToggle.checked = false;
   state.processingHealthy = true;
   state.processingError = null;
+  trackingInjection = 'auto';
+  injectionSelect.value = 'auto';
+  tracking.reset(performance.now());
+  state.tracking = tracking.snapshot(performance.now());
+  lastDetection = null;
+  lastMaskProjection = EMPTY_MASK_PROJECTION;
+  detectionErrors = 0;
+  detectionTimings = [];
+  detectedFrames = 0;
+  warmupInferenceMs = 0;
+  persistentTrackerError = null;
   timeline.reset();
   latestTimestamp = null;
   latestStats = null;
@@ -289,7 +437,7 @@ function prepareVideo(fixture: FixtureInfo): void {
         ...fixture,
         state: 'invalid',
         message: `Decoded replay duration ${element.duration.toFixed(2)}s does not match the documented ${expected.toFixed(2)}s.`,
-        action: 'Delete the cached clip and run `npm run fetch:fixture`, then press Recheck input.',
+        action: 'Delete the cached clip and re-run the documented fetch command, then press Recheck input.',
       };
       disposeVideo();
       renderNow();
@@ -321,7 +469,7 @@ function disposeVideo(): void {
 }
 
 async function startPreview(): Promise<void> {
-  if (!video || state.fixture.state !== 'ready') {
+  if (!video || state.fixture.state !== 'ready' || !trackerReady) {
     renderNow();
     return;
   }
@@ -330,6 +478,14 @@ async function startPreview(): Promise<void> {
   state.manualPaused = false;
   state.processingHealthy = !failureSimulated;
   state.processingError = failureSimulated ? SIMULATED_FAILURE_MESSAGE : null;
+  tracking.reset(performance.now());
+  state.tracking = tracking.snapshot(performance.now());
+  lastMaskProjection = EMPTY_MASK_PROJECTION;
+  detectionErrors = 0;
+  detectionTimings = [];
+  detectedFrames = 0;
+  warmupInferenceMs = 0;
+  persistentTrackerError = null;
   timeline.reset();
   frameIntervals = [];
   renderCosts = [];
@@ -386,36 +542,67 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
     state.ready = false;
     state.processingError = `Processing timestamps stopped increasing (${timestamp.invalidReason ?? 'invalid timestamp'}). Output is hidden to avoid showing untimed frames.`;
   } else if (!failureSimulated) {
-    state.processingHealthy = true;
-    state.processingError = null;
-    if (!state.ready) state.ready = true;
+    // A persistent tracker failure must not be cleared by the next frame's
+    // timestamp check; only a successful inference does that.
+    if (persistentTrackerError === null) {
+      state.processingHealthy = true;
+      state.processingError = null;
+    }
+    if (!state.ready && persistentTrackerError === null) state.ready = true;
   }
 
+  updateTracking(element, now);
   const decision = resolveOutput(state);
-  const treatment = getTreatment(state.effect);
+
   if (decision.mode === 'render') {
-    if (treatment && element.readyState >= 2) {
-      undrawableSinceMs = null;
-      const stats = pipeline.renderProcessedFrame(element, treatment);
-      publishOutputFrame();
-      latestStats = stats;
-      renderCosts = pushRolling(renderCosts, stats.renderCostMs);
-      applyDecision(decision);
-      maybeUpdateDiagnostics(now);
-      return;
+    if (isMaskEffect(state.effect)) {
+      if (maskRenderer && lastMaskProjection.visible && element.readyState >= 2) {
+        undrawableSinceMs = null;
+        maskRenderCostMs = maskRenderer.render();
+        const stats = pipeline.renderProcessedFrame(element, null, maskRenderer.canvas);
+        publishOutputFrame();
+        latestStats = stats;
+        renderCosts = pushRolling(renderCosts, stats.renderCostMs + maskRenderCostMs);
+        applyDecision(decision);
+        maybeUpdateDiagnostics(now);
+        return;
+      }
+      // Tracking says the mask is ready but the pose is not drawable yet. Show
+      // the paused screen rather than the raw frame; the next frame resolves it.
+      undrawableSinceMs ??= now;
+      if (now - undrawableSinceMs <= 250) {
+        applyDecision(decision);
+        maybeUpdateDiagnostics(now);
+        return;
+      }
+      state.processingHealthy = false;
+      state.ready = false;
+      state.processingError = 'The face pose was not drawable for more than 250 ms. Output is hidden.';
+    } else {
+      const treatment = getTreatment(state.effect);
+      if (treatment && element.readyState >= 2) {
+        undrawableSinceMs = null;
+        const stats = pipeline.renderProcessedFrame(element, treatment, null);
+        publishOutputFrame();
+        latestStats = stats;
+        renderCosts = pushRolling(renderCosts, stats.renderCostMs);
+        applyDecision(decision);
+        maybeUpdateDiagnostics(now);
+        return;
+      }
+      // Chromium can report readyState < 2 for a single presented frame at a
+      // loop seam. Keep the last processed frame instead of flashing the paused
+      // screen; a prolonged decode gap is a genuine processing failure.
+      undrawableSinceMs ??= now;
+      if (now - undrawableSinceMs <= 250) {
+        applyDecision(decision);
+        maybeUpdateDiagnostics(now);
+        return;
+      }
+      state.processingHealthy = false;
+      state.ready = false;
+      state.processingError = DECODE_STALL_MESSAGE;
     }
-    // Chromium can report readyState < 2 for a single presented frame at a
-    // loop seam. Keep the last processed frame instead of flashing the paused
-    // screen; a prolonged decode gap is a genuine processing failure.
-    undrawableSinceMs ??= now;
-    if (now - undrawableSinceMs <= 250) {
-      applyDecision(decision);
-      maybeUpdateDiagnostics(now);
-      return;
-    }
-    state.processingHealthy = false;
-    state.ready = false;
-    state.processingError = DECODE_STALL_MESSAGE;
   }
 
   const pausedDecision = resolveOutput(state);
@@ -425,6 +612,92 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
   renderCosts = pushRolling(renderCosts, stats.renderCostMs);
   applyDecision(pausedDecision);
   maybeUpdateDiagnostics(now);
+}
+
+/**
+ * Runs one tracker sample for the current frame (or the diagnostic injection)
+ * and updates the portable tracking state machine. The real detector is always
+ * authoritative when the injection control is on `auto`; injection is clearly
+ * labelled in the diagnostics and evidence.
+ */
+function updateTracking(element: HTMLVideoElement, nowMs: number): void {
+  if (!state.started || state.manualPaused || state.tracker.state !== 'ready' || !trackerReady) {
+    state.tracking = tracking.snapshot(nowMs);
+    return;
+  }
+
+  let sample: TrackingSample;
+  if (trackingInjection !== 'auto') {
+    sample = injectedSample(trackingInjection);
+    state.tracking = tracking.update(sample, nowMs, true);
+    return;
+  }
+
+  if (!faceTracker) {
+    state.tracking = tracking.snapshot(nowMs);
+    return;
+  }
+  try {
+    const startedAt = performance.now();
+    const detected = faceTracker.detect(element, Math.max(1, Math.round(startedAt)));
+    const inferenceMs = performance.now() - startedAt;
+    if (detectedFrames === 0) {
+      // The first inference pays WASM/GPU warm-up (about 2 s here); keep it out
+      // of the steady-state p95 so timing evidence is not misleading.
+      warmupInferenceMs = inferenceMs;
+    } else {
+      detectionTimings = pushRolling(detectionTimings, inferenceMs);
+    }
+    detectedFrames += 1;
+    detectionErrors = 0;
+    if (persistentTrackerError !== null) {
+      persistentTrackerError = null;
+      if (!failureSimulated) {
+        state.processingHealthy = true;
+        state.processingError = null;
+      }
+    }
+    lastDetection = detected;
+    sample = detected;
+    if (detected.matrix && maskRenderer) {
+      lastMaskProjection = maskRenderer.setPose(detected.matrix);
+    }
+    state.tracking = tracking.update(sample, nowMs, false);
+  } catch (error) {
+    detectionErrors += 1;
+    const message = (error as Error).message;
+    if (detectionErrors >= TRACKING_LIMITS.maxConsecutiveInferenceErrors) {
+      persistentTrackerError = `Face tracking failed repeatedly (${message}). The output is hidden while tracking is unavailable.`;
+      state.processingHealthy = false;
+      state.processingError = persistentTrackerError;
+      state.ready = false;
+    }
+    sample = {
+      faceCount: 1,
+      landmarkCount: 0,
+      hasTransform: false,
+      faceWidthRatio: 0,
+      pose: null,
+    };
+    state.tracking = tracking.update(sample, nowMs, false);
+  }
+}
+
+function injectedSample(injection: Exclude<TrackingInjection, 'auto'>): TrackingSample {
+  switch (injection) {
+    case 'lost':
+      return { faceCount: 0, landmarkCount: 0, hasTransform: false, faceWidthRatio: 0, pose: null };
+    case 'multiple':
+      return {
+        faceCount: 2,
+        landmarkCount: 478,
+        hasTransform: true,
+        faceWidthRatio: 0.2,
+        pose: { yawDeg: 0, pitchDeg: 0, rollDeg: 0, tx: 0, ty: 0, tz: -56 },
+      };
+    case 'unreliable':
+      return { faceCount: 1, landmarkCount: 120, hasTransform: false, faceWidthRatio: 0.2, pose: null };
+  }
 }
 
 /**
@@ -448,12 +721,28 @@ function checkDecodeStall(): void {
 }
 
 function renderNow(): void {
+  const now = performance.now();
+  state.tracking = tracking.snapshot(now);
   const decision = resolveOutput(state);
   const treatment = getTreatment(state.effect);
-  if (decision.mode === 'render' && treatment && video && video.readyState >= 2) {
-    undrawableSinceMs = null;
-    latestStats = pipeline.renderProcessedFrame(video, treatment);
-    publishOutputFrame();
+
+  if (decision.mode === 'render' && video && video.readyState >= 2) {
+    if (isMaskEffect(state.effect)) {
+      if (maskRenderer && lastMaskProjection.visible) {
+        undrawableSinceMs = null;
+        maskRenderCostMs = maskRenderer.render();
+        latestStats = pipeline.renderProcessedFrame(video, null, maskRenderer.canvas);
+        renderCosts = pushRolling(renderCosts, latestStats.renderCostMs + maskRenderCostMs);
+        publishOutputFrame();
+      }
+      // Without a drawable pose the previous output stays until the next frame;
+      // the paused screen is never replaced by the raw frame.
+    } else if (treatment) {
+      undrawableSinceMs = null;
+      latestStats = pipeline.renderProcessedFrame(video, treatment, null);
+      renderCosts = pushRolling(renderCosts, latestStats.renderCostMs);
+      publishOutputFrame();
+    }
   } else if (decision.mode === 'paused') {
     latestStats = pipeline.renderPausedScreen(PAUSED_TITLE);
     publishOutputFrame();
@@ -461,7 +750,7 @@ function renderNow(): void {
   // In render mode without a drawable frame, leave the previous processed
   // frame visible rather than substituting the paused screen for one frame.
   applyDecision(decision);
-  updateDiagnostics(performance.now());
+  updateDiagnostics(now);
 }
 
 function applyDecision(decision: OutputDecision): void {
@@ -533,11 +822,12 @@ async function captureEvidence(): Promise<void> {
 
 function updateControls(): void {
   const fixtureReady = state.fixture.state === 'ready' && video !== null;
-  startButton.disabled = !fixtureReady || state.started;
+  startButton.disabled = !fixtureReady || state.started || !trackerReady;
   pauseButton.disabled = !state.started;
   pauseButton.textContent = state.manualPaused ? 'Resume' : 'Pause';
   captureButton.disabled = captureInFlight;
   effectSelect.disabled = false;
+  injectionSelect.disabled = !trackerReady;
   recheckButton.disabled = false;
 }
 
@@ -547,7 +837,7 @@ function maybeUpdateDiagnostics(now: number): void {
   updateDiagnostics(now);
 }
 
-function updateDiagnostics(_now: number): void {
+function updateDiagnostics(now: number): void {
   setDiag('diag-loop', `loops=${timeline.loops} seams=${timeline.seams}`);
   if (latestTimestamp) {
     setDiag(
@@ -569,13 +859,74 @@ function updateDiagnostics(_now: number): void {
     setDiag('diag-render-cost', 'lastMs=0.00 p95Ms=0.00');
   }
 
+  updateTrackingDiagnostics();
+  if (latestStats) setDiag('diag-mask-probe', formatMaskProbe());
+
   if (currentDecision) {
     setDiag(
       'diag-output',
-      `mode=${currentDecision.mode} reason=${currentDecision.reason} canvas=${pipeline.width}x${pipeline.height} treatment=${state.effect}`,
+      `mode=${currentDecision.mode} reason=${currentDecision.reason} canvas=${pipeline.width}x${pipeline.height} effect=${state.effect}`,
     );
   }
   updateVirtualCameraDiagnostics();
+  // Tracker readiness and fixture changes arrive asynchronously; keep the
+  // Start/Pause/effect controls in sync with the latest state every tick.
+  updateControls();
+}
+
+function updateTrackingDiagnostics(): void {
+  const snapshot = state.tracking;
+  setDiag(
+    'diag-tracking',
+    `phase=${snapshot.phase} faces=${snapshot.faceCount} landmarks=${snapshot.landmarkCount} transform=${snapshot.hasTransform} injected=${snapshot.injected} source=${snapshot.injected ? trackingInjection : 'detector'} sinceGoodMs=${snapshot.sinceGoodMs === null ? 'none' : Math.round(snapshot.sinceGoodMs)} graceMs=${TRACKING_LIMITS.lostGraceMs} recoveryMs=${TRACKING_LIMITS.recoveryConfirmMs} detectionConfidence=${TRACKING_LIMITS.minFaceDetectionConfidence} presenceConfidence=${TRACKING_LIMITS.minFacePresenceConfidence} trackingConfidence=${TRACKING_LIMITS.minTrackingConfidence}`,
+  );
+  const lastInference = detectionTimings.length > 0 ? detectionTimings[detectionTimings.length - 1] ?? 0 : 0;
+  setDiag(
+    'diag-tracking-timing',
+    `lastMs=${lastInference.toFixed(2)} p95Ms=${percentile95(detectionTimings).toFixed(2)} warmupMs=${warmupInferenceMs.toFixed(1)} frames=${detectedFrames} errors=${detectionErrors}`,
+  );
+  const face = lastDetection;
+  if (face?.faceBbox) {
+    const bbox = face.faceBbox;
+    setDiag(
+      'diag-face',
+      `count=${face.faceCount} landmarks=${face.landmarkCount} x=${Math.round(bbox.x * pipeline.width)} y=${Math.round(bbox.y * pipeline.height)} w=${Math.round(bbox.width * pipeline.width)} h=${Math.round(bbox.height * pipeline.height)}`,
+    );
+  } else {
+    setDiag('diag-face', 'count=0 landmarks=0');
+  }
+
+  const projection = lastMaskProjection;
+  if (projection.visible && projection.pose) {
+    setDiag(
+      'diag-mask',
+      `visible=true originX=${Math.round(projection.originX)} originY=${Math.round(projection.originY)} centerX=${Math.round(projection.centerX)} centerY=${Math.round(projection.centerY)} widthPx=${Math.round(projection.widthPx)} heightPx=${Math.round(projection.heightPx)} yaw=${projection.pose.yawDeg.toFixed(1)} pitch=${projection.pose.pitchDeg.toFixed(1)} roll=${projection.pose.rollDeg.toFixed(1)} tx=${projection.pose.tx.toFixed(1)} ty=${projection.pose.ty.toFixed(1)} tz=${projection.pose.tz.toFixed(1)} probeX=${Math.round(projection.probeX)} probeY=${Math.round(projection.probeY)} renderMs=${maskRenderCostMs.toFixed(2)}`,
+    );
+    setDiag(
+      'diag-mask-color',
+      projection.probeColor
+        ? `r=${projection.probeColor.r} g=${projection.probeColor.g} b=${projection.probeColor.b}`
+        : 'r=0 g=0 b=0',
+    );
+  } else {
+    setDiag('diag-mask', 'visible=false');
+    setDiag('diag-mask-color', 'r=0 g=0 b=0');
+  }
+  if (state.tracker.metadata) {
+    setDiag(
+      'diag-model',
+      `${state.tracker.metadata.id} sha256=${state.tracker.metadata.sha256.slice(0, 12)}… license=${state.tracker.metadata.license} state=${state.tracker.state}`,
+    );
+  }
+}
+
+/** Output-canvas pixel at the mask's eye probe, for public evidence checks. */
+function formatMaskProbe(): string {
+  if (!lastMaskProjection.visible) return 'r=0 g=0 b=0 x=0 y=0';
+  const pixel = pipeline.readPixel(lastMaskProjection.probeX, lastMaskProjection.probeY);
+  return pixel
+    ? `r=${pixel.r} g=${pixel.g} b=${pixel.b} x=${Math.round(lastMaskProjection.probeX)} y=${Math.round(lastMaskProjection.probeY)}`
+    : 'r=0 g=0 b=0 x=0 y=0';
 }
 
 function pushRolling(values: number[], value: number): number[] {

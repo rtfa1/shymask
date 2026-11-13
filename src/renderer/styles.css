@@ -196,6 +196,7 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  margin-bottom: 12px;
   font-size: 13px;
   color: var(--muted);
 }

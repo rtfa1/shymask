@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env node
+#!/usr/bin/env node
 /**
  * Public-workflow check for the Shymask development preview.
  *
@@ -28,7 +28,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { arch, cpus, platform, release, totalmem, version as osVersion } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -261,6 +261,13 @@ async function normalFixtureScenario() {
       const text = await readDiagnostic(page, 'diag-fixture');
       return text.includes(metadata.id) ? text : null;
     });
+    // The face-tracker assets are loaded and validated asynchronously at launch;
+    // Start stays disabled until the tracker is ready.
+    await waitFor('face tracker ready', async () => {
+      const model = parseKeyValues(await readDiagnostic(page, 'diag-model'));
+      if (model.state !== 'ready') return null;
+      return (await page.locator('[data-testid="start"]').isDisabled()) ? null : true;
+    }, 60000);
     const startup = await readStatus(page);
     assert.equal(startup.title, 'Tracking paused');
     assert.equal(startup.mode, 'paused');
@@ -703,12 +710,11 @@ function paeth(left, up, upLeft) {
 }
 
 /**
- * Decodes the saved camera PNG and returns its mean RGB. Assertions use the
- * pixels that are actually on disk, not the consumer's in-memory statistics, so
- * a wrong PNG (for example a pre-connection native fallback) cannot satisfy a
- * processed-state check.
+ * Decodes a saved PNG into top-down RGB pixels. Assertions use the pixels that
+ * are actually on disk, not the consumer's in-memory statistics, so a wrong PNG
+ * (for example a pre-connection native fallback) cannot satisfy a state check.
  */
-function pngMeanRgb(file) {
+function decodePng(file) {
   const bytes = readFileSync(file);
   assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', 'camera frame must be a PNG');
   let offset = 8;
@@ -760,6 +766,11 @@ function pngMeanRgb(file) {
       rowOut[x] = value & 0xff;
     }
   }
+  return { width, height, channels, stride, pixels };
+}
+
+function pngMeanRgb(file) {
+  const { width, height, channels, stride, pixels } = decodePng(file);
   let red = 0;
   let green = 0;
   let blue = 0;
@@ -778,6 +789,33 @@ function pngMeanRgb(file) {
     g: Math.round(green / count),
     b: Math.round(blue / count),
   };
+}
+
+function pngPixel(file, x, y) {
+  const { width, height, channels, stride, pixels } = decodePng(file);
+  const px = Math.max(0, Math.min(width - 1, Math.round(x)));
+  const py = Math.max(0, Math.min(height - 1, Math.round(y)));
+  const index = py * stride + px * channels;
+  return { r: pixels[index], g: pixels[index + 1], b: pixels[index + 2] };
+}
+
+/** Counts pixels close to a target colour; used to prove the mask is in a camera PNG. */
+function pngColorCount(file, target, tolerance = 20) {
+  const { height, width, channels, stride, pixels } = decodePng(file);
+  let count = 0;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * stride + x * channels;
+      if (
+        Math.abs(pixels[index] - target.r) <= tolerance &&
+        Math.abs(pixels[index + 1] - target.g) <= tolerance &&
+        Math.abs(pixels[index + 2] - target.b) <= tolerance
+      ) {
+        count += 1;
+      }
+    }
+  }
+  return count;
 }
 
 function pngSize(file) {
@@ -1213,6 +1251,550 @@ async function missingFixtureCameraScenario() {
   return evidence;
 }
 
+const MASK_EYE_RGB = { r: 103, g: 232, b: 249 };
+/** Window with the largest recorded pose swing in fixtures/pose-loop.json. */
+const MOTION_WINDOW_START_SECONDS = 41.6;
+
+async function waitForTrackingPhase(page, phase = 'tracking', timeoutMs = 30000) {
+  return waitFor(
+    `tracking phase ${phase}`,
+    async () => {
+      const values = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
+      return values.phase === phase ? values : null;
+    },
+    timeoutMs,
+    100,
+  );
+}
+
+async function waitForTrackerModelReady(page, timeoutMs = 60000) {
+  return waitFor(
+    'face tracker model ready',
+    async () => {
+      const model = parseKeyValues(await readDiagnostic(page, 'diag-model'));
+      return model.state === 'ready' ? model : null;
+    },
+    timeoutMs,
+    100,
+  );
+}
+
+async function readMask(page) {
+  return parseKeyValues(await readDiagnostic(page, 'diag-mask'));
+}
+
+async function readFace(page) {
+  return parseKeyValues(await readDiagnostic(page, 'diag-face'));
+}
+
+async function readMaskProbe(page) {
+  return parseKeyValues(await readDiagnostic(page, 'diag-mask-probe'));
+}
+
+function maskEyeColourMatches(values, tolerance = 12) {
+  return (
+    Math.abs(Number(values.r) - MASK_EYE_RGB.r) <= tolerance &&
+    Math.abs(Number(values.g) - MASK_EYE_RGB.g) <= tolerance &&
+    Math.abs(Number(values.b) - MASK_EYE_RGB.b) <= tolerance
+  );
+}
+
+/**
+ * The mask's cyan eye plate is an opaque, exact-colour probe: if the mask is not
+ * composited into the output, the pixel is video content instead.
+ */
+function assertMaskProbe(probe, label) {
+  assert.ok(
+    maskEyeColourMatches(probe),
+    `${label}: output pixel at the mask eye probe must be the mask colour ${JSON.stringify(MASK_EYE_RGB)}, got ${JSON.stringify(probe)}`,
+  );
+}
+
+function originInsideFace(mask, face, marginFraction = 0.35) {
+  const x = Number(face.x);
+  const y = Number(face.y);
+  const width = Number(face.w);
+  const height = Number(face.h);
+  const marginX = width * marginFraction;
+  const marginY = height * marginFraction;
+  const originX = Number(mask.originX);
+  const originY = Number(mask.originY);
+  return (
+    originX >= x - marginX &&
+    originX <= x + width + marginX &&
+    originY >= y - marginY &&
+    originY <= y + height + marginY
+  );
+}
+
+function spread(values) {
+  return values.length === 0 ? 0 : Math.max(...values) - Math.min(...values);
+}
+
+function verifyFixtureManifest(manifestFileName) {
+  const manifest = JSON.parse(readFileSync(path.join(root, 'fixtures', manifestFileName), 'utf8'));
+  const file = path.join(root, 'fixtures', 'cache', manifest.fileName);
+  if (!existsSync(file)) {
+    throw new Error(`Fixture ${manifest.id} is missing at ${file}. Run \`npm run fetch:motion-fixture\`.`);
+  }
+  const bytes = readFileSync(file);
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  assert.equal(bytes.length, manifest.bytes, `${manifest.id} bytes must match its manifest`);
+  assert.equal(sha256, manifest.sha256, `${manifest.id} must match its committed checksum`);
+  return manifest;
+}
+
+async function trackingMaskScenario() {
+  log('\n== Scenario F: one-face tracking, rigid mask and tracking-loss policy ==');
+  const evidence = { states: {}, maskMotion: {}, camera: {}, timing: {} };
+  const { app, page, consoleErrors } = await launchApp({ SHYMASK_EVIDENCE_DIR: evidenceDir });
+  try {
+    await waitFor('fixture diagnostics', async () => {
+      const text = await readDiagnostic(page, 'diag-fixture');
+      return text.includes(metadata.id) ? text : null;
+    });
+    const model = await waitForTrackerModelReady(page);
+    await waitFor('start enabled after tracker initialization', async () => {
+      return (await page.locator('[data-testid="start"]').isDisabled()) ? null : true;
+    }, 60000);
+    const startup = await readStatus(page);
+    assert.equal(startup.title, 'Tracking paused');
+    assert.match(startup.explanation, /has not started/i);
+    pass('Face tracker assets are validated before Start and startup stays paused', `${model.state} ${model.sha256}`);
+
+    await page.locator('[data-testid="start"]').click();
+    const tracked = await waitForTrackingPhase(page);
+    assert.equal(Number(tracked.faces), 1);
+    assert.ok(Number(tracked.landmarks) >= 400, `tracked face must expose landmarks, got ${tracked.landmarks}`);
+    assert.equal(tracked.transform, 'true');
+    assert.equal(tracked.injected, 'false');
+    const face = await readFace(page);
+    assert.equal(Number(face.count), 1);
+    assert.ok(Number(face.w) > 40, `tracked face must be measurable, got ${JSON.stringify(face)}`);
+    evidence.states.trackingReady = { tracking: tracked, face };
+    pass(
+      'Recorded replay produces exactly one reliably tracked face through the normal pipeline',
+      `faces=${tracked.faces} landmarks=${tracked.landmarks} bbox=${face.w}x${face.h}`,
+    );
+
+    await page.locator('[data-testid="effect-select"]').selectOption('mask');
+    await waitForStatusTitle(page, /Effect active: Rigid mask/);
+    const mask = await waitFor('mask projection', async () => {
+      const values = await readMask(page);
+      return values.visible === 'true' ? values : null;
+    });
+    const faceForMask = await readFace(page);
+    assert.ok(originInsideFace(mask, faceForMask), `mask origin must sit on the tracked face: mask=${JSON.stringify(mask)} face=${JSON.stringify(faceForMask)}`);
+    assert.ok(
+      Number(mask.widthPx) > Number(faceForMask.w) * 0.35 && Number(mask.widthPx) < Number(faceForMask.w) * 2,
+      `mask must be sized to the face: maskWidth=${mask.widthPx} faceWidth=${faceForMask.w}`,
+    );
+    const probe = await readMaskProbe(page);
+    assertMaskProbe(probe, 'preview mask');
+    const maskRgb = await readRgb(page);
+    const maskShot = await screenshotCanvas(page, '12-mask-render.png');
+    evidence.states.mask = { mask, face: faceForMask, probe, preview: maskRgb, screenshot: maskShot };
+    pass(
+      'Rigid mask is attached to the tracked face and composited into the output canvas',
+      `origin=(${mask.originX},${mask.originY}) size=${mask.widthPx}x${mask.heightPx} probe=${JSON.stringify(probe)} ${maskShot}`,
+    );
+
+    // Real recorded motion on the default clip is small; sample it to prove the
+    // mask follows the face rather than being a fixed overlay.
+    const samples = [];
+    for (let index = 0; index < 7; index += 1) {
+      await page.waitForTimeout(350);
+      const tracking = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
+      if (tracking.phase !== 'tracking') continue;
+      const current = await readMask(page);
+      const currentFace = await readFace(page);
+      samples.push({
+        originX: Number(current.originX),
+        originY: Number(current.originY),
+        yaw: Number(current.yaw),
+        pitch: Number(current.pitch),
+        face,
+        currentFace,
+        inside: originInsideFace(current, currentFace),
+      });
+    }
+    assert.ok(samples.length >= 5, `expected tracked mask samples, got ${samples.length}`);
+    assert.ok(samples.every((sample) => sample.inside), 'the mask must stay on the face in every tracked sample');
+    const originXSpread = spread(samples.map((sample) => sample.originX));
+    const originYSpread = spread(samples.map((sample) => sample.originY));
+    const yawSpread = spread(samples.map((sample) => sample.yaw));
+    const pitchSpread = spread(samples.map((sample) => sample.pitch));
+    assert.ok(Math.max(originXSpread, originYSpread) >= 2, `mask placement must move with recorded head motion, got x=${originXSpread} y=${originYSpread}`);
+    assert.ok(Math.max(yawSpread, pitchSpread) >= 0.5, `mask orientation must follow the recorded pose, got yaw=${yawSpread} pitch=${pitchSpread}`);
+    evidence.maskMotion.defaultClip = { samples: samples.length, originXSpread, originYSpread, yawSpread, pitchSpread };
+    pass(
+      'Mask position and orientation follow the recorded head motion frame by frame',
+      `origin spread x=${originXSpread} y=${originYSpread} yaw=${yawSpread.toFixed(1)} pitch=${pitchSpread.toFixed(1)}`,
+    );
+
+    // Camera: the same canvas, including the mask, reaches the independent consumer.
+    const cameraPreview = await readRgb(page);
+    const cameraProbe = await readMaskProbe(page);
+    const maskRun = await captureCameraState(page, 'mask', 6);
+    assertProcessedFrames(maskRun.frames, cameraPreview, 'mask');
+    const maskPng = assertProcessedPng(maskRun.frames, cameraPreview, 'mask');
+    const eyePixels = pngColorCount(maskPng.png, MASK_EYE_RGB, 24);
+    assert.ok(eyePixels > 100, `camera PNG must contain the mask eye plate, found ${eyePixels} matching pixels`);
+    const cameraPixel = pngPixel(maskPng.png, Number(cameraProbe.x), Number(cameraProbe.y));
+    assert.ok(
+      maskEyeColourMatches(cameraPixel, 24),
+      `camera PNG pixel at the mask probe must be the mask colour, got ${JSON.stringify(cameraPixel)} at (${cameraProbe.x},${cameraProbe.y})`,
+    );
+    evidence.camera.mask = {
+      preview: cameraPreview,
+      probe: cameraProbe,
+      camera: averageFrameRgb(maskRun.frames),
+      rng: maskPng.rgb,
+      eyePixels,
+      cameraPixel,
+      png: maskPng.png,
+    };
+    pass(
+      'The virtual camera consumer receives the same masked output as the preview',
+      `camera=${JSON.stringify(evidence.camera.mask.camera)} eyePixels=${eyePixels} probePixel=${JSON.stringify(cameraPixel)} ${maskPng.png}`,
+    );
+
+    // Tracking loss: the whole output becomes the exact opaque paused screen in
+    // both paths, and recovery is automatic when the injected loss clears.
+    await page.locator('[data-testid="tracking-injection"]').selectOption('lost');
+    const lost = await waitFor('tracking lost pause', async () => {
+      const status = await readStatus(page);
+      return /tracking was lost/i.test(status.explanation) ? status : null;
+    });
+    assert.equal(lost.mode, 'paused');
+    assert.equal(lost.title, 'Tracking paused');
+    await page.waitForTimeout(300);
+    const lostRgb = await readRgb(page);
+    assert.ok(rgbSum(lostRgb) < 120, `tracking-loss output must be the dark paused screen, got ${JSON.stringify(lostRgb)}`);
+    const lostShot = await screenshotCanvas(page, '13-tracking-lost-paused.png');
+    const lostRun = await captureCameraState(page, 'tracking-lost', 6);
+    assertAllPausedFrames(lostRun.frames, 'tracking lost');
+    const lostPng = assertPausedPng(lostRun.frames, 'tracking lost');
+    evidence.states.trackingLost = { status: lost, preview: lostRgb, camera: averageFrameRgb(lostRun.frames), png: lostPng.png, screenshot: lostShot };
+    pass(
+      'Tracking loss replaces the whole output with the opaque paused screen in preview and camera',
+      `preview=${JSON.stringify(lostRgb)} camera=${JSON.stringify(evidence.states.trackingLost.camera)} ${lostShot}`,
+    );
+
+    // Multiple faces.
+    await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
+    await waitForStatusTitle(page, /Effect active: Rigid mask/);
+    await page.locator('[data-testid="tracking-injection"]').selectOption('multiple');
+    const multiple = await waitFor('multiple faces pause', async () => {
+      const status = await readStatus(page);
+      return /more than one face/i.test(status.explanation) ? status : null;
+    });
+    assert.equal(multiple.mode, 'paused');
+    await page.waitForTimeout(300);
+    const multipleRgb = await readRgb(page);
+    assert.ok(rgbSum(multipleRgb) < 120, 'multiple-face output must be dark');
+    const multipleShot = await screenshotCanvas(page, '14-multiple-faces-paused.png');
+    const multipleRun = await captureCameraState(page, 'multiple-faces', 6);
+    assertAllPausedFrames(multipleRun.frames, 'multiple faces');
+    const multiplePng = assertPausedPng(multipleRun.frames, 'multiple faces');
+    evidence.states.multipleFaces = { status: multiple, preview: multipleRgb, camera: averageFrameRgb(multipleRun.frames), png: multiplePng.png, screenshot: multipleShot };
+    pass(
+      'More than one detected face pauses the whole output in preview and camera',
+      `preview=${JSON.stringify(multipleRgb)} camera=${JSON.stringify(evidence.states.multipleFaces.camera)} ${multipleShot}`,
+    );
+
+    // Unreliable tracking.
+    await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
+    await waitForTrackingPhase(page);
+    await page.locator('[data-testid="tracking-injection"]').selectOption('unreliable');
+    const unreliable = await waitFor('unreliable tracking pause', async () => {
+      const status = await readStatus(page);
+      return /unreliable/i.test(status.explanation) ? status : null;
+    });
+    assert.equal(unreliable.mode, 'paused');
+    await page.waitForTimeout(300);
+    const unreliableRgb = await readRgb(page);
+    assert.ok(rgbSum(unreliableRgb) < 120, 'unreliable-tracking output must be dark');
+    const unreliableShot = await screenshotCanvas(page, '15-unreliable-tracking-paused.png');
+    const unreliableRun = await captureCameraState(page, 'unreliable', 6);
+    assertAllPausedFrames(unreliableRun.frames, 'unreliable tracking');
+    const unreliablePng = assertPausedPng(unreliableRun.frames, 'unreliable tracking');
+    evidence.states.unreliable = { status: unreliable, preview: unreliableRgb, camera: averageFrameRgb(unreliableRun.frames), png: unreliablePng.png, screenshot: unreliableShot };
+    pass(
+      'Unreliable tracking pauses the whole output in preview and camera',
+      `preview=${JSON.stringify(unreliableRgb)} camera=${JSON.stringify(evidence.states.unreliable.camera)} ${unreliableShot}`,
+    );
+
+    // Automatic recovery to the selected effect.
+    await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
+    await waitForStatusTitle(page, /Effect active: Rigid mask/);
+    const recovered = await readStatus(page);
+    const recoveredMask = await readMask(page);
+    assert.equal(recoveredMask.visible, 'true');
+    evidence.states.recovered = { status: recovered, mask: recoveredMask };
+    pass('The selected mask is restored automatically when one face and healthy processing return', `${recovered.title} ${JSON.stringify(recoveredMask.visible)}`);
+
+    // Manual pause must win over automatic tracking recovery.
+    await page.locator('[data-testid="pause-toggle"]').click();
+    const manualPause = await waitForStatusTitle(page, /^Tracking paused$/);
+    assert.match(manualPause.explanation, /paused manually/i);
+    await page.locator('[data-testid="tracking-injection"]').selectOption('lost');
+    await page.waitForTimeout(400);
+    await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
+    await page.waitForTimeout(1500);
+    const stillPaused = await readStatus(page);
+    assert.equal(stillPaused.title, 'Tracking paused');
+    assert.match(stillPaused.explanation, /paused manually/i);
+    assert.equal(await page.locator('[data-testid="pause-toggle"]').textContent(), 'Resume');
+    const manualShot = await screenshotCanvas(page, '16-manual-pause-precedence.png');
+    await page.locator('[data-testid="pause-toggle"]').click();
+    await waitForStatusTitle(page, /Effect active: Rigid mask/);
+    pass('Automatic tracking recovery does not override manual pause', `${manualShot} ${stillPaused.explanation}`);
+
+    // AC4: tracking readiness/loss gates every selected effect, not just the mask.
+    await page.locator('[data-testid="effect-select"]').selectOption('warm');
+    await waitForStatusTitle(page, /Effect active: Warm tint/);
+    await page.locator('[data-testid="tracking-injection"]').selectOption('lost');
+    const warmLost = await waitFor('color treatment tracking pause', async () => {
+      const status = await readStatus(page);
+      return /tracking was lost/i.test(status.explanation) ? status : null;
+    });
+    assert.equal(warmLost.mode, 'paused');
+    const warmLostShot = await screenshotCanvas(page, '17-color-treatment-tracking-lost.png');
+    await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
+    await waitForStatusTitle(page, /Effect active: Warm tint/);
+    evidence.states.colorTreatmentTrackingLoss = { paused: warmLost, screenshot: warmLostShot };
+    pass(
+      'Tracking loss pauses the existing color treatment too, and recovery restores it',
+      `${warmLostShot} -> ${await readDiagnostic(page, 'diag-output')}`,
+    );
+
+    const trackingTiming = parseKeyValues(await readDiagnostic(page, 'diag-tracking-timing'));
+    const renderCost = parseKeyValues(await readDiagnostic(page, 'diag-render-cost'));
+    evidence.timing = {
+      inferenceLastMs: Number(trackingTiming.lastMs ?? 0),
+      inferenceP95Ms: Number(trackingTiming.p95Ms ?? 0),
+      inferenceWarmupMs: Number(trackingTiming.warmupMs ?? 0),
+      inferenceFrames: Number(trackingTiming.frames ?? 0),
+      renderCostP95Ms: Number(renderCost.p95Ms ?? 0),
+    };
+    pass(
+      'Replay-based tracking and render timing baseline recorded',
+      `inference p95=${evidence.timing.inferenceP95Ms}ms (warmup=${evidence.timing.inferenceWarmupMs}ms) render p95=${evidence.timing.renderCostP95Ms}ms`,
+    );
+
+    assert.equal(await page.evaluate(() => document.querySelectorAll('video').length > 0), true);
+    assert.deepEqual(consoleErrors, [], `renderer console errors: ${consoleErrors.join(' | ')}`);
+    pass('No renderer console errors during the tracking and mask scenario');
+  } finally {
+    await closeApp(app);
+  }
+  return evidence;
+}
+
+async function recordedMotionScenario() {
+  log('\n== Scenario G: recorded head turns, nods and leaning (larger-motion CC0 clip) ==');
+  const motionMetadata = verifyFixtureManifest('pose-loop.json');
+  const evidence = { states: {}, motion: {}, timing: {} };
+  const { app, page, consoleErrors } = await launchApp({
+    SHYMASK_EVIDENCE_DIR: evidenceDir,
+    SHYMASK_FIXTURE_MANIFEST: 'pose-loop.json',
+  });
+  try {
+    await waitFor('motion fixture diagnostics', async () => {
+      const text = await readDiagnostic(page, 'diag-fixture');
+      return text.includes(motionMetadata.id) ? text : null;
+    });
+    await waitForTrackerModelReady(page);
+    await page.locator('[data-testid="start"]').click();
+    await waitForTrackingPhase(page);
+    await page.locator('[data-testid="effect-select"]').selectOption('mask');
+    await waitForStatusTitle(page, /Effect active: Rigid mask/);
+
+    // Controlled scenario: seek to the documented 8 s window with the largest
+    // observed pose swing in this recorded clip. The input is still the same
+    // recorded video and the normal processing pipeline.
+    await page.evaluate((startSeconds) => {
+      const video = document.querySelector('video');
+      if (!video) throw new Error('expected a replay video element');
+      video.currentTime = startSeconds;
+    }, MOTION_WINDOW_START_SECONDS);
+    await waitFor(
+      'motion window media time',
+      async () => {
+        const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+        return Number(timestamp.mediaMs ?? 0) >= MOTION_WINDOW_START_SECONDS * 1000 ? timestamp : null;
+      },
+      15000,
+      100,
+    );
+
+    const samples = [];
+    const sampleShots = [];
+    for (let index = 0; index < 18; index += 1) {
+      await page.waitForTimeout(400);
+      const tracking = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
+      if (tracking.phase !== 'tracking') continue;
+      const mask = await readMask(page);
+      const face = await readFace(page);
+      if (mask.visible !== 'true') continue;
+      samples.push({
+        yaw: Number(mask.yaw),
+        pitch: Number(mask.pitch),
+        roll: Number(mask.roll),
+        originX: Number(mask.originX),
+        originY: Number(mask.originY),
+        face,
+        inside: originInsideFace(mask, face),
+        mediaMs: Number(parseKeyValues(await readDiagnostic(page, 'diag-timestamp')).mediaMs ?? 0),
+      });
+      if (index === 3 || index === 9 || index === 15) {
+        const shot = await screenshotCanvas(page, `18-motion-mask-${index}.png`);
+        sampleShots.push(shot);
+      }
+    }
+    assert.ok(samples.length >= 14, `expected most motion-window frames tracked, got ${samples.length}/18`);
+    assert.ok(samples.every((sample) => sample.inside), 'the mask must stay attached to the face during turns and nods');
+    const yawRange = spread(samples.map((sample) => sample.yaw));
+    const pitchRange = spread(samples.map((sample) => sample.pitch));
+    const rollRange = spread(samples.map((sample) => sample.roll));
+    const originXRange = spread(samples.map((sample) => sample.originX));
+    const originYRange = spread(samples.map((sample) => sample.originY));
+    assert.ok(yawRange >= 12, `recorded turns must rotate the mask, yaw range=${yawRange}`);
+    assert.ok(pitchRange >= 12, `recorded nods must rotate the mask, pitch range=${pitchRange}`);
+    assert.ok(rollRange >= 4, `recorded leaning must roll the mask, roll range=${rollRange}`);
+    assert.ok(
+      Math.max(originXRange, originYRange) >= 40,
+      `recorded motion must move the mask origin, x=${originXRange} y=${originYRange}`,
+    );
+    const motionProbe = await readMaskProbe(page);
+    assertMaskProbe(motionProbe, 'motion-window preview mask');
+    evidence.motion = {
+      fixture: motionMetadata.id,
+      windowStartSeconds: MOTION_WINDOW_START_SECONDS,
+      trackedSamples: samples.length,
+      yawRange,
+      pitchRange,
+      rollRange,
+      originXRange,
+      originYRange,
+      previewProbe: motionProbe,
+      screenshots: sampleShots,
+    };
+    pass(
+      'The mask follows recorded head turns, nods and leaning through the normal pipeline',
+      `tracked=${samples.length}/18 yaw=${yawRange.toFixed(1)} pitch=${pitchRange.toFixed(1)} roll=${rollRange.toFixed(1)} origin=${originXRange}x${originYRange}px`,
+    );
+    pass('Masked motion-window screenshots captured at three points in the turn', sampleShots.join(' '));
+
+    const cameraPreview = await readRgb(page);
+    const cameraRun = await captureCameraState(page, 'motion-mask', 6);
+    assertProcessedFrames(cameraRun.frames, cameraPreview, 'motion mask');
+    const cameraPng = assertProcessedPng(cameraRun.frames, cameraPreview, 'motion mask');
+    const eyePixels = pngColorCount(cameraPng.png, MASK_EYE_RGB, 24);
+    assert.ok(eyePixels > 60, `motion camera PNG must contain the mask, found ${eyePixels} eye pixels`);
+    evidence.camera = {
+      preview: cameraPreview,
+      camera: averageFrameRgb(cameraRun.frames),
+      eyePixels,
+      png: cameraPng.png,
+    };
+    pass(
+      'The camera consumer receives the masked head-turn output as well',
+      `camera=${JSON.stringify(evidence.camera.camera)} eyePixels=${eyePixels} ${cameraPng.png}`,
+    );
+
+    const trackingTiming = parseKeyValues(await readDiagnostic(page, 'diag-tracking-timing'));
+    evidence.timing = {
+      inferenceP95Ms: Number(trackingTiming.p95Ms ?? 0),
+      inferenceWarmupMs: Number(trackingTiming.warmupMs ?? 0),
+      inferenceFrames: Number(trackingTiming.frames ?? 0),
+    };
+    assert.deepEqual(consoleErrors, [], `renderer console errors: ${consoleErrors.join(' | ')}`);
+    pass('No renderer console errors during the recorded-motion scenario');
+  } finally {
+    await closeApp(app);
+  }
+  return evidence;
+}
+
+async function trackerModelScenario() {
+  log('\n== Scenario H: missing and corrupt face-tracker model ==');
+  const evidence = { missing: {}, corrupt: {} };
+  const missingDir = path.join(evidenceDir, 'missing-tracker');
+  mkdirSync(missingDir, { recursive: true });
+  {
+    const { app, page, consoleErrors } = await launchApp({
+      SHYMASK_EVIDENCE_DIR: evidenceDir,
+      SHYMASK_TRACKER_DIR: missingDir,
+    });
+    try {
+      const status = await waitForStatusTitle(page, /^Tracking paused$/);
+      assert.match(status.explanation, /face-tracker model is missing/i);
+      assert.match(status.action, /fetch:tracker/);
+      assert.equal(await page.locator('[data-testid="start"]').isDisabled(), true);
+      await page.waitForTimeout(300);
+      const rgb = await readRgb(page);
+      assert.ok(rgbSum(rgb) < 120, `missing tracker model must hide the output, got ${JSON.stringify(rgb)}`);
+      const shot = await screenshotCanvas(page, '19-missing-tracker-model.png');
+      await waitForVirtualCamera(page);
+      const run = await captureCameraState(page, 'missing-tracker', 6);
+      assertAllPausedFrames(run.frames, 'missing tracker model');
+      const png = assertPausedPng(run.frames, 'missing tracker model');
+      evidence.missing = { status, preview: rgb, camera: averageFrameRgb(run.frames), png: png.png, screenshot: shot };
+      pass(
+        'A missing tracker model shows an actionable error and the hidden output in preview and camera',
+        `${JSON.stringify(rgb)} ${png.png}`,
+      );
+      assert.deepEqual(consoleErrors, [], `renderer console errors: ${consoleErrors.join(' | ')}`);
+    } finally {
+      await closeApp(app);
+    }
+  }
+
+  {
+    const modelMetadata = JSON.parse(readFileSync(path.join(root, 'tracker', 'face-landmarker-model.json'), 'utf8'));
+    const corruptDir = path.join(evidenceDir, 'corrupt-tracker');
+    mkdirSync(corruptDir, { recursive: true });
+    const builtTrackerDir = path.join(root, 'dist', 'renderer', 'tracker');
+    for (const fileName of [
+      'vision_wasm_internal.js',
+      'vision_wasm_internal.wasm',
+      'vision_wasm_nosimd_internal.js',
+      'vision_wasm_nosimd_internal.wasm',
+    ]) {
+      copyFileSync(path.join(builtTrackerDir, fileName), path.join(corruptDir, fileName));
+    }
+    // Same byte length, wrong bytes: exercises the checksum branch rather than
+    // the size branch.
+    writeFileSync(path.join(corruptDir, modelMetadata.fileName), Buffer.alloc(modelMetadata.bytes, 0));
+
+    const { app, page, consoleErrors } = await launchApp({
+      SHYMASK_EVIDENCE_DIR: evidenceDir,
+      SHYMASK_TRACKER_DIR: corruptDir,
+    });
+    try {
+      const status = await waitForStatusTitle(page, /^Tracking paused$/);
+      assert.match(status.explanation, /checksum mismatch/i);
+      assert.match(status.action, /fetch:tracker/);
+      assert.equal(await page.locator('[data-testid="start"]').isDisabled(), true);
+      await page.waitForTimeout(300);
+      const rgb = await readRgb(page);
+      assert.ok(rgbSum(rgb) < 120, `corrupt tracker model must hide the output, got ${JSON.stringify(rgb)}`);
+      const shot = await screenshotCanvas(page, '20-corrupt-tracker-model.png');
+      evidence.corrupt = { status, preview: rgb, screenshot: shot };
+      pass(
+        'A corrupt tracker model (checksum mismatch) shows an actionable error and hidden output',
+        `${JSON.stringify(rgb)} ${shot}`,
+      );
+      assert.deepEqual(consoleErrors, [], `renderer console errors: ${consoleErrors.join(' | ')}`);
+    } finally {
+      await closeApp(app);
+    }
+  }
+  return evidence;
+}
+
 function staticCameraGuard() {
   log('\n== Camera-safety source guard ==');
   const sourceFiles = [];
@@ -1295,6 +1877,11 @@ async function main() {
   await invalidFixtureScenario();
   const virtualCamera = await virtualCameraScenario();
   const missingFixtureCamera = await missingFixtureCameraScenario();
+  const trackingMask = await trackingMaskScenario();
+  const recordedMotion = await recordedMotionScenario();
+  const trackerModel = await trackerModelScenario();
+  const trackerMetadata = JSON.parse(readFileSync(path.join(root, 'tracker', 'face-landmarker-model.json'), 'utf8'));
+  const motionManifest = JSON.parse(readFileSync(path.join(root, 'fixtures', 'pose-loop.json'), 'utf8'));
 
   const summary = {
     generatedAt: new Date().toISOString(),
@@ -1314,6 +1901,13 @@ async function main() {
         durationSeconds: metadata.durationSeconds,
         resolution: `${metadata.width}x${metadata.height}`,
       },
+      motionFixture: {
+        id: motionManifest.id,
+        fileName: motionManifest.fileName,
+        durationSeconds: motionManifest.durationSeconds,
+        resolution: `${motionManifest.width}x${motionManifest.height}`,
+        windowStartSeconds: MOTION_WINDOW_START_SECONDS,
+      },
     },
     measuredBoundaries: [
       'Processing timestamps, loops and seams are read from the app diagnostics; loop seams are also counted independently from backward media-time jumps in the samples.',
@@ -1323,6 +1917,9 @@ async function main() {
       'Camera frames are read by a separate Media Foundation consumer process; camera latency is the consumer receive time minus the canvas capture wall-clock time carried in the sample attribute.',
       'The camera path adds the app canvas readback, an IPC copy, a loopback TCP hop, RGB32 conversion and the native media source; each is inside the measured latency, but no camera sensor or call application is involved.',
       'No physical-camera behavior, real Zoom/Meet/OBS compatibility, laptop or integrated-graphics suitability is measured.',
+      'Tracker inference cost is performance.now() around one MediaPipe detectForVideo call; the first warm-up inference is reported separately and excluded from the p95.',
+      'Mask placement/orientation is derived from the MediaPipe facial transformation matrix using its documented 63 degree vertical-FOV camera assumption; it is a rigid attachment, not occlusion-aware.',
+      'Tracking-loss, multiple-face and unreliable-tracking policy states in Scenario F are produced by the labelled diagnostic injection control; the real detector path is used for the normal tracking and recorded-motion states. The recorded-motion clip is real recorded video from a second CC0 fixture, positioned by seeking to a documented window.',
     ],
     commands: {
       build: 'npm run build',
@@ -1350,6 +1947,34 @@ async function main() {
       durationSeconds: metadata.durationSeconds,
       sourcePage: metadata.sourcePage,
     },
+    tracking: {
+      engine:
+        'MediaPipe Face Landmarker via @mediapipe/tasks-vision 0.10.21 (WASM, GPU delegate) in the renderer; Three.js 0.180.0 rigid mask composited into the single output canvas',
+      model: {
+        id: trackerMetadata.id,
+        version: trackerMetadata.version,
+        sourceUrl: trackerMetadata.sourceUrl,
+        license: trackerMetadata.license,
+        sha256: trackerMetadata.sha256,
+        bytes: trackerMetadata.bytes,
+      },
+      mask:
+        'bundled procedural low-poly helmet/visor attached to the face facial transformation matrix; MediaPipe 63 degree vertical FOV camera; occlusion refinement is a later issue',
+      thresholds: {
+        minFaceDetectionConfidence: 0.5,
+        minFacePresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5,
+        lostGraceMs: 250,
+        unreliableConfirmMs: 250,
+        recoveryConfirmMs: 300,
+        maxConsecutiveInferenceErrors: 5,
+      },
+      evidence: {
+        defaultClip: trackingMask,
+        recordedMotion,
+        trackerModel,
+      },
+    },
     timing: {
       ...timing,
       basis: 'replay-derived preview and replay-to-camera measurements at this head; not the 720p/30 FPS / 100 ms camera-to-output target',
@@ -1364,12 +1989,14 @@ async function main() {
     },
     results,
     limitations: [
-      'Replay fixture only; no physical webcam was opened and no human participated.',
+      'Replay fixtures only; no physical webcam was opened and no human participated.',
       'Virtual camera evidence is from a separate Media Foundation consumer harness, not a call or stream application; Zoom/Meet/OBS compatibility is a later slice.',
       'Camera latency is measured against canvas capture time in the same process tree; camera-sensor and call-network delay are out of scope.',
-      'Face tracking and secondary motion do not exist yet, so no tracking-failure path is exercised beyond the effect-processing failure injection.',
-      'Measured on this development desktop; laptop integrated-graphics behavior is unverified.',
-      'Color treatments use canvas CSS filters in this spike; a later tracking/effect slice may replace the implementation.',
+      'Tracking is demonstrated on recorded video (the default clip and a second larger-motion CC0 clip); there is no physical-camera or live-human tracking evidence in this slice.',
+      'Tracking loss, multiple faces and unreliable tracking are exercised through a labelled diagnostic injection; the detected-face path is authoritative when the control is on normal. The policy cannot detect every possible tracking or rendering defect.',
+      'The rigid mask has no occlusion refinement and no secondary motion; those are later issues. The mask is composited as one procedural low-poly effect.',
+      'Measured on this development desktop with a discrete GPU; laptop integrated-graphics behavior is unverified.',
+      'Color treatments use canvas CSS filters in this spike; a later effect-package slice may replace the implementation.',
       'No CI or branch protection exists; these local checks are the validation gate.',
     ],
   };
@@ -1385,6 +2012,15 @@ async function main() {
   log(`camera frame interval p95:   ${virtualCamera.timing.intervalP95Ms}ms`);
   log(`replay-to-camera latency:    p50=${virtualCamera.timing.latencyP50Ms}ms p95=${virtualCamera.timing.latencyP95Ms}ms`);
   log(`camera mean-RGB spread:      ${virtualCamera.timing.meanRgbSpread} (replay content changes across loops)`);
+  log('\n== Tracking baseline (replay-based) ==');
+  log(`tracker:                     ${trackingMask.states.trackingReady?.tracking?.faces ?? '?'} face, ${trackingMask.states.trackingReady?.tracking?.landmarks ?? '?'} landmarks`);
+  log(`tracker inference p95:       ${trackingMask.timing.inferenceP95Ms}ms (warm-up ${trackingMask.timing.inferenceWarmupMs}ms, ${trackingMask.timing.inferenceFrames} frames)`);
+  log(`mask render + composite p95: ${trackingMask.timing.renderCostP95Ms}ms`);
+  log(`default-clip mask motion:    origin x=${trackingMask.maskMotion.defaultClip?.originXSpread}px y=${trackingMask.maskMotion.defaultClip?.originYSpread}px yaw=${trackingMask.maskMotion.defaultClip?.yawSpread?.toFixed?.(1) ?? '?'} pitch=${trackingMask.maskMotion.defaultClip?.pitchSpread?.toFixed?.(1) ?? '?'}`);
+  log(`recorded turns/nods window:  ${MOTION_WINDOW_START_SECONDS}s of ${motionManifest.id}: yaw=${recordedMotion.motion.yawRange.toFixed(1)} pitch=${recordedMotion.motion.pitchRange.toFixed(1)} roll=${recordedMotion.motion.rollRange.toFixed(1)} origin=${recordedMotion.motion.originXRange}x${recordedMotion.motion.originYRange}px (${recordedMotion.motion.trackedSamples}/18 tracked)`);
+  log(`tracker model:               ${trackerMetadata.id} sha256=${trackerMetadata.sha256.slice(0, 12)}…`);
+  log('These numbers are replay-derived. They do not establish physical-camera tracking, laptop suitability,');
+  log('or the 720p/30 FPS / 100 ms target, and the policy cannot detect every possible visual defect.');
   log('These numbers are replay-derived with a virtual camera, not a physical camera. They do not establish');
   log('the 720p/30 FPS / 100 ms camera-to-output target, call-application compatibility, or laptop suitability.');
   log(`tested head SHA:             ${headSha}`);

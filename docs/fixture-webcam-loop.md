@@ -78,6 +78,11 @@ Known coverage gaps, relevant to later tracking and effect slices:
 Later slices that need those situations should add separate fixtures (or controlled live capture)
 rather than treating this clip as general motion coverage.
 
+Issue #4 added exactly that second fixture for tracking: [`pose-loop-v1`](fixture-pose-loop.md), a
+CC0 Wikitongues clip with real head turns, nods and leaning. `webcam-loop-v1` remains the app's
+default input and the source of the expression/small-motion coverage; the larger-motion clip is used
+only by the public-workflow check through `SHYMASK_FIXTURE_MANIFEST=pose-loop.json`.
+
 ## Verification
 
 ```powershell

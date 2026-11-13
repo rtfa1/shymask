@@ -34,8 +34,45 @@ export interface FixtureInfo {
   action?: string;
 }
 
+/** Committed metadata for the checksum-pinned Face Landmarker model. */
+export interface TrackerMetadata {
+  /** Stable identifier for the exact model revision. */
+  id: string;
+  /** Human-readable model version, for diagnostics and docs. */
+  version: string;
+  fileName: string;
+  sourceUrl: string;
+  license: string;
+  licenseUrl: string;
+  attribution: string;
+  sha256: string;
+  bytes: number;
+  notes: string;
+}
+
+export type TrackerState = 'checking' | 'ready' | 'missing' | 'invalid' | 'error';
+
+/**
+ * Face-tracker asset state. The renderer loads the WASM fileset and model from
+ * the app's local asset protocol; a missing or corrupt model hides the output
+ * with an actionable explanation and never falls back to a camera.
+ */
+export interface TrackerInfo {
+  state: TrackerState;
+  metadata: TrackerMetadata | null;
+  /** `shymask://app/tracker/vision_wasm_*` base URL passed to FilesetResolver. */
+  wasmBaseUrl?: string;
+  /** `shymask://app/tracker/face_landmarker.task` model URL. */
+  modelUrl?: string;
+  /** Human-readable explanation, always present when state is not ready. */
+  message?: string;
+  /** Actionable next step shown in the app status area. */
+  action?: string;
+}
+
 export interface StartupInfo {
   fixture: FixtureInfo;
+  tracker: TrackerInfo;
 }
 
 export interface CaptureResult {

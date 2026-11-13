@@ -1,0 +1,12 @@
+{
+  "id": "mediapipe-face-landmarker-float16-v1",
+  "version": "MediaPipe Face Landmarker (float16, model bundle v1)",
+  "fileName": "face_landmarker.task",
+  "sourceUrl": "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+  "license": "Apache-2.0",
+  "licenseUrl": "https://www.apache.org/licenses/LICENSE-2.0",
+  "attribution": "MediaPipe Face Landmarker model, Google LLC, Apache-2.0.",
+  "sha256": "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff",
+  "bytes": 3758596,
+  "notes": "Pinned MediaPipe model bundle (float16/version 1), downloaded on demand to a gitignored cache; the binary is never committed. The @mediapipe/tasks-vision WASM runtime is installed from npm at the exact version pinned in package.json (0.10.21) and copied into the build by scripts/build.mjs."
+}

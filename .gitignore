@@ -5,3 +5,4 @@ dist/
 evidence/
 fixtures/cache/
 build/
+.cache/
