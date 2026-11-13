@@ -107,10 +107,10 @@ package is rejected. It is intentionally the same pure validator the app uses.
 | `expressionReactions` | reserved | Must be absent or an empty array. A non-empty declaration is rejected as `unsupported-behavior`. |
 | `behaviors` | reserved | Reserved for moving parts/secondary motion; absent or empty. Non-empty is rejected. |
 
-Unknown top-level fields produce an `unknown-field` **warning** (for forward
-compatibility) but do not enable behavior. Unknown fields inside `mask`,
-`attachment`, `colorTreatment` or `author` are errors, because a typo there
-would silently change the effect.
+Unknown top-level fields and unknown `author` fields produce an `unknown-field`
+**warning** (for forward compatibility) but do not enable behavior. Unknown
+fields inside `mask`, `attachment` or `colorTreatment` are errors, because a typo
+there would silently change the effect.
 
 ### `mask`
 
@@ -282,7 +282,7 @@ stops the camera output. No Blender or AI process is involved in playback.
 | `glb-external-resource` | GLB references an external buffer/image; embed everything. |
 | `glb-unsupported-extension` | A required glTF extension other than `KHR_materials_unlit`. |
 | `glb-unsupported-feature` | Cameras, lights, or a non-triangle primitive mode. |
-| `unknown-field` | Warning: unknown top-level manifest author/field ignored by v1. |
+| `unknown-field` | Warning: an unknown top-level manifest field or `author` field is ignored by v1. |
 
 All messages name the field or archive path and the expected form. Multiple
 independent issues may be reported; the app shows the first and a count.

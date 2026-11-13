@@ -2063,7 +2063,7 @@ async function effectPackageScenario() {
     // --- Import the valid mask + treatment package through the UI ------------
     const guardImport = await importPackageThroughControl(app, page, path.join(PACKAGE_FIXTURES_DIR, 'guard-visor.zip'));
     assert.equal(guardImport.state, 'success', `valid import must succeed: ${guardImport.text}`);
-    assert.match(guardImport.text, /Imported Guard visor v1\.0\.0/);
+    assert.match(guardImport.text, /Imported "Guard visor" v1\.0\.0/);
     const optionsAfterGuard = await effectOptionValues(page);
     assert.ok(optionsAfterGuard.includes(GUARD_VISOR_EFFECT_ID), 'imported effect must appear in the selector');
     const guardLoaded = await waitForEffectLoaded(page, GUARD_VISOR_EFFECT_ID);
