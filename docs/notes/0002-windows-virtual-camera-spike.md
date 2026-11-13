@@ -10,10 +10,11 @@
   parent spec [#1](https://github.com/rtfa1/shymask/issues/1).
 - **Related decisions:** [ADR-0003](../adr/0003-conceal-the-face-on-tracking-failure.md) (opaque
   paused output in every output path), [ADR-0004](../adr/0004-declarative-effect-packages.md).
-- **Validated head:** `30c014bc6722a4f8cb9d080fd0b698e5cd6c788e` (full `npm run check` plus `npm run vcam:check` at that
-  commit). The check summary records the same head SHA, hardware, workload, timing, camera evidence
-  and tested commands in `evidence/check-<timestamp>/summary.json`; the matching logs are
-  `evidence/logs/check-final.log` and `evidence/logs/vcam-final.log`. Local validation is the gate
+- **Validated head:** `d353aa68aac6efbe8035b1dee11dbb08fbf96e4a` (full `npm run check` plus `npm run vcam:check` at that
+  commit). Both `evidence/check-<timestamp>/summary.json` and `evidence/vcam-check/summary.json`
+  record that SHA; the check summary also records hardware, workload, timing and camera evidence.
+  The matching logs are `evidence/logs/check-final.log` and `evidence/logs/vcam-final.log`. Later
+  documentation-only commits do not change the validated behavior. Local validation is the gate
   (no CI in the repository).
 
 ## Decision
@@ -141,8 +142,9 @@ renderer or a silently stalled producer cannot freeze the camera. The socket sta
 next complete frame restores processed output immediately. A socket close still resets the cached
 frame and falls back at once. `npm run vcam:check` exercises the steady-clock path with
 `scripts/dev/vcam-test-pattern.mjs --stop-after N`, which stops writing but keeps the connection open,
-and asserts that the consumer sees coloured frames followed by the dark paused fallback within the
-bound (1268 ms observed in the validated run).
+and asserts that the consumer sees coloured frames followed by the dark paused fallback at/after
+the 1200 ms bound (the validated run observed the transition at 1254 ms in
+`evidence/vcam-check/summary.json`).
 
 Two harness bugs found during bring-up are fixed: the consumer double-released its Source Reader
 at exit (access violation), and the host emitted unescaped backslashes in its JSON `list` output.
@@ -186,13 +188,13 @@ controls and an independent Media Foundation consumer process:
   app-published frame (`captureUnixMs > 0`) and decodes the saved PNG, so the native pre-connection
   paused fallback cannot pass a paused state on its own.
 - Start produces processed replay frames in the consumer that match the preview's treatment
-  (warm preview 146,67,42 vs camera 144,67,41 in the validated run; the saved PNG decodes to
+  (warm preview 143,66,41 vs camera 144,67,42 in the validated run; the saved PNG decodes to
   144,67,42; switching to cool changes the camera output as well). The saved PNG is decoded from
   disk and must match the asserted processed colour, so a native fallback PNG cannot evidence a
   processed state.
 - Resume, effect re-selection and failure recovery restore processed camera output automatically.
 - The camera consumer receives a continuous stream across at least two replay loops
-  (212 frames over 6.92 s, 30.5 Hz) with strictly increasing sample times and visible content
+  (212 frames over 6.87 s, 30.4 Hz) with strictly increasing sample times and visible content
   changes.
 - Closing the app stops the camera stream (no frames after close), exits the camera host process
   within a bounded wait, and removes the device from camera enumeration. A consumer timeout is
@@ -202,23 +204,26 @@ controls and an independent Media Foundation consumer process:
   treatments, loops/seams, pacing, PNG capture, no console errors) and 23 unit tests remain green.
 - `npm run vcam:check` exercises the native path without Electron: test-pattern pixels and the
   1200 ms freshness bound (a source that stops writing but keeps the socket open must give the
-  consumer the dark native paused fallback; 1268 ms observed in the validated run).
+  consumer the dark native paused fallback at/after the bound; the validated run observed the
+  transition at 1254 ms in `evidence/vcam-check/summary.json`).
 
 ### Measured baseline (replay-based, virtual camera)
 
-From a passing `npm run check` run on 2026-11-13 at validated head `30c014bc6722a4f8cb9d080fd0b698e5cd6c788e` (run-to-run
-variation is expected; the check summary records the same head SHA), source clip 3.379 s, Windows 11
-Pro 26100, i7-11700K / RTX 3070 Ti / 31.8 GiB, Electron 45.3.1:
+From a passing `npm run check` run on 2026-11-13 at validated head `d353aa68aac6efbe8035b1dee11dbb08fbf96e4a` (run-to-run
+variation is expected; that run's `evidence/check-<timestamp>/summary.json` and
+`evidence/vcam-check/summary.json` record the same SHA, and later documentation-only commits do not
+change the validated behavior), source clip 3.379 s, Windows 11 Pro 26100, i7-11700K / RTX 3070 Ti /
+31.8 GiB, Electron 45.3.1:
 
 | Measurement | Value |
 | --- | --- |
 | Camera media type | RGB32 1280×720 @ 30/1 |
-| Camera frames observed | 212 over 6.92 s (30.5 Hz sample rate) |
-| Camera frame interval, p95 | 47 ms |
-| Replay-to-camera latency, p50 / p95 | 31 ms / 50 ms (canvas capture time → consumer receive time) |
+| Camera frames observed | 212 over 6.87 s (30.4 Hz sample rate) |
+| Camera frame interval, p95 | 48 ms |
+| Replay-to-camera latency, p50 / p95 | 32 ms / 55 ms (canvas capture time → consumer receive time) |
 | Camera mean-RGB spread across the window | 19 (replay content changes across loops) |
 | Replay loops crossed during the camera window | 2 |
-| Preview source frame interval, p95 | ~42 ms in this run (~21–24 Hz replay; ~42–49 ms across passing runs) |
+| Preview source frame interval, p95 | 41.9 ms in this run (~21–24 Hz replay; ~42–49 ms across passing runs) |
 | Preview render + filter cost, p95 | 0.40 ms without a camera consumer; a connected consumer adds a 1280×720 canvas readback |
 | Camera transport | canvas readback → IPC → loopback TCP → RGB32 sample → frame server → consumer |
 
@@ -248,6 +253,9 @@ Boundaries:
   (`MFEnumDeviceSources` + Source Reader). It writes PNGs and JSON pixel/timing statistics; the
   harness compares camera mean RGB with the preview's diagnostics, requires app-published paused
   frames, and decodes the saved PNG for paused and processed assertions.
+- Each sample also carries the producer's frame `sequence` (from the wire header) as a diagnostic
+  attribute, and the consumer prints it, so the evidence distinguishes several samples of the same
+  app frame from a newly published frame. Native paused fallback samples carry sequence 0.
 - The harness bounds every consumer run (consumer-side watchdog plus a Node-side timeout) so a
   stalled camera fails the check instead of hanging.
 - Timing numbers come from a single desktop run and vary with load; they are observations, not
