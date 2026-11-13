@@ -1,8 +1,8 @@
 import type { FixtureInfo, TrackerInfo } from './bridge';
-import { getEffectLabel, isMaskEffect, type EffectId } from './treatments';
+import { getEffectLabel, getTreatment, isMaskEffect } from './treatments';
 import type { TrackingSnapshot } from './tracking';
 
-export type { EffectId };
+export type { EffectId } from './treatments';
 
 /** Exact text required by docs/adr/0003-conceal-the-face-on-tracking-failure.md. */
 export const PAUSED_TITLE = 'Tracking paused';
@@ -17,7 +17,23 @@ export interface PreviewState {
   ready: boolean;
   /** Manual pause persists until the operator resumes. */
   manualPaused: boolean;
-  effect: EffectId;
+  effect: string;
+  /**
+   * Resolved complete-effect display name. Optional so the bundled policy tests
+   * stay explicit; package effects always set it.
+   */
+  effectLabel?: string;
+  /** Whether the complete effect draws a rigid mask. Defaults to the bundled check. */
+  effectHasMask?: boolean;
+  /** Whether the complete effect applies a color treatment. */
+  effectHasTreatment?: boolean;
+  /** False when the selected id no longer resolves (for example a removed package). */
+  effectValid?: boolean;
+  /** Set when an imported effect failed to load; output stays paused. */
+  effectError?: string | null;
+  /** True while an imported effect's assets are loading (async switch). */
+  switching?: boolean;
+  switchingLabel?: string;
   /** False while effect or tracker processing is failing. */
   processingHealthy: boolean;
   processingError: string | null;
@@ -34,6 +50,9 @@ export type PauseReason =
   | 'no-effect'
   | 'manual-pause'
   | 'processing-failure'
+  | 'effect-switching'
+  | 'effect-invalid'
+  | 'effect-unavailable'
   | 'tracking-initializing'
   | 'tracking-lost'
   | 'multiple-faces'
@@ -119,25 +138,49 @@ export function resolveOutput(state: PreviewState): OutputDecision {
       'Choose an effect to restore the preview.',
     );
   }
+  if (state.effectValid === false) {
+    return paused(
+      'effect-invalid',
+      'The selected effect is no longer available, so the output is hidden instead of falling back to the raw feed.',
+      'Choose another effect, or import the effect package again.',
+    );
+  }
+  if (state.effectError) {
+    return paused(
+      'effect-unavailable',
+      `${state.effectError} The output is hidden.`,
+      'Choose another effect, or remove the imported package.',
+    );
+  }
+  // An async package switch keeps the whole output on the opaque paused screen
+  // until the new assets are ready; no previous or raw frame is shown.
+  if (state.switching) {
+    const label = state.switchingLabel ?? state.effectLabel ?? state.effect;
+    return paused(
+      'effect-switching',
+      `Switching to ${label}. The output stays hidden until the new effect is ready.`,
+      'Output returns automatically when the effect finishes loading.',
+    );
+  }
   const trackingPause = trackingPausedDecision(state.tracking);
   if (trackingPause) return trackingPause;
   if (!state.ready) {
     return paused('starting', 'Waiting for the first valid replay frame.', null);
   }
-  if (isMaskEffect(state.effect)) {
-    return {
-      mode: 'render',
-      reason: 'ready',
-      title: `Effect active: ${getEffectLabel(state.effect)}`,
-      explanation: `Processing the replay input with the ${getEffectLabel(state.effect).toLowerCase()} attached to the tracked face.`,
-      action: null,
-    };
-  }
+  const label = state.effectLabel ?? getEffectLabel(state.effect);
+  const effectHasMask = state.effectHasMask ?? isMaskEffect(state.effect);
+  const effectHasTreatment = state.effectHasTreatment ?? getTreatment(state.effect) !== null;
+  const explanation =
+    effectHasMask && effectHasTreatment
+      ? `Processing the replay input with the ${label.toLowerCase()} mask attached to the tracked face and its color treatment applied.`
+      : effectHasMask
+        ? `Processing the replay input with the ${label.toLowerCase()} attached to the tracked face.`
+        : `Processing the replay input with the ${label.toLowerCase()} color treatment.`;
   return {
     mode: 'render',
     reason: 'ready',
-    title: `Effect active: ${getEffectLabel(state.effect)}`,
-    explanation: `Processing the replay input with the ${getEffectLabel(state.effect).toLowerCase()} color treatment.`,
+    title: `Effect active: ${label}`,
+    explanation,
     action: null,
   };
 }

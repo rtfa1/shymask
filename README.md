@@ -2,7 +2,8 @@
 
 Shymask applies visual effects to a webcam feed and publishes the result as a virtual webcam. This
 repository currently delivers a **recorded-replay preview** (issue #2), the **Windows 11 virtual
-camera** (issue #3), and **one-face tracking with a basic rigid 3D mask** (issue #4): a desktop
+camera** (issue #3), **one-face tracking with a basic rigid 3D mask** (issue #4), and **imported,
+validated effect packages** (issue #5): a desktop
 preview loops a recorded webcam-style clip at real-time pacing, tracks exactly one face, attaches a
 procedural low-poly mask to that face, displays a selectable effect, and publishes its 1280×720
 output canvas as **Shymask Camera** so other applications can select it. The camera publishes the
@@ -10,13 +11,20 @@ app's output canvas; a native opaque paused fallback covers the short window bef
 and is used when app frames stop arriving. No physical webcam, account, cloud service, or live test
 subject is used.
 
+An effect package is a ZIP containing a versioned `manifest.json` plus declared assets only —
+never executable effect code. A package is **one complete effect** that may combine a rigid GLB
+mask and a declarative color treatment; imported effects use the same tracking, rendering and
+camera path as the bundled mask. The versioned contract, limits, error codes and authoring guidance
+are in [`docs/effect-packages.md`](docs/effect-packages.md).
+
 Tracking readiness and loss gate every effect: zero faces, multiple faces, unreliable tracking, a
 missing tracker model, no effect, manual pause and processing failures all replace the whole output
 with the exact opaque "Tracking paused" screen in both the preview and the virtual camera. There is
 no raw-passthrough branch.
 
-Effect packages, occlusion refinement, secondary motion, real call-application compatibility (issue
-#10), and the final 720p/30 FPS / 100 ms target are later child tickets of the parent spec.
+Occlusion refinement, secondary motion, real call-application compatibility (issue #10), the
+Blender/AI authoring flow (issue #9), complexity budgets (issue #11), and the final 720p/30 FPS /
+100 ms target are later child tickets of the parent spec.
 
 ## Quick start (Windows 11)
 
@@ -54,7 +62,9 @@ If `npm install` blocks install scripts (newer npm releases gate them), run
 | --- | --- |
 | **Start** | Begins real-time playback of the fixture already validated at launch. Disabled while the fixture is missing or corrupt, the face tracker is unavailable, playback has already started, or manual pause is active. |
 | **Pause / Resume** | Manual pause replaces the whole output with the opaque "Tracking paused" screen and freezes processing. It persists until Resume is pressed, including across automatic tracking recovery. |
-| **Effect** | `Rigid mask`, `Warm tint`, `Cool tint`, `Monochrome`, or explicit `No effect`. Choosing `No effect` hides the output; choosing an effect restores it automatically once one face is tracked. Tracking loss pauses every effect, including the color treatments. |
+| **Effect** | One complete effect at a time: `Rigid mask`, `Warm tint`, `Cool tint`, `Monochrome`, explicit `No effect`, or any imported package. Bundled options are followed by an **Imported packages** group. A package may combine its own mask and color treatment; components from different packages are never stacked. Choosing `No effect` hides the output; choosing an effect restores it automatically once one face is tracked. Tracking loss pauses every effect, including color treatments. |
+| **Import package…** | Opens the OS file picker and validates the selected ZIP (schema v1, declared assets only, bounded declarations, no executable content). A valid package is stored under the app's `userData` directory, appears in the Effect selector and is selected. An invalid package is rejected with its actionable code, message and field/path; the current output is unchanged. |
+| **Remove imported effect** | Removes the selected imported package from the persistent store. If it was active, the selector falls back to `No effect` and the opaque paused output; other imported packages remain. |
 | **Tracking state (diagnostic)** | `Use detected face (normal)`, or inject `tracking lost`, `multiple faces`, or `unreliable tracking` to exercise the output policy. Injected states are labelled in the diagnostics; the real detector is authoritative when set back to normal. |
 | **Recheck input** | Re-runs fixture size/checksum validation. Use after fetching a fixture that was missing at launch. |
 | **Capture evidence frame** | Writes the current output canvas (1280×720 PNG) to `evidence/` and shows the path in the app. |
@@ -62,8 +72,10 @@ If `npm install` blocks install scripts (newer npm releases gate them), run
 | **Restart virtual camera** | Re-runs the native camera host (for example after an elevated install or a camera error). |
 
 The app never opens a physical camera in this slice. There is no passthrough mode: the output is
-either a processed replay frame (with the mask or a color treatment) or the opaque "Tracking paused"
-screen, in the preview **and** in the virtual camera. Closing Shymask stops its camera output.
+either a processed replay frame (with a mask, a color treatment, or an imported complete effect) or
+the opaque "Tracking paused" screen, in the preview **and** in the virtual camera. While an imported
+mask loads, the whole output stays on the opaque paused screen; a failed load leaves it hidden with
+an explanation. Closing Shymask stops its camera output.
 
 ## What the output path does
 
@@ -99,29 +111,45 @@ screen, in the preview **and** in the virtual camera. Closing Shymask stops its 
   policy can distinguish one person from more than one.
 - **Rigid mask.** `src/renderer/mask-renderer.ts` builds a procedural low-poly helmet/visor in
   MediaPipe's canonical face units, attaches it to the facial transformation matrix (not screen
-  coordinates), and renders it to an offscreen transparent WebGL canvas. `src/core/pipeline.ts`
-  composites that canvas into the single output canvas. The camera uses MediaPipe's 63-degree
-  vertical-FOV assumption, which is what makes the mask land on the face. Only a sample the tracking
-  state machine classifies reliable updates the mask transform; a rejected sample (for example one
-  implausible pose jump) keeps the previous accepted projection through the confirmation window, so a
-  detector glitch cannot draw one teleported mask frame. See
+  coordinates), and renders it to an offscreen transparent WebGL canvas. An imported package's
+  `.glb` is loaded with Three.js `GLTFLoader` into the **same mask scene**, with the manifest's
+  declarative attachment, so the bundled and imported masks share one projection and composite
+  path. `src/core/pipeline.ts` composites that canvas into the single output canvas. The camera
+  uses MediaPipe's 63-degree vertical-FOV assumption, which is what makes the mask land on the
+  face. Only a sample the tracking state machine classifies reliable updates the mask transform; a
+  rejected sample (for example one implausible pose jump) keeps the previous accepted projection
+  through the confirmation window, so a detector glitch cannot draw one teleported mask frame. See
   [`docs/notes/0003-face-tracking-and-mask.md`](docs/notes/0003-face-tracking-and-mask.md).
 - **Failure policy.** The policy in `src/core/output-policy.ts` returns the opaque
   "Tracking paused" decision for startup, first-frame wait, missing/invalid fixture, missing/corrupt
-  tracker model, no active effect, manual pause, effect-processing failure, tracking readiness,
-  tracking loss, multiple faces, and unreliable tracking. Manual pause is evaluated before tracking
-  so automatic recovery cannot override it. It has no raw-passthrough branch.
+  tracker model, no active effect, manual pause, effect-processing failure, an async effect switch,
+  an invalid/removed active effect, a failed imported-effect load, tracking readiness, tracking
+  loss, multiple faces, and unreliable tracking. Manual pause is evaluated before tracking and
+  switching so automatic recovery or a switch cannot override it. It has no raw-passthrough branch.
 - **Declarative effects.** Color treatments and the bundled rigid mask are data/ids
-  (`src/core/treatments.ts`): filters are declarative canvas expressions and the mask is a bundled
-  procedural effect. No arbitrary executable effect code is loaded.
+  (`src/core/treatments.ts`); an imported effect is a validated package descriptor
+  (`src/core/effects.ts`, `src/core/effect-package-contract.ts`) whose mask is a declared GLB and
+  whose treatment is a fixed filter built from bounded parameters. No arbitrary executable effect
+  code is loaded, and the renderer never receives archive bytes. The package contract, validation,
+  limits and error codes are documented in [`docs/effect-packages.md`](docs/effect-packages.md).
+- **Effect package import.** `src/main/effect-packages.ts` validates the chosen ZIP with the pure
+  validator (`src/core/effect-package.ts`, `src/core/zip.ts`, `src/core/glb.ts`), stores the
+  validated archive and declared asset under `userData`, and serves only that asset from the local
+  `shymask://app/packages/...` route. Validation rejects zip-slip, absolute paths, symlinks,
+  oversized entries, executable/script content, unsupported schema versions, unknown behaviors,
+  missing assets, out-of-range color parameters and unsupported glTF features with structured,
+  actionable codes. Imported effects persist across restarts and can be removed in the app. The
+  spike choices and replay-based package evidence are in
+  [`docs/notes/0004-effect-packages.md`](docs/notes/0004-effect-packages.md).
 - **Virtual camera publication.** While the app runs, `src/main/virtual-camera.ts` serves the output
   canvas to the native Windows virtual camera over a loopback frame transport, and
   `src/renderer/renderer.ts` pushes every drawn output frame plus a 100 ms heartbeat (only while a
   camera consumer is connected). Startup, no effect, manual pause, processing errors, missing input,
   tracking loss, multiple faces, unreliable tracking and a missing model all appear in the camera as
-  the same opaque "Tracking paused" canvas. A treatment change itself is synchronous and renders the
-  new treatment in the camera immediately. The native opaque fallback covers only the pre-connection
-  window. The camera uses `MFVirtualCameraLifetime_Session`, so closing Shymask stops the stream and
+  the same opaque "Tracking paused" canvas. A bundled treatment change is synchronous and renders the
+  new treatment in the camera immediately; an imported effect switch keeps the camera on the paused
+  canvas until the package assets are ready, so it never receives a stale or raw switch frame. The
+  native opaque fallback covers only the pre-connection window. The camera uses `MFVirtualCameraLifetime_Session`, so closing Shymask stops the stream and
   removes the device.
 
 ## Windows virtual camera (issue #3)
@@ -202,14 +230,17 @@ for the architecture, the registration failure that was investigated, and the me
 ## Checks
 
 ```powershell
-npm run typecheck   # strict TypeScript across src and tests
-npm test            # unit tests for the output policy, tracking state machine, replay clock,
-                    # frame watchdog and treatments (41 tests)
-npm run check       # builds TypeScript + native camera, stages it, launches the real Electron app with
-                    # Playwright, drives public controls, runs the independent Media Foundation camera
-                    # consumer, and writes screenshots + camera frames + summary.json under
-                    # evidence/check-<timestamp>/
-npm run check:all   # npm test && npm run check
+npm run typecheck        # strict TypeScript across src and tests
+npm test                 # unit tests for the output policy, tracking state machine, replay clock,
+                         # frame watchdog, treatments, package schema/ZIP safety/GLB validation and
+                         # the effect registry (94 tests)
+npm run build:packages   # regenerate the committed sample + negative effect-package fixtures
+npm run validate:package -- <file.zip>  # validate one package with the app's pure validator
+npm run check            # builds TypeScript + native camera, stages it, launches the real Electron app with
+                         # Playwright, drives public controls, runs the independent Media Foundation camera
+                         # consumer, and writes screenshots + camera frames + summary.json under
+                         # evidence/check-<timestamp>/
+npm run check:all        # npm test && npm run check
 ```
 
 `npm run check` requires the native camera prerequisites (MSVC + Windows 11 SDK) and the
@@ -278,12 +309,31 @@ independent camera consumer:
 28. On the second recorded CC0 clip, a documented 8 s window with real turns, nods and leaning keeps
     exactly one face tracked and moves/rotates the mask by at least 12° of yaw and pitch and 40 px of
     origin movement, with screenshots at three points in the turn.
+29. A valid generated package imports through the public **Import package…** control (only the OS file
+    picker is stubbed), appears in the Effect selector, and renders its packaged GLB mask + declared
+    color treatment in the preview. The package's unlit material colour is the exact probe pixel, so
+    the packaged asset — not the bundled mask — is composited.
+30. The independent camera consumer receives the same imported mask + treatment: its saved PNG mean
+    matches the preview, contains the package material colour, and the pixel at the mask probe is that
+    colour.
+31. A color-treatment-only package visibly changes the preview and camera output through the same path.
+32. Switching bundled → imported → imported paints the opaque paused output first and completes;
+    manual pause persists across a switch and keeps the camera paused; an imported effect honors
+    tracking-loss/multiple-face/unreliable gates and recovers automatically; an invalid/removed
+    selection falls back to the no-effect paused output.
+33. Malformed JSON, unsupported schemaVersion, unsupported behavior, missing asset, invalid color,
+    zip-slip, oversized entry, executable content and an unsupported glTF extension are each rejected
+    with their documented actionable code, keep the previous effect rendering, and cause no crash or
+    renderer console error. Removing the active imported effect leaves the paused no-effect output, and
+    another imported package still renders after an app restart.
 
 Artifacts are written to the gitignored `evidence/check-<timestamp>/` directory: per-state canvas
-screenshots, the full app window, captured output frames, camera-consumer PNGs under
-`camera-frames/`, and `summary.json` with the derived base SHA, timing baseline, tracking/model
-evidence, hardware, workload, measured boundaries, commands, validation-gate facts and the tested
-head SHA.
+screenshots, the full app window (including import-error feedback), captured output frames,
+camera-consumer PNGs under `camera-frames/`, and `summary.json` with the derived base SHA, timing
+baseline, tracking/model evidence, effect-package import/validation/complexity evidence, hardware,
+workload, measured boundaries, commands, validation-gate facts and the tested head SHA. The check uses
+an evidence-local `SHYMASK_PACKAGE_DIR`, so it never edits installed packages; the committed sample and
+negative package fixtures are regenerated with `npm run build:packages`.
 
 `npm run vcam:check` independently exercises the native path: it asserts the test-pattern pixels and
 that a connected frame source which stops sending (socket kept open) is replaced by the native opaque
@@ -326,6 +376,13 @@ source clip 3.379 s:
 | Independent seam validation | 3 backward media-time jumps matched 3 reported seams |
 | Replay pacing ratio | 1.004 processing time / wall time in this run |
 
+Effect-package evidence from the same run (replay-based): the committed `guard-visor` sample is a
+1,715-byte archive with 2 entries and a 693-byte manifest, containing a 2,284-byte GLB with 96
+triangles, 1 mesh, 1 material and 1 node; `verdant-tint` is a 397-byte color-only archive. The
+imported mask's unlit material colour (RGB 225,29,154) is the exact preview probe pixel and appears
+in the independent camera-consumer PNG, so the packaged asset is composited through the shared path.
+Package complexity is reported, not budgeted; no triangle/mesh threshold is asserted.
+
 Replay-derived tracking measurements from the same run are documented in
 [`docs/notes/0003-face-tracking-and-mask.md`](docs/notes/0003-face-tracking-and-mask.md). The
 default clip's recorded motion is deliberately small (it has no large turns or nods); the
@@ -354,17 +411,19 @@ intentionally not committed; only fetch scripts and metadata are versioned (`tra
 ## Layout
 
 ```
-src/core/       output policy, tracking state machine, replay clock, canvas pipeline, effects
-src/main/       Electron main process, local asset protocol, fixture/tracker validation, IPC,
-                virtual camera lifecycle
-src/renderer/   desktop preview UI (HTML/CSS/TS), MediaPipe tracker wrapper, Three.js mask renderer,
-                and camera frame publication
-scripts/        build, start, fixture/model fetch, public-workflow check, native camera scripts
+src/core/       output policy, tracking state machine, replay clock, canvas pipeline, effects,
+                effect-package contract/validator, ZIP safety reader, GLB validator
+src/main/       Electron main process, local asset protocol, fixture/tracker validation, effect-package
+                store/import/remove, IPC, virtual camera lifecycle
+src/renderer/   desktop preview UI (HTML/CSS/TS), MediaPipe tracker wrapper, Three.js mask renderer
+                (bundled + package GLB), and camera frame publication
+scripts/        build, start, fixture/model fetch, package fixture generation/validation,
+                public-workflow check, native camera scripts
 native/         Windows virtual camera: Media Foundation media source, host, consumer harness
 tests/          focused unit tests (node:test)
-fixtures/       committed fixture manifests; fetched media is gitignored
+fixtures/       committed fixture manifests and effect packages; fetched media is gitignored
 tracker/        committed Face Landmarker model metadata (source, license, SHA-256); model is gitignored
-docs/           fixture notes, preview/loop + virtual camera + tracking notes, ADRs
+docs/           fixture notes, preview/loop + virtual camera + tracking + effect-package notes, ADRs
 ```
 
 ## Environment notes and troubleshooting
@@ -397,24 +456,35 @@ docs/           fixture notes, preview/loop + virtual camera + tracking notes, A
   oracle; a stalled consumer now times out with JSON instead of hanging. A connected app that goes
   silent (hung renderer) is replaced by the native opaque paused fallback after 1200 ms rather than
   freezing the last processed frame.
-- The check harness accepts `SHYMASK_FIXTURE_DIR`, `SHYMASK_EVIDENCE_DIR`, `SHYMASK_FIXTURE_MANIFEST`
-  and `SHYMASK_TRACKER_DIR` to point at different media/evidence/asset directories. The app honors
-  the same variables; the checks use them to exercise missing/corrupt fixture and tracker states and
-  the larger-motion fixture.
+- **An imported package is rejected:** the app shows the first validation code, the field or archive
+  path and an actionable message; the current effect and output are unchanged. `npm run
+  validate:package -- <file.zip>` gives the full structured result without opening the app. Common
+  fixes are covered in [`docs/effect-packages.md`](docs/effect-packages.md#validation-error-codes).
+- **Imported effects disappeared:** the store revalidates `package.zip` on every launch and ignores a
+  package that no longer passes validation (the package summary shows the warning). Re-import it, or
+  remove it with **Remove imported effect**.
+- The check harness accepts `SHYMASK_FIXTURE_DIR`, `SHYMASK_EVIDENCE_DIR`, `SHYMASK_FIXTURE_MANIFEST`,
+  `SHYMASK_TRACKER_DIR` and `SHYMASK_PACKAGE_DIR` to point at different media/evidence/asset/package
+  directories. The app honors the same variables; the checks use them to exercise missing/corrupt
+  fixture and tracker states, the larger-motion fixture and an isolated package store.
 
 ## Scope boundaries
 
 Delivered by this slice: recorded input acquisition and validation, real-time looping, monotonic
-processing timestamps, selectable declarative effects (color treatments and a bundled rigid mask),
+processing timestamps, selectable declarative effects (color treatments, a bundled rigid mask, and
+imported validated effect packages combining a declared GLB mask and/or bounded color treatment),
 one-face tracking with readiness/loss hysteresis, the opaque paused-output policy in the preview and
-the virtual camera (including tracking loss, multiple faces, unreliable tracking and missing/corrupt
-tracker assets), Windows 11 virtual camera publication as `Shymask Camera`, an independent Media
+the virtual camera (including tracking loss, multiple faces, unreliable tracking, missing/corrupt
+tracker assets, async effect switching and failed imported-effect loads), import/remove persistence
+under `userData`, Windows 11 virtual camera publication as `Shymask Camera`, an independent Media
 Foundation consumer harness, and reproducible local checks with no physical camera or human
-participation. A treatment change is synchronous, so the AC3 async switching-interruption sub-case has
-no async state to exercise here and is deliberately deferred to the later effect-package slice.
+participation. The imported-effect async switch is the switching-interruption sub-case: the whole
+output stays on the opaque paused screen until the new effect loads, or remains hidden with an
+explanation if the load fails.
 
 Deferred: physical webcam capture, live-human acceptance, occlusion refinement (issue #6), secondary
-motion, effect packages, real Zoom/Meet/OBS compatibility (issue #10), final live acceptance, NV12
-support, the async effect-switching interruption sub-case, laptop integrated-graphics validation, and
-the 720p/30 FPS / ≤100 ms target. Two-person footage is not part of this slice; multiple faces are
-exercised through a labelled diagnostic injection and the `numFaces: 2` detector configuration.
+motion, the Blender/AI authoring flow (issue #9), real Zoom/Meet/OBS compatibility (issue #10),
+final live acceptance, NV12 support, complexity budgets (issue #11), laptop integrated-graphics
+validation, and the 720p/30 FPS / ≤100 ms target. Two-person footage is not part of this slice;
+multiple faces are exercised through a labelled diagnostic injection and the `numFaces: 2` detector
+configuration.

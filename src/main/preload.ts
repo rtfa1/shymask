@@ -2,7 +2,10 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   CameraFrame,
   CaptureResult,
+  EffectPackageList,
   FixtureInfo,
+  ImportEffectPackageResult,
+  RemoveEffectPackageResult,
   ShymaskBridge,
   StartupInfo,
   VirtualCameraStatus,
@@ -14,6 +17,15 @@ const bridge: ShymaskBridge = {
   },
   recheckFixture(): Promise<FixtureInfo> {
     return ipcRenderer.invoke('shymask:recheck-fixture') as Promise<FixtureInfo>;
+  },
+  getEffectPackages(): Promise<EffectPackageList> {
+    return ipcRenderer.invoke('shymask:effect-packages') as Promise<EffectPackageList>;
+  },
+  importEffectPackage(): Promise<ImportEffectPackageResult> {
+    return ipcRenderer.invoke('shymask:effect-package-import') as Promise<ImportEffectPackageResult>;
+  },
+  removeEffectPackage(id: string): Promise<RemoveEffectPackageResult> {
+    return ipcRenderer.invoke('shymask:effect-package-remove', id) as Promise<RemoveEffectPackageResult>;
   },
   captureOutputPng(dataUrl: string): Promise<CaptureResult> {
     return ipcRenderer.invoke('shymask:capture-output', dataUrl) as Promise<CaptureResult>;

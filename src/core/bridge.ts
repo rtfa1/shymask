@@ -3,6 +3,24 @@
  * renderer. This module is erased at runtime except for constants.
  */
 
+import type {
+  EffectPackageList,
+  ImportEffectPackageResult,
+  RemoveEffectPackageResult,
+} from './effect-package-contract';
+
+export type {
+  ColorTreatmentParameters,
+  EffectPackageAuthor,
+  EffectPackageList,
+  ImportEffectPackageResult,
+  InstalledEffectPackage,
+  MaskAttachment,
+  PackageComplexity,
+  PackageIssue,
+  RemoveEffectPackageResult,
+} from './effect-package-contract';
+
 export interface FixtureMetadata {
   /** Stable identifier for the exact clip revision. */
   id: string;
@@ -73,6 +91,8 @@ export interface TrackerInfo {
 export interface StartupInfo {
   fixture: FixtureInfo;
   tracker: TrackerInfo;
+  /** Validated effect packages persisted under the app's package store. */
+  effectPackages: EffectPackageList;
 }
 
 export interface CaptureResult {
@@ -124,6 +144,12 @@ export interface VirtualCameraStatus {
 export interface ShymaskBridge {
   getStartupInfo(): Promise<StartupInfo>;
   recheckFixture(): Promise<FixtureInfo>;
+  /** Re-read validated packages from the persisted store (survives restart). */
+  getEffectPackages(): Promise<EffectPackageList>;
+  /** Opens the OS file picker, validates and stores the chosen package. */
+  importEffectPackage(): Promise<ImportEffectPackageResult>;
+  /** Removes an imported package from the persisted store. */
+  removeEffectPackage(id: string): Promise<RemoveEffectPackageResult>;
   captureOutputPng(dataUrl: string): Promise<CaptureResult>;
   publishCameraFrame(frame: CameraFrame): void;
   getVirtualCameraStatus(): Promise<VirtualCameraStatus>;

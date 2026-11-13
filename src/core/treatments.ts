@@ -8,7 +8,11 @@
 export type EffectId = 'none' | 'warm' | 'cool' | 'mono' | 'mask';
 
 export interface ColorTreatment {
-  id: Exclude<EffectId, 'none' | 'mask'>;
+  /**
+   * Bundled treatment id, or the complete-effect id for an imported package's
+   * color treatment.
+   */
+  id: string;
   label: string;
   description: string;
   /** CSS filter expression applied while drawing the frame. */
@@ -44,19 +48,19 @@ export interface EffectOption {
 export const EFFECT_OPTIONS: readonly EffectOption[] = [
   { id: 'none', label: 'No effect' },
   { id: 'mask', label: 'Rigid mask' },
-  ...COLOR_TREATMENTS.map((treatment) => ({ id: treatment.id, label: treatment.label })),
+  ...COLOR_TREATMENTS.map((treatment) => ({ id: treatment.id as EffectId, label: treatment.label })),
 ];
 
-export function getTreatment(id: EffectId): ColorTreatment | null {
+export function getTreatment(id: string): ColorTreatment | null {
   if (id === 'none' || id === 'mask') return null;
   return COLOR_TREATMENTS.find((treatment) => treatment.id === id) ?? null;
 }
 
-export function getEffectLabel(id: EffectId): string {
+export function getEffectLabel(id: string): string {
   return EFFECT_OPTIONS.find((option) => option.id === id)?.label ?? id;
 }
 
 /** True for the bundled rigid-mask effect (no color filter, needs a pose). */
-export function isMaskEffect(id: EffectId): boolean {
+export function isMaskEffect(id: string): boolean {
   return id === 'mask';
 }

@@ -1,4 +1,21 @@
-import type { FixtureInfo, TrackerInfo, VirtualCameraStatus } from '../core/bridge';
+import type {
+  FixtureInfo,
+  ImportEffectPackageResult,
+  InstalledEffectPackage,
+  TrackerInfo,
+  VirtualCameraStatus,
+} from '../core/bridge';
+import { effectIdForPackage } from '../core/effect-package-contract';
+import {
+  BUNDLED_EFFECT_DEFINITIONS,
+  DEFAULT_EFFECT_ID,
+  NO_EFFECT_ID,
+  effectOptionGroups,
+  hasMask as effectHasMask,
+  hasTreatment as effectHasTreatment,
+  resolveEffect,
+  type EffectDefinition,
+} from '../core/effects';
 import { DECODE_STALL_THRESHOLD_MS, FrameWatchdog } from '../core/frame-watchdog';
 import {
   PAUSED_TITLE,
@@ -8,7 +25,6 @@ import {
 } from '../core/output-policy';
 import { PreviewPipeline, type FrameStats } from '../core/pipeline';
 import { ReplayTimeline, type ReplayFrameTimestamp } from '../core/replay-clock';
-import { EFFECT_OPTIONS, getEffectLabel, getTreatment, isMaskEffect, type ColorTreatment, type EffectId } from '../core/treatments';
 import {
   acceptsDetectedPose,
   initialTrackingSnapshot,
@@ -17,7 +33,7 @@ import {
   type TrackingSample,
 } from '../core/tracking';
 import { FaceTracker, type DetectedTracking } from './face-tracker';
-import { MaskRenderer, type MaskProjection } from './mask-renderer';
+import { MaskRenderer, type MaskProjection, type PackageMaskSummary } from './mask-renderer';
 
 const SIMULATED_FAILURE_MESSAGE =
   'Effect processing is failing (simulated by the diagnostic control). The output is hidden.';
@@ -25,6 +41,8 @@ const DECODE_STALL_MESSAGE = `The replay frame could not be decoded for more tha
 const TRACKER_ACTION =
   'Run `npm run fetch:tracker`, then `npm run build`, and restart Shymask. The output stays hidden; there is no camera fallback.';
 const WATCHDOG_POLL_MS = 50;
+const PACKAGE_LOAD_ERROR_PREFIX = 'The imported effect could not be loaded';
+const MASK_LOAD_BUNDLED_KEY = 'bundled';
 
 /** Diagnostic tracking-state injection. `auto` uses the real detector. */
 type TrackingInjection = 'auto' | 'lost' | 'multiple' | 'unreliable';
@@ -60,6 +78,9 @@ const canvas = mustGet<HTMLCanvasElement>('output');
 const startButton = mustGet<HTMLButtonElement>('start');
 const pauseButton = mustGet<HTMLButtonElement>('pause-toggle');
 const effectSelect = mustGet<HTMLSelectElement>('effect-select');
+const importPackageButton = mustGet<HTMLButtonElement>('import-package');
+const removePackageButton = mustGet<HTMLButtonElement>('remove-package');
+const packageResult = mustGet<HTMLParagraphElement>('package-result');
 const injectionSelect = mustGet<HTMLSelectElement>('tracking-injection');
 const recheckButton = mustGet<HTMLButtonElement>('recheck');
 const captureButton = mustGet<HTMLButtonElement>('capture');
@@ -80,6 +101,9 @@ const timeline = new ReplayTimeline();
 const watchdog = new FrameWatchdog();
 const tracking = new TrackingStateMachine();
 
+const DEFAULT_ACTIVE_EFFECT: EffectDefinition =
+  BUNDLED_EFFECT_DEFINITIONS.find((effect) => effect.id === DEFAULT_EFFECT_ID) ?? BUNDLED_EFFECT_DEFINITIONS[0];
+
 const state: PreviewState = {
   fixture: { state: 'checking', metadata: null },
   tracker: {
@@ -91,7 +115,13 @@ const state: PreviewState = {
   started: false,
   ready: false,
   manualPaused: false,
-  effect: 'warm',
+  effect: DEFAULT_ACTIVE_EFFECT.id,
+  effectLabel: DEFAULT_ACTIVE_EFFECT.label,
+  effectHasMask: effectHasMask(DEFAULT_ACTIVE_EFFECT),
+  effectHasTreatment: effectHasTreatment(DEFAULT_ACTIVE_EFFECT),
+  effectValid: true,
+  effectError: null,
+  switching: false,
   processingHealthy: true,
   processingError: null,
   tracking: initialTrackingSnapshot(),
@@ -127,6 +157,22 @@ let detectionTimings: number[] = [];
 let detectedFrames = 0;
 let warmupInferenceMs = 0;
 let persistentTrackerError: string | null = null;
+let lastPoseMatrix: number[] | null = null;
+
+// Effect packages: validated descriptors only. The renderer never sees archive
+// bytes or executable content; package mask assets are fetched as .glb.
+let installedPackages: InstalledEffectPackage[] = [];
+let packageStoreWarnings: string[] = [];
+let activeEffect: EffectDefinition = DEFAULT_ACTIVE_EFFECT;
+let effectError: string | null = null;
+let switchingActive = false;
+let switchingPausedFrames = 0;
+let switchCount = 0;
+let switchToken = 0;
+let importInFlight = false;
+let removeInFlight = false;
+let loadedMaskKey: string | null = null;
+let maskSummary: PackageMaskSummary | null = null;
 
 // The virtual camera and the preview receive the exact same frames. 30 Hz is
 // the camera workload; the replay itself presents at ~21-24 Hz here.
@@ -163,6 +209,7 @@ async function bootstrap(): Promise<void> {
   }
   try {
     const info = await window.shymask.getStartupInfo();
+    applyPackageList(info.effectPackages.packages, info.effectPackages.warnings);
     applyTrackerInfo(info.tracker);
     applyFixture(info.fixture);
   } catch (error) {
@@ -171,13 +218,71 @@ async function bootstrap(): Promise<void> {
 }
 
 function buildEffectOptions(): void {
-  for (const option of EFFECT_OPTIONS) {
-    const element = document.createElement('option');
-    element.value = option.id;
-    element.textContent = option.label;
+  effectSelect.replaceChildren();
+  for (const group of effectOptionGroups(installedPackages)) {
+    const element = document.createElement('optgroup');
+    element.label = group.label;
+    for (const option of group.options) {
+      const item = document.createElement('option');
+      item.value = option.id;
+      item.textContent = option.label;
+      element.appendChild(item);
+    }
     effectSelect.appendChild(element);
   }
-  effectSelect.value = state.effect;
+  effectSelect.value = activeEffect.id;
+  removePackageButton.disabled = activeEffect.source !== 'package' || removeInFlight || importInFlight;
+  updatePackageSummary();
+}
+
+/**
+ * Replaces the validated package list, keeps the current selection only if it
+ * still exists, and never leaves a stale complete effect selected.
+ */
+function applyPackageList(packages: InstalledEffectPackage[], warnings: string[]): void {
+  installedPackages = packages;
+  packageStoreWarnings = warnings;
+  const current =
+    activeEffect.source === 'package' ? resolveEffect(activeEffect.id, installedPackages) : activeEffect;
+  if (current) {
+    activeEffect = current;
+  } else {
+    // The selected package disappeared (for example removed from another
+    // window): fall back to the explicit no-effect paused output.
+    activeEffect = resolveEffect(NO_EFFECT_ID, installedPackages) ?? DEFAULT_ACTIVE_EFFECT;
+    effectError = null;
+  }
+  syncEffectState();
+  buildEffectOptions();
+  updatePackageSummary();
+}
+
+function updatePackageSummary(): void {
+  if (installedPackages.length === 0) {
+    packageResult.textContent =
+      packageStoreWarnings.length > 0
+        ? packageStoreWarnings.join(' ')
+        : 'No imported effect packages. Import a ZIP containing manifest.json and its declared assets.';
+    packageResult.dataset.state = packageStoreWarnings.length > 0 ? 'error' : '';
+    return;
+  }
+  const names = installedPackages.map((pkg) => `${pkg.name} v${pkg.version}`).join(', ');
+  const warningText = packageStoreWarnings.length > 0 ? ` Warnings: ${packageStoreWarnings.join(' ')}` : '';
+  packageResult.textContent = `${installedPackages.length} imported package(s): ${names}.${warningText}`;
+  // `data-state` is reserved for import/remove outcomes; a neutral summary must
+  // not look like a completed import while a load is still in progress.
+  packageResult.dataset.state = packageStoreWarnings.length > 0 ? 'error' : '';
+}
+
+function syncEffectState(): void {
+  state.effect = activeEffect.id;
+  state.effectLabel = activeEffect.label;
+  state.effectHasMask = effectHasMask(activeEffect);
+  state.effectHasTreatment = effectHasTreatment(activeEffect);
+  state.effectValid = true;
+  state.effectError = effectError;
+  state.switching = switchingActive;
+  state.switchingLabel = activeEffect.label;
 }
 
 function buildInjectionOptions(): void {
@@ -196,10 +301,13 @@ function bindControls(): void {
   });
   pauseButton.addEventListener('click', togglePause);
   effectSelect.addEventListener('change', () => {
-    const value = effectSelect.value;
-    const match = EFFECT_OPTIONS.find((option) => option.id === value);
-    state.effect = (match?.id ?? 'none') as EffectId;
-    renderNow();
+    void selectEffect(effectSelect.value);
+  });
+  importPackageButton.addEventListener('click', () => {
+    void importEffectPackage();
+  });
+  removePackageButton.addEventListener('click', () => {
+    void removeSelectedEffectPackage();
   });
   injectionSelect.addEventListener('change', () => {
     const value = injectionSelect.value;
@@ -244,6 +352,196 @@ function bindControls(): void {
   });
 }
 
+/**
+ * Selects one complete effect. An imported effect's GLB loads asynchronously,
+ * and the output is the opaque paused screen for the whole switch: the previous
+ * or raw frame is never shown. A stale switch is cancelled by a newer token, so
+ * rapid selections cannot apply an older result.
+ */
+async function selectEffect(id: string): Promise<void> {
+  const token = ++switchToken;
+  const next = resolveEffect(id, installedPackages);
+  if (!next) {
+    // Invalid/stale selection: fall back to the explicit no-effect paused
+    // output, never to a previous or raw frame.
+    activeEffect = resolveEffect(NO_EFFECT_ID, installedPackages) ?? DEFAULT_ACTIVE_EFFECT;
+    effectError = null;
+    switchingActive = false;
+    syncEffectState();
+    buildEffectOptions();
+    renderNow();
+    return;
+  }
+  activeEffect = next;
+  effectError = null;
+  switchingActive = false;
+  syncEffectState();
+  buildEffectOptions();
+  // Do not render before ensureMaskContent: if the new effect's mask content is
+  // not loaded yet, that would briefly draw the previous mask. ensureMaskContent
+  // paints the opaque paused screen for the switch instead.
+  await ensureMaskContent(token);
+}
+
+/** Reloads the active effect's mask content, invalidating any in-flight switch. */
+async function reloadActiveMask(): Promise<void> {
+  const token = ++switchToken;
+  await ensureMaskContent(token);
+}
+
+async function ensureMaskContent(token: number): Promise<void> {
+  const mask = activeEffect.mask;
+  if (!mask) {
+    maskSummary = null;
+    lastMaskProjection = EMPTY_MASK_PROJECTION;
+    syncEffectState();
+    renderNow();
+    return;
+  }
+  // A bundled mask never needs loading, but it still replaces package content.
+  if (!maskRenderer) {
+    // The tracker/WebGL renderer is not ready yet. Startup/tracker policy keeps
+    // the output paused; initializeTracker retries the load when it exists.
+    syncEffectState();
+    renderNow();
+    return;
+  }
+  const desiredKey =
+    mask.kind === 'bundled'
+      ? MASK_LOAD_BUNDLED_KEY
+      : `${activeEffect.id}:${activeEffect.packageRevision ?? ''}:${mask.assetUrl}`;
+  if (loadedMaskKey === desiredKey) {
+    refreshMaskProjection();
+    syncEffectState();
+    renderNow();
+    return;
+  }
+
+  if (mask.kind === 'gltf') {
+    switchingActive = true;
+    switchCount += 1;
+    syncEffectState();
+    renderNow(); // opaque paused output for the whole load
+  }
+  try {
+    if (mask.kind === 'bundled') {
+      maskRenderer.setBundledMask();
+      maskSummary = null;
+      loadedMaskKey = desiredKey;
+    } else {
+      const response = await fetch(mask.assetUrl);
+      if (!response.ok) {
+        throw new Error(`the local asset request returned HTTP ${response.status}`);
+      }
+      const data = await response.arrayBuffer();
+      if (token !== switchToken) return;
+      maskSummary = await maskRenderer.loadGltfModel(data, mask.attachment);
+      loadedMaskKey = desiredKey;
+    }
+    if (token !== switchToken) return;
+    switchingActive = false;
+    effectError = null;
+    syncEffectState();
+    refreshMaskProjection();
+    renderNow();
+  } catch (error) {
+    if (token !== switchToken) return;
+    switchingActive = false;
+    loadedMaskKey = null;
+    maskSummary = null;
+    effectError = `${PACKAGE_LOAD_ERROR_PREFIX} "${activeEffect.label}": ${(error as Error).message}.`;
+    syncEffectState();
+    renderNow();
+  }
+}
+
+/** Re-projects the current mask content against the last accepted face pose. */
+function refreshMaskProjection(): void {
+  if (!maskRenderer) return;
+  lastMaskProjection = lastPoseMatrix ? maskRenderer.setPose(lastPoseMatrix) : EMPTY_MASK_PROJECTION;
+}
+
+async function importEffectPackage(): Promise<void> {
+  if (!window.shymask || importInFlight) return;
+  importInFlight = true;
+  importPackageButton.disabled = true;
+  packageResult.dataset.state = '';
+  packageResult.textContent = 'Waiting for the OS file picker…';
+  try {
+    const result = await window.shymask.importEffectPackage();
+    await applyImportResult(result);
+  } catch (error) {
+    packageResult.dataset.state = 'error';
+    packageResult.textContent = `Import failed: ${(error as Error).message}`;
+  } finally {
+    importInFlight = false;
+    updateControls();
+  }
+}
+
+async function applyImportResult(result: ImportEffectPackageResult): Promise<void> {
+  applyPackageList(result.list.packages, result.list.warnings);
+  if (result.status === 'imported' && result.package) {
+    // Select first: rebuilding the selector writes the package summary, so the
+    // import result message must be written after it.
+    const imported = result.package;
+    await selectEffect(effectIdForPackage(imported.id));
+    packageResult.dataset.state = 'success';
+    const warnings =
+      result.issues.length > 0
+        ? ` Warnings: ${result.issues.map((entry) => `${entry.code}: ${entry.message}`).join(' ')}`
+        : '';
+    packageResult.textContent = `${result.message}${warnings}`;
+    return;
+  }
+  if (result.status === 'cancelled') {
+    packageResult.dataset.state = '';
+    packageResult.textContent = 'Import cancelled. No package was added and the current output is unchanged.';
+    return;
+  }
+  packageResult.dataset.state = 'error';
+  const details = result.issues
+    .slice(0, 6)
+    .map((entry) => `[${entry.code}]${entry.path ? ` ${entry.path}:` : ''} ${entry.message}`)
+    .join(' ');
+  const more = result.issues.length > 6 ? ` (${result.issues.length - 6} more issue(s))` : '';
+  packageResult.textContent = `${result.message}${details ? ` ${details}${more}` : ''}`;
+}
+
+async function removeSelectedEffectPackage(): Promise<void> {
+  if (!window.shymask || removeInFlight) return;
+  const selected = installedPackages.find((pkg) => effectIdForPackage(pkg.id) === activeEffect.id);
+  if (!selected) return;
+  removeInFlight = true;
+  removePackageButton.disabled = true;
+  // Cancel any in-flight switch so its result cannot re-apply after removal.
+  switchToken += 1;
+  try {
+    const result = await window.shymask.removeEffectPackage(selected.id);
+    applyPackageList(result.list.packages, result.list.warnings);
+    // Removal falls back to the explicit no-effect paused output unless another
+    // effect is still selected.
+    if (!resolveEffect(state.effect, installedPackages)) {
+      activeEffect = resolveEffect(NO_EFFECT_ID, installedPackages) ?? DEFAULT_ACTIVE_EFFECT;
+    }
+    effectError = null;
+    switchingActive = false;
+    loadedMaskKey = null;
+    maskSummary = null;
+    syncEffectState();
+    buildEffectOptions();
+    renderNow();
+    packageResult.dataset.state = result.removed ? 'success' : 'error';
+    packageResult.textContent = result.message;
+  } catch (error) {
+    packageResult.dataset.state = 'error';
+    packageResult.textContent = `Remove failed: ${(error as Error).message}`;
+  } finally {
+    removeInFlight = false;
+    updateControls();
+  }
+}
+
 function applyTrackerInfo(info: TrackerInfo): void {
   state.tracker = info;
   if (info.state === 'ready') {
@@ -266,6 +564,9 @@ async function initializeTracker(info: TrackerInfo): Promise<void> {
     state.tracker = info;
     renderNow();
     updateStaticDiagnostics();
+    // The selected effect may be a package chosen before the tracker/WebGL
+    // renderer existed; load its mask content now.
+    void reloadActiveMask();
   } catch (error) {
     trackerReady = false;
     faceTracker = null;
@@ -392,6 +693,7 @@ function applyFixture(fixture: FixtureInfo): void {
   tracking.reset(performance.now());
   state.tracking = tracking.snapshot(performance.now());
   lastDetection = null;
+  lastPoseMatrix = null;
   lastMaskProjection = EMPTY_MASK_PROJECTION;
   detectionErrors = 0;
   detectionTimings = [];
@@ -482,6 +784,7 @@ async function startPreview(): Promise<void> {
   tracking.reset(performance.now());
   state.tracking = tracking.snapshot(performance.now());
   lastMaskProjection = EMPTY_MASK_PROJECTION;
+  lastPoseMatrix = null;
   detectionErrors = 0;
   detectionTimings = [];
   detectedFrames = 0;
@@ -556,45 +859,27 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
   const decision = resolveOutput(state);
 
   if (decision.mode === 'render') {
-    if (isMaskEffect(state.effect)) {
-      if (element.readyState >= 2 && drawProcessedFrame(element, null)) {
-        undrawableSinceMs = null;
-        applyDecision(decision);
-        maybeUpdateDiagnostics(now);
-        return;
-      }
-      // Tracking says the mask is ready but the pose is not drawable yet. Show
-      // the paused screen rather than the raw frame; the next frame resolves it.
-      undrawableSinceMs ??= now;
-      if (now - undrawableSinceMs <= 250) {
-        applyDecision(decision);
-        maybeUpdateDiagnostics(now);
-        return;
-      }
-      state.processingHealthy = false;
-      state.ready = false;
-      state.processingError = 'The face pose was not drawable for more than 250 ms. Output is hidden.';
-    } else {
-      const treatment = getTreatment(state.effect);
-      if (element.readyState >= 2 && drawProcessedFrame(element, treatment)) {
-        undrawableSinceMs = null;
-        applyDecision(decision);
-        maybeUpdateDiagnostics(now);
-        return;
-      }
-      // Chromium can report readyState < 2 for a single presented frame at a
-      // loop seam. Keep the last processed frame instead of flashing the paused
-      // screen; a prolonged decode gap is a genuine processing failure.
-      undrawableSinceMs ??= now;
-      if (now - undrawableSinceMs <= 250) {
-        applyDecision(decision);
-        maybeUpdateDiagnostics(now);
-        return;
-      }
-      state.processingHealthy = false;
-      state.ready = false;
-      state.processingError = DECODE_STALL_MESSAGE;
+    if (element.readyState >= 2 && drawProcessedFrame(element)) {
+      undrawableSinceMs = null;
+      applyDecision(decision);
+      maybeUpdateDiagnostics(now);
+      return;
     }
+    // Either the effect needs a drawable mask pose that is not ready yet, or the
+    // decoder presented an unusable frame. Keep the last processed frame for a
+    // single-frame decode gap, never the raw frame; a prolonged failure hides
+    // the output behind the opaque paused screen.
+    undrawableSinceMs ??= now;
+    if (now - undrawableSinceMs <= 250) {
+      applyDecision(decision);
+      maybeUpdateDiagnostics(now);
+      return;
+    }
+    state.processingHealthy = false;
+    state.ready = false;
+    state.processingError = activeEffect.mask
+      ? 'The face pose was not drawable for more than 250 ms. Output is hidden.'
+      : DECODE_STALL_MESSAGE;
   }
 
   const pausedDecision = resolveOutput(state);
@@ -602,6 +887,7 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
   publishOutputFrame();
   latestStats = stats;
   renderCosts = pushRolling(renderCosts, stats.renderCostMs);
+  if (pausedDecision.reason === 'effect-switching') switchingPausedFrames += 1;
   applyDecision(pausedDecision);
   maybeUpdateDiagnostics(now);
 }
@@ -659,6 +945,7 @@ function updateTracking(element: HTMLVideoElement, nowMs: number): void {
     const snapshot = tracking.update(sample, nowMs, false);
     state.tracking = snapshot;
     if (acceptsDetectedPose(snapshot) && detected.matrix && maskRenderer) {
+      lastPoseMatrix = detected.matrix;
       lastMaskProjection = maskRenderer.setPose(detected.matrix);
     }
   } catch (error) {
@@ -699,18 +986,21 @@ function injectedSample(injection: Exclude<TrackingInjection, 'auto'>): Tracking
 }
 
 /**
- * Draws one processed frame with the active effect into the single output
- * canvas and publishes it. The frame loop and the on-demand render path share
- * this so both apply exactly the same mask/colour logic and cost accounting.
- * Returns false when the effect cannot be drawn (no drawable mask pose, or no
- * colour treatment), in which case the caller keeps the previous output instead
- * of substituting the raw frame.
+ * Draws one processed frame with the active complete effect into the single
+ * output canvas and publishes it. The frame loop and the on-demand render path
+ * share this so both apply exactly the same mask/color logic and cost
+ * accounting. A complete effect may combine a mask and a color treatment: the
+ * treatment filters the replay frame and the mask is composited on top through
+ * the same pipeline call. Returns false when the effect cannot be drawn (no
+ * drawable mask pose, or no color treatment), in which case the caller keeps the
+ * previous output instead of substituting the raw frame.
  */
-function drawProcessedFrame(element: HTMLVideoElement, treatment: ColorTreatment | null): boolean {
-  if (isMaskEffect(state.effect)) {
+function drawProcessedFrame(element: HTMLVideoElement): boolean {
+  const treatment = activeEffect.treatment;
+  if (activeEffect.mask) {
     if (!maskRenderer || !lastMaskProjection.visible) return false;
     maskRenderCostMs = maskRenderer.render();
-    latestStats = pipeline.renderProcessedFrame(element, null, maskRenderer.canvas);
+    latestStats = pipeline.renderProcessedFrame(element, treatment, maskRenderer.canvas);
     renderCosts = pushRolling(renderCosts, latestStats.renderCostMs + maskRenderCostMs);
   } else {
     if (!treatment) return false;
@@ -745,19 +1035,15 @@ function renderNow(): void {
   const now = performance.now();
   state.tracking = tracking.snapshot(now);
   const decision = resolveOutput(state);
-  const treatment = getTreatment(state.effect);
 
   if (decision.mode === 'render' && video && video.readyState >= 2) {
-    if (isMaskEffect(state.effect)) {
-      if (drawProcessedFrame(video, null)) undrawableSinceMs = null;
-      // Without a drawable pose the previous output stays until the next frame;
-      // the paused screen is never replaced by the raw frame.
-    } else if (treatment && drawProcessedFrame(video, treatment)) {
-      undrawableSinceMs = null;
-    }
+    if (drawProcessedFrame(video)) undrawableSinceMs = null;
+    // Without a drawable pose/frame the previous output stays until the next
+    // frame; the paused screen is never replaced by the raw frame.
   } else if (decision.mode === 'paused') {
     latestStats = pipeline.renderPausedScreen(PAUSED_TITLE);
     publishOutputFrame();
+    if (decision.reason === 'effect-switching') switchingPausedFrames += 1;
   }
   // In render mode without a drawable frame, leave the previous processed
   // frame visible rather than substituting the paused screen for one frame.
@@ -841,6 +1127,8 @@ function updateControls(): void {
   effectSelect.disabled = false;
   injectionSelect.disabled = !trackerReady;
   recheckButton.disabled = false;
+  importPackageButton.disabled = importInFlight;
+  removePackageButton.disabled = activeEffect.source !== 'package' || removeInFlight || importInFlight;
 }
 
 function maybeUpdateDiagnostics(now: number): void {
@@ -851,6 +1139,14 @@ function maybeUpdateDiagnostics(now: number): void {
 
 function updateDiagnostics(now: number): void {
   setDiag('diag-loop', `loops=${timeline.loops} seams=${timeline.seams}`);
+  setDiag(
+    'diag-effect',
+    `id=${activeEffect.id} source=${activeEffect.source} mask=${activeEffect.mask ? activeEffect.mask.kind : 'none'} treatment=${activeEffect.treatment ? 'yes' : 'no'} switching=${switchingActive} switchingPausedFrames=${switchingPausedFrames} switchCount=${switchCount} error=${effectError ? 'yes' : 'no'} package=${activeEffect.source === 'package' ? `${activeEffect.packageVersion ?? '?'} loaded=${activeEffect.mask ? (loadedMaskKey !== null ? 'yes' : 'no') : 'n/a'}` : 'n/a'} maskProbe=${activeEffect.mask && maskSummary?.probeColor ? `${maskSummary.probeColor.r},${maskSummary.probeColor.g},${maskSummary.probeColor.b}` : 'none'} meshes=${activeEffect.mask ? (maskSummary?.meshes ?? 0) : 0}`,
+  );
+  setDiag(
+    'diag-packages',
+    `installed=${installedPackages.length} ids=${installedPackages.map((pkg) => `${pkg.id}@${pkg.version}`).join(',') || 'none'} warnings=${packageStoreWarnings.length}`,
+  );
   if (latestTimestamp) {
     setDiag(
       'diag-timestamp',

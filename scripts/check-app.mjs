@@ -1254,6 +1254,27 @@ async function missingFixtureCameraScenario() {
 }
 
 const MASK_EYE_RGB = { r: 103, g: 232, b: 249 };
+/** Exact unlit material colour of the committed sample mask GLB (guard-visor). */
+const PACKAGE_MASK_RGB = { r: 225, g: 29, b: 154 };
+const PACKAGE_FIXTURES_DIR = path.join(root, 'fixtures', 'packages');
+const PACKAGE_NEGATIVE_DIR = path.join(PACKAGE_FIXTURES_DIR, 'negative');
+const GUARD_VISOR_EFFECT_ID = 'package:shymask.guard-visor';
+const VERDANT_TINT_EFFECT_ID = 'package:shymask.verdant-tint';
+/**
+ * Required negative package fixtures and the actionable code each must produce.
+ * They are generated reproducibly by `npm run build:packages`.
+ */
+const NEGATIVE_PACKAGE_CASES = [
+  { name: 'malformed-json', code: 'manifest-invalid-json' },
+  { name: 'schema-version-2', code: 'schema-version-unsupported' },
+  { name: 'unsupported-behavior', code: 'unsupported-behavior' },
+  { name: 'missing-asset', code: 'missing-asset' },
+  { name: 'invalid-color', code: 'color-parameter-out-of-range' },
+  { name: 'zip-slip', code: 'entry-path-unsafe' },
+  { name: 'oversized-entry', code: 'entry-too-large' },
+  { name: 'executable-file', code: 'executable-content' },
+  { name: 'unsupported-gltf-extension', code: 'glb-unsupported-extension' },
+];
 /** Window with the largest recorded pose swing in fixtures/pose-loop.json. */
 const MOTION_WINDOW_START_SECONDS = 41.6;
 /** Documented motion window length (docs/fixture-pose-loop.md, docs/notes/0003). */
@@ -1706,16 +1727,22 @@ async function recordedMotionScenario() {
     const samples = [];
     const sampleShots = [];
     let windowExitedAtMs = null;
+    let previousMediaMs = null;
     for (let index = 0; index < 18; index += 1) {
       await page.waitForTimeout(400);
       const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
       const mediaMs = Number(timestamp.mediaMs ?? 0);
-      if (mediaMs > MOTION_WINDOW_END_MS) {
-        // Sampling reached the end of the documented 8 s window; keep the
-        // collected in-window samples and record where it stopped.
+      // Sampling can outrun the remaining window (the reads themselves take
+      // time), so a loop seam back to the start of the clip also ends the
+      // window instead of recording a media time of 0 as an in-window sample.
+      if (
+        mediaMs > MOTION_WINDOW_END_MS ||
+        (previousMediaMs !== null && mediaMs < previousMediaMs - LOOP_SEAM_THRESHOLD_MS)
+      ) {
         windowExitedAtMs = mediaMs;
         break;
       }
+      previousMediaMs = mediaMs;
       const tracking = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
       if (tracking.phase !== 'tracking') continue;
       const mask = await readMask(page);
@@ -1895,6 +1922,464 @@ async function trackerModelScenario() {
   return evidence;
 }
 
+function verifyPackageFixtures() {
+  const required = [
+    path.join(PACKAGE_FIXTURES_DIR, 'guard-visor.zip'),
+    path.join(PACKAGE_FIXTURES_DIR, 'verdant-tint.zip'),
+    ...NEGATIVE_PACKAGE_CASES.map((entry) => path.join(PACKAGE_NEGATIVE_DIR, `${entry.name}.zip`)),
+  ];
+  for (const file of required) {
+    assert.ok(existsSync(file), `Missing effect-package fixture ${file}. Run \`npm run build:packages\`.`);
+    assert.ok(readFileSync(file).length > 0, `Effect-package fixture ${file} is empty.`);
+  }
+}
+
+async function effectOptionValues(page) {
+  return page
+    .locator('[data-testid="effect-select"] option')
+    .evaluateAll((options) => options.map((option) => option.value));
+}
+
+/** Stubs only the OS picker; the real validation/import/store path still runs. */
+async function stubPackageDialog(app, filePath) {
+  await app.evaluate(({ dialog }, selected) => {
+    dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selected] });
+  }, filePath);
+}
+
+async function importPackageThroughControl(app, page, filePath) {
+  await stubPackageDialog(app, filePath);
+  await page.locator('[data-testid="import-package"]').click();
+  return waitFor(
+    `import result for ${path.basename(filePath)}`,
+    async () => {
+      const state = await page.locator('[data-testid="package-result"]').getAttribute('data-state');
+      const text = ((await page.locator('[data-testid="package-result"]').textContent()) ?? '').trim();
+      if (state === 'success' || state === 'error') return { state, text };
+      return null;
+    },
+    20000,
+    100,
+  );
+}
+
+async function readEffectDiagnostic(page) {
+  return parseKeyValues(await readDiagnostic(page, 'diag-effect'));
+}
+
+async function waitForEffectLoaded(page, id, timeoutMs = 20000) {
+  return waitFor(
+    `effect ${id} loaded`,
+    async () => {
+      const values = await readEffectDiagnostic(page);
+      return values.id === id && values.switching === 'false' && values.error === 'no' ? values : null;
+    },
+    timeoutMs,
+    100,
+  );
+}
+
+async function selectEffectThroughControl(page, id) {
+  await page.locator('[data-testid="effect-select"]').selectOption(id);
+  return waitForEffectLoaded(page, id);
+}
+
+function colorNear(actual, expected, tolerance = 16) {
+  return (
+    Math.abs(Number(actual.r) - expected.r) <= tolerance &&
+    Math.abs(Number(actual.g) - expected.g) <= tolerance &&
+    Math.abs(Number(actual.b) - expected.b) <= tolerance
+  );
+}
+
+async function waitForPackageMask(page, label) {
+  const mask = await waitFor(`${label} mask projection`, async () => {
+    const values = await readMask(page);
+    return values.visible === 'true' ? values : null;
+  }, 20000);
+  const face = await readFace(page);
+  assert.ok(
+    originInsideFace(mask, face),
+    `${label}: packaged mask origin must sit on the tracked face: mask=${JSON.stringify(mask)} face=${JSON.stringify(face)}`,
+  );
+  const probe = await readMaskProbe(page);
+  const expected = await readDiagnostic(page, 'diag-mask-color');
+  const expectedRgb = parseKeyValues(expected);
+  assert.ok(
+    colorNear(expectedRgb, PACKAGE_MASK_RGB, 4),
+    `${label}: the packaged unlit material colour must be reported as the probe colour, got ${expected}`,
+  );
+  assert.ok(
+    colorNear(probe, PACKAGE_MASK_RGB, 20),
+    `${label}: preview pixel at the packaged-mask probe must be the package material colour ${JSON.stringify(PACKAGE_MASK_RGB)}, got ${JSON.stringify(probe)}`,
+  );
+  return { mask, face, probe, expectedRgb };
+}
+
+/**
+ * Scenario G: import validated effect packages through the public control, select
+ * them as complete effects, and prove preview + independent camera output, the
+ * paused-output switching policy, negative imports and removal/persistence.
+ */
+async function effectPackageScenario() {
+  log('\n== Scenario I: effect package import, selection, switching and removal ==');
+  const evidence = { imports: {}, negative: [], switching: {}, removal: {}, persistence: {}, camera: {} };
+  // Isolated store so a check run never mutates the developer's userData.
+  const packageDir = path.join(evidenceDir, 'effect-packages');
+  mkdirSync(packageDir, { recursive: true });
+  const env = { SHYMASK_EVIDENCE_DIR: evidenceDir, SHYMASK_PACKAGE_DIR: packageDir };
+
+  let app;
+  let page;
+  let consoleErrors = [];
+  try {
+    ({ app, page, consoleErrors } = await launchApp(env));
+    await waitFor('fixture diagnostics', async () => {
+      const text = await readDiagnostic(page, 'diag-fixture');
+      return text.includes(metadata.id) ? text : null;
+    });
+    await waitForTrackerModelReady(page);
+    await waitFor('start enabled after tracker initialization', async () => {
+      return (await page.locator('[data-testid="start"]').isDisabled()) ? null : true;
+    }, 60000);
+    await page.locator('[data-testid="start"]').click();
+    await waitForTrackingPhase(page);
+    await waitForVirtualCamera(page);
+
+    const initialPackages = await readDiagnostic(page, 'diag-packages');
+    assert.match(initialPackages, /installed=0/);
+    assert.equal(await page.locator('[data-testid="effect-select"]').getAttribute('multiple'), null);
+    assert.equal(await page.locator('select[multiple]').count(), 0);
+
+    // Bundled baseline on the same output path the packages must use.
+    await page.locator('[data-testid="effect-select"]').selectOption('mask');
+    await waitForStatusTitle(page, /Effect active: Rigid mask/);
+    await waitFor('bundled mask projection', async () => {
+      const mask = await readMask(page);
+      return mask.visible === 'true' ? mask : null;
+    });
+    const bundledRgb = await readRgb(page);
+
+    // --- Import the valid mask + treatment package through the UI ------------
+    const guardImport = await importPackageThroughControl(app, page, path.join(PACKAGE_FIXTURES_DIR, 'guard-visor.zip'));
+    assert.equal(guardImport.state, 'success', `valid import must succeed: ${guardImport.text}`);
+    assert.match(guardImport.text, /Imported Guard visor v1\.0\.0/);
+    const optionsAfterGuard = await effectOptionValues(page);
+    assert.ok(optionsAfterGuard.includes(GUARD_VISOR_EFFECT_ID), 'imported effect must appear in the selector');
+    const guardLoaded = await waitForEffectLoaded(page, GUARD_VISOR_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Guard visor/);
+    assert.equal(await page.locator('[data-testid="effect-select"]').inputValue(), GUARD_VISOR_EFFECT_ID);
+    assert.equal(guardLoaded.source, 'package');
+    assert.equal(guardLoaded.mask, 'gltf');
+    assert.equal(guardLoaded.treatment, 'yes');
+    assert.ok(
+      Number(guardLoaded.switchingPausedFrames) >= 1,
+      `an async package switch must pause the output while loading, got ${guardLoaded.switchingPausedFrames}`,
+    );
+    assert.ok(Number(guardLoaded.switchCount) >= 1);
+    const guardPreview = await waitForPackageMask(page, 'imported guard visor');
+    const guardRgb = await readRgb(page);
+    const guardShot = await screenshotCanvas(page, '21-imported-guard-visor-preview.png');
+    evidence.imports.guardVisor = {
+      importMessage: guardImport.text,
+      effect: guardLoaded,
+      mask: guardPreview.mask,
+      face: guardPreview.face,
+      probe: guardPreview.probe,
+      preview: guardRgb,
+      bundledPreview: bundledRgb,
+      screenshot: guardShot,
+    };
+    pass(
+      'A valid effect package imports through the public control and renders its mask + color treatment in preview',
+      `effect=${GUARD_VISOR_EFFECT_ID} probe=${JSON.stringify(guardPreview.probe)} switchingPausedFrames=${guardLoaded.switchingPausedFrames} ${guardShot}`,
+    );
+
+    // The independent camera consumer must receive the same packaged canvas.
+    const guardCameraRun = await captureCameraState(page, 'imported-guard-visor', 6);
+    assertProcessedFrames(guardCameraRun.frames, guardRgb, 'imported guard visor');
+    const guardPng = assertProcessedPng(guardCameraRun.frames, guardRgb, 'imported guard visor');
+    const guardMaskPixels = pngColorCount(guardPng.png, PACKAGE_MASK_RGB, 28);
+    assert.ok(guardMaskPixels > 100, `camera PNG must contain the package mask material, found ${guardMaskPixels} pixels`);
+    const guardCameraPixel = pngPixel(guardPng.png, Number(guardPreview.probe.x), Number(guardPreview.probe.y));
+    assert.ok(
+      colorNear(guardCameraPixel, PACKAGE_MASK_RGB, 28),
+      `camera PNG pixel at the packaged mask probe must be the package material colour, got ${JSON.stringify(guardCameraPixel)}`,
+    );
+    evidence.camera.guardVisor = {
+      preview: guardRgb,
+      camera: averageFrameRgb(guardCameraRun.frames),
+      png: guardPng.png,
+      pngRgb: guardPng.rgb,
+      maskPixels: guardMaskPixels,
+      cameraPixel: guardCameraPixel,
+    };
+    pass(
+      'The virtual camera receives the same imported mask + treatment through the shared output path',
+      `camera=${JSON.stringify(evidence.camera.guardVisor.camera)} maskPixels=${guardMaskPixels} probePixel=${JSON.stringify(guardCameraPixel)} ${guardPng.png}`,
+    );
+
+    // --- Import a color-treatment-only package -------------------------------
+    const verdantImport = await importPackageThroughControl(app, page, path.join(PACKAGE_FIXTURES_DIR, 'verdant-tint.zip'));
+    assert.equal(verdantImport.state, 'success', `valid color-only import must succeed: ${verdantImport.text}`);
+    const optionsAfterVerdant = await effectOptionValues(page);
+    assert.ok(optionsAfterVerdant.includes(VERDANT_TINT_EFFECT_ID));
+    const verdantLoaded = await waitForEffectLoaded(page, VERDANT_TINT_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Verdant tint/);
+    assert.equal(await page.locator('[data-testid="effect-select"]').inputValue(), VERDANT_TINT_EFFECT_ID);
+    assert.equal(verdantLoaded.mask, 'none');
+    assert.equal(verdantLoaded.treatment, 'yes');
+    await page.waitForTimeout(350);
+    const verdantRgb = await readRgb(page);
+    assert.ok(
+      verdantRgb.g > verdantRgb.r + 8 && verdantRgb.g > verdantRgb.b + 8,
+      `the package's declarative green treatment must visibly change the preview, got ${JSON.stringify(verdantRgb)}`,
+    );
+    const verdantShot = await screenshotCanvas(page, '22-imported-verdant-tint-preview.png');
+    const verdantRun = await captureCameraState(page, 'imported-verdant-tint', 6);
+    assertProcessedFrames(verdantRun.frames, verdantRgb, 'imported verdant tint');
+    const verdantPng = assertProcessedPng(verdantRun.frames, verdantRgb, 'imported verdant tint');
+    evidence.imports.verdantTint = {
+      importMessage: verdantImport.text,
+      effect: verdantLoaded,
+      preview: verdantRgb,
+      screenshot: verdantShot,
+    };
+    evidence.camera.verdantTint = {
+      preview: verdantRgb,
+      camera: averageFrameRgb(verdantRun.frames),
+      png: verdantPng.png,
+      pngRgb: verdantPng.rgb,
+    };
+    pass(
+      'A color-treatment-only package renders in preview and the virtual camera through the same path',
+      `preview=${JSON.stringify(verdantRgb)} camera=${JSON.stringify(evidence.camera.verdantTint.camera)} ${verdantShot} ${verdantPng.png}`,
+    );
+
+    // --- Switching: bundled -> imported -> imported, with paused output ------
+    await page.locator('[data-testid="effect-select"]').selectOption('mask');
+    await waitForEffectLoaded(page, 'mask');
+    const beforeSwitch = await readEffectDiagnostic(page);
+    await selectEffectThroughControl(page, GUARD_VISOR_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Guard visor/);
+    const afterGuardSwitch = await readEffectDiagnostic(page);
+    assert.ok(
+      Number(afterGuardSwitch.switchingPausedFrames) > Number(beforeSwitch.switchingPausedFrames),
+      `switching to an imported effect must paint the paused output first: before=${beforeSwitch.switchingPausedFrames} after=${afterGuardSwitch.switchingPausedFrames}`,
+    );
+    await selectEffectThroughControl(page, VERDANT_TINT_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Verdant tint/);
+    await selectEffectThroughControl(page, GUARD_VISOR_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Guard visor/);
+    const afterRoundTrip = await readEffectDiagnostic(page);
+    assert.ok(Number(afterRoundTrip.switchCount) >= Number(afterGuardSwitch.switchCount));
+    evidence.switching.bundledToImported = { before: beforeSwitch, after: afterGuardSwitch, roundTrip: afterRoundTrip };
+    pass(
+      'Switching between bundled and imported effects completes without raw passthrough',
+      `switchCount=${afterRoundTrip.switchCount} switchingPausedFrames=${afterRoundTrip.switchingPausedFrames}`,
+    );
+
+    // --- Manual pause persists across a switch -------------------------------
+    await page.locator('[data-testid="pause-toggle"]').click();
+    const manualPause = await waitFor('manual pause status', async () => {
+      const status = await readStatus(page);
+      return /paused manually/i.test(status.explanation) ? status : null;
+    });
+    await page.locator('[data-testid="effect-select"]').selectOption(VERDANT_TINT_EFFECT_ID);
+    await page.waitForTimeout(300);
+    const stillPaused = await readStatus(page);
+    assert.equal(stillPaused.mode, 'paused');
+    assert.match(stillPaused.explanation, /paused manually/i);
+    const manualRun = await captureCameraState(page, 'imported-manual-pause', 4);
+    assertAllPausedFrames(manualRun.frames, 'imported effect manual pause');
+    const manualPng = assertPausedPng(manualRun.frames, 'imported effect manual pause');
+    const manualShot = await screenshotCanvas(page, '23-imported-effect-manual-pause.png');
+    await page.locator('[data-testid="pause-toggle"]').click();
+    await waitForStatusTitle(page, /Effect active: Verdant tint/);
+    evidence.switching.manualPause = {
+      status: manualPause,
+      pausedAfterSwitch: stillPaused,
+      camera: averageFrameRgb(manualRun.frames),
+      png: manualPng.png,
+      screenshot: manualShot,
+    };
+    pass(
+      'Manual pause persists across an effect switch and the camera stays on the opaque paused canvas',
+      `camera=${JSON.stringify(evidence.switching.manualPause.camera)} ${manualShot}`,
+    );
+
+    // --- Tracking gates still apply to imported effects ----------------------
+    await selectEffectThroughControl(page, GUARD_VISOR_EFFECT_ID);
+    await page.locator('[data-testid="tracking-injection"]').selectOption('lost');
+    const importedLost = await waitFor('imported effect tracking loss', async () => {
+      const status = await readStatus(page);
+      return /tracking was lost/i.test(status.explanation) ? status : null;
+    });
+    assert.equal(importedLost.mode, 'paused');
+    await page.waitForTimeout(300);
+    const importedLostRgb = await readRgb(page);
+    assert.ok(rgbSum(importedLostRgb) < 120, `tracking loss must hide the imported effect, got ${JSON.stringify(importedLostRgb)}`);
+    const importedLostRun = await captureCameraState(page, 'imported-tracking-lost', 4);
+    assertAllPausedFrames(importedLostRun.frames, 'imported effect tracking loss');
+    const importedLostPng = assertPausedPng(importedLostRun.frames, 'imported effect tracking loss');
+    const importedLostShot = await screenshotCanvas(page, '24-imported-effect-tracking-lost.png');
+    await page.locator('[data-testid="tracking-injection"]').selectOption('auto');
+    await waitForStatusTitle(page, /Effect active: Guard visor/);
+    const recoveredRgb = await readRgb(page);
+    assert.ok(rgbSum(recoveredRgb) > 120, 'the imported effect must recover automatically');
+    evidence.switching.trackingGate = {
+      paused: importedLostRgb,
+      camera: averageFrameRgb(importedLostRun.frames),
+      png: importedLostPng.png,
+      screenshot: importedLostShot,
+      recovered: recoveredRgb,
+    };
+    pass(
+      'Tracking loss hides an imported effect in preview and camera, and recovery is automatic',
+      `preview=${JSON.stringify(importedLostRgb)} camera=${JSON.stringify(evidence.switching.trackingGate.camera)} recovered=${JSON.stringify(recoveredRgb)}`,
+    );
+
+    // --- An effect-processing interruption keeps the paused-output policy ----
+    await page.locator('[data-testid="simulate-failure"]').check();
+    const interrupted = await waitFor('imported effect processing interruption', async () => {
+      const status = await readStatus(page);
+      return /simulated by the diagnostic control/i.test(status.explanation) ? status : null;
+    });
+    assert.equal(interrupted.mode, 'paused');
+    await page.waitForTimeout(300);
+    const interruptedRgb = await readRgb(page);
+    assert.ok(rgbSum(interruptedRgb) < 120, `a processing interruption must hide the imported effect, got ${JSON.stringify(interruptedRgb)}`);
+    const interruptedRun = await captureCameraState(page, 'imported-processing-failure', 4);
+    assertAllPausedFrames(interruptedRun.frames, 'imported effect processing interruption');
+    const interruptedPng = assertPausedPng(interruptedRun.frames, 'imported effect processing interruption');
+    await page.locator('[data-testid="simulate-failure"]').uncheck();
+    await waitForStatusTitle(page, /Effect active: Guard visor/);
+    const interruptionRecovered = await readRgb(page);
+    assert.ok(rgbSum(interruptionRecovered) > 120, 'the imported effect must recover after the interruption clears');
+    evidence.switching.processingInterruption = {
+      paused: interruptedRgb,
+      camera: averageFrameRgb(interruptedRun.frames),
+      png: interruptedPng.png,
+      recovered: interruptionRecovered,
+    };
+    pass(
+      'An effect-processing interruption hides an imported effect in preview and camera, and recovery is automatic',
+      `preview=${JSON.stringify(interruptedRgb)} camera=${JSON.stringify(evidence.switching.processingInterruption.camera)} recovered=${JSON.stringify(interruptionRecovered)}`,
+    );
+
+    // --- Negative imports keep the current effect and never crash ------------
+    await selectEffectThroughControl(page, GUARD_VISOR_EFFECT_ID);
+    for (const negative of NEGATIVE_PACKAGE_CASES) {
+      const result = await importPackageThroughControl(app, page, path.join(PACKAGE_NEGATIVE_DIR, `${negative.name}.zip`));
+      assert.equal(result.state, 'error', `${negative.name}: negative import must be rejected`);
+      assert.ok(
+        result.text.includes(negative.code),
+        `${negative.name}: expected actionable code ${negative.code}, got: ${result.text}`,
+      );
+      assert.ok(result.text.length > 60, `${negative.name}: error feedback must be actionable`);
+      const statusAfterReject = await readStatus(page);
+      assert.equal(statusAfterReject.mode, 'render', `${negative.name}: a rejected import must not change the active output`);
+      assert.match(statusAfterReject.title, /Effect active: Guard visor/);
+      const rejectionProbe = await readMaskProbe(page);
+      assert.ok(
+        colorNear(rejectionProbe, PACKAGE_MASK_RGB, 20),
+        `${negative.name}: the previous packaged effect must keep rendering, got probe ${JSON.stringify(rejectionProbe)}`,
+      );
+      evidence.negative.push({ name: negative.name, expectedCode: negative.code, message: result.text.slice(0, 400) });
+    }
+    await page.screenshot({ path: path.join(screenshotsDir, '25-package-import-error.png') });
+    const afterNegatives = await readEffectDiagnostic(page);
+    assert.equal(afterNegatives.id, GUARD_VISOR_EFFECT_ID);
+    assert.equal(afterNegatives.error, 'no');
+    pass(
+      'Malformed, unsupported, unsafe and oversized packages are rejected with actionable feedback and no crash',
+      `${NEGATIVE_PACKAGE_CASES.length} negative fixtures: ${NEGATIVE_PACKAGE_CASES.map((entry) => entry.code).join(', ')}`,
+    );
+
+    // --- Removal falls back to no-effect paused output -----------------------
+    await page.locator('[data-testid="remove-package"]').click();
+    const removalText = await waitFor('removal result', async () => {
+      const state = await page.locator('[data-testid="package-result"]').getAttribute('data-state');
+      const text = ((await page.locator('[data-testid="package-result"]').textContent()) ?? '').trim();
+      return state === 'success' && /Removed the imported effect/.test(text) ? text : null;
+    });
+    const optionsAfterRemoval = await effectOptionValues(page);
+    assert.ok(!optionsAfterRemoval.includes(GUARD_VISOR_EFFECT_ID), 'removed effect must leave the selector');
+    assert.ok(optionsAfterRemoval.includes(VERDANT_TINT_EFFECT_ID), 'other imported effects must remain');
+    await waitForStatusTitle(page, /^Tracking paused$/);
+    await page.waitForTimeout(300);
+    const removalStatus = await readStatus(page);
+    assert.match(removalStatus.explanation, /No effect is active/i);
+    const removalRgb = await readRgb(page);
+    assert.ok(rgbSum(removalRgb) < 120, `removal must leave the opaque paused output, got ${JSON.stringify(removalRgb)}`);
+    const removalRun = await captureCameraState(page, 'removed-package', 4);
+    assertAllPausedFrames(removalRun.frames, 'removed imported package');
+    const removalPng = assertPausedPng(removalRun.frames, 'removed imported package');
+    const removalShot = await screenshotCanvas(page, '26-removed-package-paused.png');
+    evidence.removal = {
+      message: removalText,
+      status: removalStatus,
+      preview: removalRgb,
+      camera: averageFrameRgb(removalRun.frames),
+      png: removalPng.png,
+      screenshot: removalShot,
+    };
+    pass(
+      'Removing the active imported effect falls back to the no-effect opaque paused output in preview and camera',
+      `${JSON.stringify(removalRgb)} camera=${JSON.stringify(evidence.removal.camera)} ${removalShot}`,
+    );
+
+    assert.deepEqual(consoleErrors, [], `renderer console errors: ${consoleErrors.join(' | ')}`);
+
+    // --- Persistence across restart -----------------------------------------
+    await closeApp(app);
+    app = null;
+    const relaunched = await launchApp(env);
+    app = relaunched.app;
+    page = relaunched.page;
+    consoleErrors = relaunched.consoleErrors;
+    await waitForTrackerModelReady(page);
+    const persistedPackages = parseKeyValues(await readDiagnostic(page, 'diag-packages'));
+    assert.equal(persistedPackages.installed, '1', `expected one persisted package, got ${JSON.stringify(persistedPackages)}`);
+    const persistedOptions = await effectOptionValues(page);
+    assert.ok(persistedOptions.includes(VERDANT_TINT_EFFECT_ID), 'imported effect must survive an app restart');
+    assert.ok(!persistedOptions.includes(GUARD_VISOR_EFFECT_ID), 'removed effect must stay removed after restart');
+    await waitFor('start enabled after restart', async () => {
+      return (await page.locator('[data-testid="start"]').isDisabled()) ? null : true;
+    }, 60000);
+    await page.locator('[data-testid="start"]').click();
+    await waitForTrackingPhase(page);
+    await waitForVirtualCamera(page);
+    await selectEffectThroughControl(page, VERDANT_TINT_EFFECT_ID);
+    await waitForStatusTitle(page, /Effect active: Verdant tint/);
+    await page.waitForTimeout(350);
+    const persistedRgb = await readRgb(page);
+    assert.ok(
+      persistedRgb.g > persistedRgb.r + 8 && persistedRgb.g > persistedRgb.b + 8,
+      `persisted package treatment must render after restart, got ${JSON.stringify(persistedRgb)}`,
+    );
+    const persistedRun = await captureCameraState(page, 'persisted-package', 4);
+    assertProcessedFrames(persistedRun.frames, persistedRgb, 'persisted package');
+    const persistedPng = assertProcessedPng(persistedRun.frames, persistedRgb, 'persisted package');
+    const persistedShot = await screenshotCanvas(page, '27-persisted-package-preview.png');
+    evidence.persistence = {
+      packages: persistedPackages,
+      preview: persistedRgb,
+      camera: averageFrameRgb(persistedRun.frames),
+      png: persistedPng.png,
+      screenshot: persistedShot,
+    };
+    pass(
+      'An imported effect survives an app restart and renders through preview and camera',
+      `installed=${persistedPackages.installed} preview=${JSON.stringify(persistedRgb)} ${persistedShot} ${persistedPng.png}`,
+    );
+    assert.deepEqual(consoleErrors, [], `renderer console errors after restart: ${consoleErrors.join(' | ')}`);
+  } finally {
+    if (app) await closeApp(app);
+  }
+  return evidence;
+}
+
 function staticCameraGuard() {
   log('\n== Camera-safety source guard ==');
   const sourceFiles = [];
@@ -1970,6 +2455,7 @@ async function main() {
   log(`node:     ${environment.node} | electron ${environment.electron}`);
 
   verifyFixtureFile();
+  verifyPackageFixtures();
   prepareNativeComponents();
   staticCameraGuard();
   await normalFixtureScenario();
@@ -1980,6 +2466,7 @@ async function main() {
   const trackingMask = await trackingMaskScenario();
   const recordedMotion = await recordedMotionScenario();
   const trackerModel = await trackerModelScenario();
+  const effectPackages = await effectPackageScenario();
   const trackerMetadata = JSON.parse(readFileSync(path.join(root, 'tracker', 'face-landmarker-model.json'), 'utf8'));
   const motionManifest = JSON.parse(readFileSync(path.join(root, 'fixtures', 'pose-loop.json'), 'utf8'));
 
@@ -2021,10 +2508,14 @@ async function main() {
       'Tracker inference cost is performance.now() around one MediaPipe detectForVideo call; the first warm-up inference is reported separately and excluded from the p95.',
       'Mask placement/orientation is derived from the MediaPipe facial transformation matrix using its documented 63 degree vertical-FOV camera assumption; it is a rigid attachment, not occlusion-aware.',
       'Tracking-loss, multiple-face and unreliable-tracking policy states in Scenario F are produced by the labelled diagnostic injection control; the real detector path is used for the normal tracking and recorded-motion states. The recorded-motion clip is real recorded video from a second CC0 fixture, positioned by seeking to a documented window.',
+      'Effect-package evidence uses an isolated SHYMASK_PACKAGE_DIR and stubs only the Electron OS file picker in the main process; validation, archive safety checks, storage, asset protocol loading and GLTFLoader parsing are the real paths. A rejected dialog cancellation is not exercised.',
+      'The sample packages are committed generated fixtures (deterministic GLB writer + `npm run build:packages`), not Blender output; the contract and validator are what the later Blender/AI authoring slice will use.',
+      'Package complexity measurements (triangles, meshes, materials, bytes) are reported for the later budget slice; they are not final complexity budgets and nothing here asserts an unmeasured threshold.',
     ],
     commands: {
       build: 'npm run build',
       buildNative: 'npm run build:native',
+      buildPackages: 'npm run build:packages',
       installCamera: 'npm run vcam:install',
       typecheck: 'npm run typecheck',
       test: 'npm test',
@@ -2083,6 +2574,21 @@ async function main() {
         recordedMotion,
         trackerModel,
       },
+    },
+    effectPackages: {
+      contract: {
+        schemaVersion: 1,
+        shape: 'ZIP with a root manifest.json (schemaVersion: 1) and declared assets under assets/; mask (self-contained GLB + face attachment) and/or declarative color treatment; one complete effect selected at a time.',
+        unsupported: [
+          'arbitrary executable/script content (rejected)',
+          'expression reactions and other declared behaviors (reserved; non-empty declarations rejected)',
+          'glTF animations, skins, cameras, lights and external resources (rejected)',
+          'stacking multiple complete effects (no UI)',
+        ],
+      },
+      validationCodes: NEGATIVE_PACKAGE_CASES.map((entry) => entry.code),
+      negativeFixtures: effectPackages.negative,
+      evidence: effectPackages,
     },
     timing: {
       ...timing,

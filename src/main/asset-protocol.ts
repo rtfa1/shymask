@@ -22,6 +22,8 @@ export interface AssetRoots {
   rendererDir: string;
   trackerDir: string;
   fixtureDir: string;
+  /** Persisted effect-package assets, served at `shymask://app/packages/...`. */
+  packageDir: string;
 }
 
 interface ResolvedAsset {
@@ -38,11 +40,13 @@ const MIME_TYPES: Record<string, string> = {
   '.webm': 'video/webm',
   '.json': 'application/json; charset=utf-8',
   '.png': 'image/png',
+  '.glb': 'model/gltf-binary',
 };
 
 const ROUTES = {
   fixture: 'fixtureDir',
   tracker: 'trackerDir',
+  packages: 'packageDir',
 } as const;
 
 function safeJoin(root: string, segments: string[]): string | null {
@@ -69,7 +73,7 @@ export function resolveAssetPath(roots: AssetRoots, pathname: string): ResolvedA
   const [route, ...rest] = segments;
   let root: string;
   let relative: string[];
-  if (route === 'fixture' || route === 'tracker') {
+  if (route === 'fixture' || route === 'tracker' || route === 'packages') {
     root = roots[ROUTES[route]];
     relative = rest;
   } else {

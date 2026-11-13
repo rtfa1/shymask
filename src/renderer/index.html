@@ -48,6 +48,13 @@
             <span>Effect</span>
             <select id="effect-select" data-testid="effect-select"></select>
           </label>
+          <div class="button-row secondary">
+            <button id="import-package" data-testid="import-package" type="button">Import package&hellip;</button>
+            <button id="remove-package" data-testid="remove-package" type="button" disabled>Remove imported effect</button>
+          </div>
+          <p class="package-result" id="package-result" data-testid="package-result" aria-live="polite">
+            No imported effect packages.
+          </p>
           <label class="field" for="tracking-injection">
             <span>Tracking state (diagnostic)</span>
             <select id="tracking-injection" data-testid="tracking-injection" disabled></select>
@@ -80,6 +87,8 @@
             <div><dt>Output</dt><dd id="diag-output"></dd></div>
             <div><dt>Fixture</dt><dd id="diag-fixture"></dd></div>
             <div><dt>Model</dt><dd id="diag-model"></dd></div>
+            <div><dt>Effect</dt><dd id="diag-effect"></dd></div>
+            <div><dt>Imported packages</dt><dd id="diag-packages"></dd></div>
             <div><dt>Tracking</dt><dd id="diag-tracking"></dd></div>
             <div><dt>Tracker inference</dt><dd id="diag-tracking-timing"></dd></div>
             <div><dt>Tracked face</dt><dd id="diag-face"></dd></div>
