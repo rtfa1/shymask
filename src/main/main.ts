@@ -1,8 +1,18 @@
-import { app, BrowserWindow, ipcMain, protocol } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, protocol, type OpenDialogOptions } from 'electron';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import type { CameraFrame, CaptureResult, FixtureInfo, StartupInfo, TrackerInfo, VirtualCameraStatus } from '../core/bridge';
+import type {
+  CameraFrame,
+  CaptureResult,
+  FixtureInfo,
+  ImportEffectPackageResult,
+  RemoveEffectPackageResult,
+  StartupInfo,
+  TrackerInfo,
+  VirtualCameraStatus,
+} from '../core/bridge';
 import { createAssetHandler } from './asset-protocol';
+import { EffectPackageStore } from './effect-packages';
 import { FIXTURE_METADATA_FILENAME, loadFixture } from './fixture';
 import { loadTracker } from './tracker';
 import { VirtualCameraPublisher } from './virtual-camera';
@@ -28,6 +38,19 @@ const assetScheme = 'shymask';
 const assetBaseUrl = `${assetScheme}://app`;
 const fixtureUrlBase = `${assetBaseUrl}/fixture`;
 const trackerUrlBase = `${assetBaseUrl}/tracker`;
+const packageUrlBase = `${assetBaseUrl}/packages`;
+// Imported effect packages persist under Electron's userData by default. The
+// public-workflow check points this at an evidence-local directory so a check
+// run never edits the developer's installed packages.
+const packageDir = process.env.SHYMASK_PACKAGE_DIR
+  ? path.resolve(process.env.SHYMASK_PACKAGE_DIR)
+  : path.join(app.getPath('userData'), 'effect-packages');
+let packageStore: EffectPackageStore | null = null;
+
+function getPackageStore(): EffectPackageStore {
+  packageStore ??= new EffectPackageStore(packageDir, packageUrlBase);
+  return packageStore;
+}
 
 // The renderer, its WASM assets and the replay clip are served from a local
 // asset scheme so Fetch API/WASM and byte-range media work under a strict CSP.
@@ -104,7 +127,29 @@ function createWindow(): void {
 }
 
 ipcMain.handle('shymask:startup-info', (): StartupInfo => {
-  return { fixture: currentFixture, tracker: currentTracker };
+  return { fixture: currentFixture, tracker: currentTracker, effectPackages: getPackageStore().list() };
+});
+
+ipcMain.handle('shymask:effect-package-import', async (event): Promise<ImportEffectPackageResult> => {
+  const store = getPackageStore();
+  const parent = BrowserWindow.fromWebContents(event.sender) ?? mainWindow;
+  const options: OpenDialogOptions = {
+    title: 'Import a Shymask effect package',
+    buttonLabel: 'Import package',
+    properties: ['openFile'],
+    filters: [{ name: 'Shymask effect package', extensions: ['zip'] }],
+  };
+  const picked = parent
+    ? await dialog.showOpenDialog(parent, options)
+    : await dialog.showOpenDialog(options);
+  if (picked.canceled || picked.filePaths.length === 0) {
+    return { status: 'cancelled', message: 'Import cancelled.', issues: [], list: store.list() };
+  }
+  return store.importArchive(picked.filePaths[0] as string);
+});
+
+ipcMain.handle('shymask:effect-package-remove', (_event, id: unknown): RemoveEffectPackageResult => {
+  return getPackageStore().remove(typeof id === 'string' ? id : '');
 });
 
 ipcMain.handle('shymask:recheck-fixture', (): FixtureInfo => {
@@ -174,7 +219,7 @@ function broadcastVirtualCameraStatus(status: VirtualCameraStatus): void {
 app.whenReady().then(() => {
   protocol.handle(
     assetScheme,
-    createAssetHandler({ rendererDir, trackerDir, fixtureDir }),
+    createAssetHandler({ rendererDir, trackerDir, fixtureDir, packageDir }),
   );
   createWindow();
   virtualCamera = new VirtualCameraPublisher({

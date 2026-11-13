@@ -25,6 +25,7 @@ function makeFixture(clipBytes: Buffer = CLIP_BYTES): Fixture {
     rendererDir: path.join(dir, 'renderer'),
     trackerDir: path.join(dir, 'tracker'),
     fixtureDir: path.join(dir, 'fixture'),
+    packageDir: path.join(dir, 'packages'),
   };
   for (const root of Object.values(roots)) mkdirSync(root, { recursive: true });
   const clipPath = path.join(roots.fixtureDir, 'clip.webm');

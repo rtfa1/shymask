@@ -228,3 +228,61 @@ test('a tracking pause never renders even when the effect and frame are ready', 
     }
   }
 });
+
+test('an async effect switch keeps the opaque paused output until the new effect is ready', () => {
+  const decision = resolveOutput(
+    state({ effect: 'package:studio.guard-visor', effectLabel: 'Guard visor', switching: true }),
+  );
+  assert.equal(decision.mode, 'paused');
+  assert.equal(decision.reason, 'effect-switching');
+  assert.equal(decision.title, PAUSED_TITLE);
+  assert.match(decision.explanation, /Switching to Guard visor/);
+  assert.equal(resolveOutput(state({ effectLabel: 'Guard visor', switching: false })).mode, 'render');
+});
+
+test('manual pause persists while a package switch is in flight', () => {
+  const decision = resolveOutput(
+    state({ effect: 'package:studio.guard-visor', effectLabel: 'Guard visor', switching: true, manualPaused: true }),
+  );
+  assert.equal(decision.mode, 'paused');
+  assert.equal(decision.reason, 'manual-pause');
+});
+
+test('a stale or invalid effect selection hides the output instead of rendering raw frames', () => {
+  const decision = resolveOutput(
+    state({ effect: 'package:removed.package', effectLabel: 'Removed effect', effectValid: false }),
+  );
+  assert.equal(decision.mode, 'paused');
+  assert.equal(decision.reason, 'effect-invalid');
+  assert.equal(decision.title, PAUSED_TITLE);
+  assert.match(decision.action ?? '', /Choose another effect/);
+});
+
+test('a package load failure keeps the output paused with an explanation and recovers when cleared', () => {
+  const failed = state({
+    effect: 'package:studio.guard-visor',
+    effectLabel: 'Guard visor',
+    effectError: 'The imported effect could not be loaded "Guard visor": the local asset request returned HTTP 404.',
+  });
+  const decision = resolveOutput(failed);
+  assert.equal(decision.mode, 'paused');
+  assert.equal(decision.reason, 'effect-unavailable');
+  assert.match(decision.explanation, /could not be loaded/);
+  assert.match(decision.action ?? '', /remove the imported package/);
+  assert.equal(resolveOutput({ ...failed, effectError: null }).mode, 'render');
+});
+
+test('a complete package effect renders with combined face-attachment and treatment wording', () => {
+  const decision = resolveOutput(
+    state({
+      effect: 'package:studio.guard-visor',
+      effectLabel: 'Guard visor',
+      effectHasMask: true,
+      effectHasTreatment: true,
+    }),
+  );
+  assert.equal(decision.mode, 'render');
+  assert.equal(decision.title, 'Effect active: Guard visor');
+  assert.match(decision.explanation, /mask attached to the tracked face/);
+  assert.match(decision.explanation, /color treatment/);
+});

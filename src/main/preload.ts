@@ -3,6 +3,8 @@ import type {
   CameraFrame,
   CaptureResult,
   FixtureInfo,
+  ImportEffectPackageResult,
+  RemoveEffectPackageResult,
   ShymaskBridge,
   StartupInfo,
   VirtualCameraStatus,
@@ -14,6 +16,12 @@ const bridge: ShymaskBridge = {
   },
   recheckFixture(): Promise<FixtureInfo> {
     return ipcRenderer.invoke('shymask:recheck-fixture') as Promise<FixtureInfo>;
+  },
+  importEffectPackage(): Promise<ImportEffectPackageResult> {
+    return ipcRenderer.invoke('shymask:effect-package-import') as Promise<ImportEffectPackageResult>;
+  },
+  removeEffectPackage(id: string): Promise<RemoveEffectPackageResult> {
+    return ipcRenderer.invoke('shymask:effect-package-remove', id) as Promise<RemoveEffectPackageResult>;
   },
   captureOutputPng(dataUrl: string): Promise<CaptureResult> {
     return ipcRenderer.invoke('shymask:capture-output', dataUrl) as Promise<CaptureResult>;

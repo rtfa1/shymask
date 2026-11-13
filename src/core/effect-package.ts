@@ -1,0 +1,641 @@
+/**
+ * Pure, unit-testable validation for Shymask effect packages (contract v1).
+ *
+ * `validateEffectPackage` takes archive bytes and returns either a validated,
+ * in-memory package (manifest + declared asset bytes + complexity measurements)
+ * or structured, actionable issues. It never writes to disk, never executes
+ * package content, and rejects any file that is not the manifest or a declared
+ * `.glb` asset, which is what enforces ADR-0004's "declared behaviors, never
+ * arbitrary executable effect code".
+ *
+ * See docs/effect-packages.md for the schema, the error codes and what is
+ * explicitly unsupported in v1.
+ */
+
+import {
+  COLOR_PARAMETER_BOUNDS,
+  DEFAULT_MASK_ATTACHMENT,
+  EFFECT_PACKAGE_SCHEMA_VERSION,
+  MASK_ATTACHMENT_LIMITS,
+  PACKAGE_ASSET_PREFIX,
+  PACKAGE_MANIFEST_PATH,
+  PACKAGE_SAFETY_LIMITS,
+  countDeclaredColorParameters,
+  type ColorTreatmentParameters,
+  type EffectPackageAuthor,
+  type EffectPackageManifestV1,
+  type MaskAttachment,
+  type PackageComplexity,
+  type PackageIssue,
+} from './effect-package-contract';
+import { inspectGlb } from './glb';
+import { readZip, type ZipEntry } from './zip';
+
+export interface ValidatedEffectPackage {
+  manifest: EffectPackageManifestV1;
+  /** Archive path -> bytes, only for entries the manifest declares. */
+  assets: ReadonlyMap<string, Uint8Array>;
+  complexity: PackageComplexity;
+  warnings: PackageIssue[];
+}
+
+export type EffectPackageValidation =
+  | { ok: true; package: ValidatedEffectPackage }
+  | { ok: false; errors: PackageIssue[]; warnings: PackageIssue[] };
+
+const EXECUTABLE_EXTENSIONS = new Set([
+  '.js',
+  '.mjs',
+  '.cjs',
+  '.jsx',
+  '.ts',
+  '.tsx',
+  '.exe',
+  '.dll',
+  '.so',
+  '.dylib',
+  '.sh',
+  '.ps1',
+  '.bat',
+  '.cmd',
+  '.com',
+  '.py',
+  '.rb',
+  '.pl',
+  '.php',
+  '.node',
+  '.wasm',
+  '.html',
+  '.htm',
+  '.xhtml',
+  '.svg',
+  '.jar',
+  '.class',
+]);
+
+const MANIFEST_KEYS = new Set([
+  'schemaVersion',
+  'id',
+  'name',
+  'version',
+  'description',
+  'author',
+  'mask',
+  'colorTreatment',
+  'expressionReactions',
+  'behaviors',
+]);
+const AUTHOR_KEYS = new Set(['name', 'attribution', 'license', 'url']);
+const MASK_KEYS = new Set(['asset', 'attachment']);
+const ATTACHMENT_KEYS = new Set(['position', 'rotationDeg', 'scale']);
+const ASSET_PATH_PATTERN = /^assets\/[A-Za-z0-9][A-Za-z0-9._-]*\.glb$/;
+const PACKAGE_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{1,62}$/;
+const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
+
+function issue(
+  severity: PackageIssue['severity'],
+  code: PackageIssue['code'],
+  message: string,
+  path?: string,
+): PackageIssue {
+  return { severity, code, message, ...(path ? { path } : {}) };
+}
+
+function error(code: PackageIssue['code'], message: string, path?: string): PackageIssue {
+  return issue('error', code, message, path);
+}
+
+function warning(code: PackageIssue['code'], message: string, path?: string): PackageIssue {
+  return issue('warning', code, message, path);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function extensionOf(name: string): string {
+  const base = name.slice(name.lastIndexOf('/') + 1);
+  const dot = base.lastIndexOf('.');
+  return dot >= 0 ? base.slice(dot).toLowerCase() : '';
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function readString(
+  value: unknown,
+  field: string,
+  minimum: number,
+  maximum: number,
+  issues: PackageIssue[],
+  code: PackageIssue['code'] = 'identity-invalid',
+): string | null {
+  if (typeof value !== 'string' || value.trim().length < minimum || value.length > maximum) {
+    issues.push(
+      error(
+        code,
+        `manifest ${field} must be a string of ${minimum}-${maximum} characters.`,
+        field,
+      ),
+    );
+    return null;
+  }
+  return value;
+}
+
+function validateAuthor(value: unknown, issues: PackageIssue[]): EffectPackageAuthor | null {
+  if (!isRecord(value)) {
+    issues.push(error('identity-invalid', 'manifest author must be an object with a name.', 'author'));
+    return null;
+  }
+  for (const key of Object.keys(value)) {
+    if (!AUTHOR_KEYS.has(key)) {
+      issues.push(warning('unknown-field', `Unknown author field "${key}" is ignored.`, `author.${key}`));
+    }
+  }
+  const name = readString(value.name, 'author.name', 1, 80, issues);
+  if (!name) return null;
+  const author: EffectPackageAuthor = { name };
+  if (value.attribution !== undefined) {
+    if (typeof value.attribution !== 'string' || value.attribution.length > 200) {
+      issues.push(error('identity-invalid', 'manifest author.attribution must be a string of at most 200 characters.', 'author.attribution'));
+    } else {
+      author.attribution = value.attribution;
+    }
+  }
+  if (value.license !== undefined) {
+    if (typeof value.license !== 'string' || value.license.length > 40) {
+      issues.push(error('identity-invalid', 'manifest author.license must be a string of at most 40 characters.', 'author.license'));
+    } else {
+      author.license = value.license;
+    }
+  }
+  if (value.url !== undefined) {
+    if (typeof value.url !== 'string' || value.url.length > 300 || !/^https?:\/\//.test(value.url)) {
+      issues.push(error('identity-invalid', 'manifest author.url must be an http(s) URL.', 'author.url'));
+    } else {
+      author.url = value.url;
+    }
+  }
+  return author;
+}
+
+interface AttachmentResult {
+  attachment: MaskAttachment | null;
+  issues: PackageIssue[];
+}
+
+function readVec3(
+  value: unknown,
+  field: string,
+  minimum: number,
+  maximum: number,
+  issues: PackageIssue[],
+): readonly [number, number, number] | null {
+  if (!Array.isArray(value) || value.length !== 3) {
+    issues.push(error('attachment-invalid', `${field} must be an array of three numbers.`, field));
+    return null;
+  }
+  const numbers: number[] = [];
+  for (const [index, item] of value.entries()) {
+    if (!isFiniteNumber(item) || item < minimum || item > maximum) {
+      issues.push(
+        error(
+          'attachment-invalid',
+          `${field}[${index}] must be a finite number between ${minimum} and ${maximum}.`,
+          `${field}[${index}]`,
+        ),
+      );
+      return null;
+    }
+    numbers.push(item);
+  }
+  return [numbers[0] as number, numbers[1] as number, numbers[2] as number];
+}
+
+function validateAttachment(value: unknown): AttachmentResult {
+  const issues: PackageIssue[] = [];
+  if (value === undefined) {
+    return { attachment: { ...DEFAULT_MASK_ATTACHMENT }, issues };
+  }
+  if (!isRecord(value)) {
+    issues.push(error('attachment-invalid', 'manifest mask.attachment must be an object.', 'mask.attachment'));
+    return { attachment: null, issues };
+  }
+  for (const key of Object.keys(value)) {
+    if (!ATTACHMENT_KEYS.has(key)) {
+      issues.push(
+        error(
+          'attachment-invalid',
+          `Unknown mask.attachment field "${key}". Supported fields: position, rotationDeg, scale.`,
+          `mask.attachment.${key}`,
+        ),
+      );
+    }
+  }
+  const position =
+    value.position === undefined
+      ? DEFAULT_MASK_ATTACHMENT.position
+      : readVec3(
+          value.position,
+          'mask.attachment.position',
+          -MASK_ATTACHMENT_LIMITS.maxPositionCm,
+          MASK_ATTACHMENT_LIMITS.maxPositionCm,
+          issues,
+        );
+  const rotationDeg =
+    value.rotationDeg === undefined
+      ? DEFAULT_MASK_ATTACHMENT.rotationDeg
+      : readVec3(
+          value.rotationDeg,
+          'mask.attachment.rotationDeg',
+          -MASK_ATTACHMENT_LIMITS.maxRotationDeg,
+          MASK_ATTACHMENT_LIMITS.maxRotationDeg,
+          issues,
+        );
+  let scale = DEFAULT_MASK_ATTACHMENT.scale;
+  if (value.scale !== undefined) {
+    if (
+      !isFiniteNumber(value.scale) ||
+      value.scale < MASK_ATTACHMENT_LIMITS.minScale ||
+      value.scale > MASK_ATTACHMENT_LIMITS.maxScale
+    ) {
+      issues.push(
+        error(
+          'attachment-invalid',
+          `mask.attachment.scale must be a finite number between ${MASK_ATTACHMENT_LIMITS.minScale} and ${MASK_ATTACHMENT_LIMITS.maxScale}.`,
+          'mask.attachment.scale',
+        ),
+      );
+      scale = DEFAULT_MASK_ATTACHMENT.scale;
+    } else {
+      scale = value.scale;
+    }
+  }
+  if (!position || !rotationDeg) return { attachment: null, issues };
+  return { attachment: { position, rotationDeg, scale }, issues };
+}
+
+function validateColorTreatment(value: unknown): { treatment: ColorTreatmentParameters | null; issues: PackageIssue[] } {
+  const issues: PackageIssue[] = [];
+  if (!isRecord(value)) {
+    issues.push(
+      error(
+        'manifest-schema-invalid',
+        'manifest colorTreatment must be an object of bounded parameters (brightness, contrast, saturation, hueRotateDeg, sepia, grayscale).',
+        'colorTreatment',
+      ),
+    );
+    return { treatment: null, issues };
+  }
+  const known = new Set(COLOR_PARAMETER_BOUNDS.map((bound) => bound.key as string));
+  for (const key of Object.keys(value)) {
+    if (!known.has(key)) {
+      issues.push(
+        error(
+          'manifest-schema-invalid',
+          `Unknown colorTreatment parameter "${key}". Supported parameters: ${[...known].join(', ')}.`,
+          `colorTreatment.${key}`,
+        ),
+      );
+    }
+  }
+  const treatment: ColorTreatmentParameters = {};
+  for (const bound of COLOR_PARAMETER_BOUNDS) {
+    const raw = value[bound.key];
+    if (raw === undefined) continue;
+    if (!isFiniteNumber(raw) || raw < bound.min || raw > bound.max) {
+      issues.push(
+        error(
+          'color-parameter-out-of-range',
+          `colorTreatment.${bound.key} must be a number between ${bound.min} and ${bound.max}; got ${JSON.stringify(raw)}.`,
+          `colorTreatment.${bound.key}`,
+        ),
+      );
+      continue;
+    }
+    treatment[bound.key] = raw;
+  }
+  if (Object.keys(treatment).length === 0 && issues.length === 0) {
+    issues.push(
+      error(
+        'manifest-schema-invalid',
+        'colorTreatment must declare at least one bounded parameter.',
+        'colorTreatment',
+      ),
+    );
+  }
+  return { treatment, issues };
+}
+
+function validateMask(value: unknown): {
+  mask: { asset: string; attachment: MaskAttachment } | null;
+  issues: PackageIssue[];
+} {
+  const issues: PackageIssue[] = [];
+  if (!isRecord(value)) {
+    issues.push(error('manifest-schema-invalid', 'manifest mask must be an object with an asset path.', 'mask'));
+    return { mask: null, issues };
+  }
+  for (const key of Object.keys(value)) {
+    if (!MASK_KEYS.has(key)) {
+      issues.push(
+        error(
+          'manifest-schema-invalid',
+          `Unknown mask field "${key}". Supported fields: asset, attachment.`,
+          `mask.${key}`,
+        ),
+      );
+    }
+  }
+  if (typeof value.asset !== 'string' || value.asset.length > 128) {
+    issues.push(
+      error('missing-asset', 'manifest mask.asset must be an archive path such as "assets/mask.glb".', 'mask.asset'),
+    );
+    return { mask: null, issues };
+  }
+  if (!ASSET_PATH_PATTERN.test(value.asset)) {
+    issues.push(
+      error(
+        'missing-asset',
+        `mask.asset "${value.asset}" must be a single-level path under assets/ ending in .glb (for example "assets/mask.glb").`,
+        'mask.asset',
+      ),
+    );
+    return { mask: null, issues };
+  }
+  const attachment = validateAttachment(value.attachment);
+  issues.push(...attachment.issues);
+  if (!attachment.attachment) return { mask: null, issues };
+  return { mask: { asset: value.asset, attachment: attachment.attachment }, issues };
+}
+
+function validateEntryPaths(entries: ZipEntry[]): PackageIssue[] {
+  const issues: PackageIssue[] = [];
+  for (const entry of entries) {
+    if (entry.name === PACKAGE_MANIFEST_PATH) continue;
+    const extension = extensionOf(entry.name);
+    if (EXECUTABLE_EXTENSIONS.has(extension)) {
+      issues.push(
+        error(
+          'executable-content',
+          `Archive entry "${entry.name}" is executable or script content (${extension}), which effect packages must never contain.`,
+          entry.name,
+        ),
+      );
+      continue;
+    }
+    if (!entry.name.startsWith(PACKAGE_ASSET_PREFIX)) {
+      issues.push(
+        error(
+          'entry-not-allowed',
+          `Archive entry "${entry.name}" is not allowed. A package contains only manifest.json and declared assets under assets/.`,
+          entry.name,
+        ),
+      );
+      continue;
+    }
+    if (!ASSET_PATH_PATTERN.test(entry.name)) {
+      issues.push(
+        error(
+          'unsupported-asset-type',
+          `Asset "${entry.name}" is not supported. v1 accepts only a single .glb file directly under assets/ (for example assets/mask.glb).`,
+          entry.name,
+        ),
+      );
+    }
+  }
+  return issues;
+}
+
+/** Parses/validates the manifest JSON. Returns issues and a typed manifest. */
+function validateManifestObject(value: unknown, issues: PackageIssue[], warnings: PackageIssue[]): EffectPackageManifestV1 | null {
+  if (!isRecord(value)) {
+    issues.push(error('manifest-schema-invalid', 'manifest.json must contain a JSON object.'));
+    return null;
+  }
+  for (const key of Object.keys(value)) {
+    if (!MANIFEST_KEYS.has(key)) {
+      warnings.push(warning('unknown-field', `Unknown manifest field "${key}" is ignored by schema v1.`, key));
+    }
+  }
+  if (value.schemaVersion !== EFFECT_PACKAGE_SCHEMA_VERSION) {
+    issues.push(
+      error(
+        'schema-version-unsupported',
+        `schemaVersion ${JSON.stringify(value.schemaVersion)} is not supported. This build reads effect package schema version ${EFFECT_PACKAGE_SCHEMA_VERSION} only.`,
+        'schemaVersion',
+      ),
+    );
+  }
+  const id =
+    typeof value.id === 'string' && PACKAGE_ID_PATTERN.test(value.id)
+      ? value.id
+      : null;
+  if (!id) {
+    issues.push(
+      error(
+        'identity-invalid',
+        'manifest id must be 2-63 characters of lowercase letters, digits, dots, underscores or hyphens (for example "studio.guard-visor").',
+        'id',
+      ),
+    );
+  }
+  const name = readString(value.name, 'name', 1, 80, issues);
+  const version =
+    typeof value.version === 'string' && VERSION_PATTERN.test(value.version)
+      ? value.version
+      : null;
+  if (!version) {
+    issues.push(error('identity-invalid', 'manifest version must be a semantic version such as "1.0.0".', 'version'));
+  }
+  const description = readString(value.description, 'description', 1, 500, issues, 'manifest-schema-invalid');
+  const author = validateAuthor(value.author, issues);
+
+  for (const reserved of ['expressionReactions', 'behaviors'] as const) {
+    const declared = value[reserved];
+    if (declared === undefined) continue;
+    if (!Array.isArray(declared)) {
+      issues.push(
+        error('manifest-schema-invalid', `manifest ${reserved} must be an array (reserved and empty in v1).`, reserved),
+      );
+      continue;
+    }
+    if (declared.length > 0) {
+      issues.push(
+        error(
+          'unsupported-behavior',
+          `manifest ${reserved} declares ${declared.length} behavior(s), which schema v1 does not support. Remove the declaration or use a package without it; unsupported behavior is rejected rather than ignored.`,
+          reserved,
+        ),
+      );
+    }
+  }
+
+  let mask: { asset: string; attachment: MaskAttachment } | null = null;
+  if (value.mask !== undefined) {
+    const parsed = validateMask(value.mask);
+    issues.push(...parsed.issues);
+    mask = parsed.mask;
+  }
+  let treatment: ColorTreatmentParameters | null = null;
+  if (value.colorTreatment !== undefined) {
+    const parsed = validateColorTreatment(value.colorTreatment);
+    issues.push(...parsed.issues);
+    treatment = parsed.treatment;
+  }
+  if (value.mask === undefined && value.colorTreatment === undefined) {
+    issues.push(
+      error(
+        'empty-effect',
+        'The package declares no effect. Add a "mask" component, a "colorTreatment" component, or both to make one complete effect.',
+      ),
+    );
+  }
+
+  if (issues.length > 0) return null;
+  return {
+    schemaVersion: EFFECT_PACKAGE_SCHEMA_VERSION,
+    id: id as string,
+    name: name as string,
+    version: version as string,
+    description: description as string,
+    author: author as EffectPackageAuthor,
+    ...(mask ? { mask: { asset: mask.asset, attachment: mask.attachment } } : {}),
+    ...(treatment ? { colorTreatment: treatment } : {}),
+  };
+}
+
+export function validateEffectPackage(bytes: Uint8Array): EffectPackageValidation {
+  const zip = readZip(bytes);
+  if (!zip.ok) {
+    return { ok: false, errors: zip.issues, warnings: [] };
+  }
+  const entries = zip.entries;
+  const warnings: PackageIssue[] = [];
+  const errors: PackageIssue[] = validateEntryPaths(entries);
+
+  const manifestEntry = entries.find((entry) => entry.name === PACKAGE_MANIFEST_PATH);
+  if (!manifestEntry) {
+    errors.push(
+      error(
+        'manifest-missing',
+        'The archive has no root manifest.json. Add a schema v1 manifest at the archive root (not inside a folder).',
+      ),
+    );
+    return { ok: false, errors, warnings };
+  }
+  if (manifestEntry.data.length > PACKAGE_SAFETY_LIMITS.maxManifestBytes) {
+    errors.push(
+      error(
+        'manifest-too-large',
+        `manifest.json is ${manifestEntry.data.length} bytes; the safety limit is ${PACKAGE_SAFETY_LIMITS.maxManifestBytes}.`,
+      ),
+    );
+    return { ok: false, errors, warnings };
+  }
+  let manifestText: string;
+  try {
+    manifestText = new TextDecoder('utf-8', { fatal: true }).decode(manifestEntry.data);
+  } catch {
+    errors.push(error('manifest-not-utf8', 'manifest.json is not valid UTF-8. Save it as UTF-8 JSON.'));
+    return { ok: false, errors, warnings };
+  }
+  let rawManifest: unknown;
+  try {
+    rawManifest = JSON.parse(manifestText.replace(/^\uFEFF/u, ''));
+  } catch (cause) {
+    errors.push(
+      error('manifest-invalid-json', `manifest.json is not valid JSON: ${(cause as Error).message}`),
+    );
+    return { ok: false, errors, warnings };
+  }
+
+  const manifest = validateManifestObject(rawManifest, errors, warnings);
+  if (!manifest) {
+    return { ok: false, errors, warnings };
+  }
+
+  const declaredAssets = new Set<string>();
+  if (manifest.mask) declaredAssets.add(manifest.mask.asset);
+  for (const entry of entries) {
+    if (entry.name === PACKAGE_MANIFEST_PATH || declaredAssets.has(entry.name)) continue;
+    if (errors.some((existing) => existing.path === entry.name)) continue;
+    errors.push(
+      error(
+        'entry-not-allowed',
+        `Archive entry "${entry.name}" is not declared by manifest.json. Packages may contain only the manifest and the declared mask asset.`,
+        entry.name,
+      ),
+    );
+  }
+
+  const assets = new Map<string, Uint8Array>();
+  let triangles = 0;
+  let meshes = 0;
+  let materials = 0;
+  let nodes = 0;
+  let textures = 0;
+  let maskAssetBytes = 0;
+  if (manifest.mask) {
+    const asset = entries.find((entry) => entry.name === manifest.mask?.asset);
+    if (!asset) {
+      errors.push(
+        error(
+          'missing-asset',
+          `The manifest declares mask asset "${manifest.mask.asset}" but the archive does not contain it.`,
+          manifest.mask.asset,
+        ),
+      );
+    } else if (asset.data.length > PACKAGE_SAFETY_LIMITS.maxMaskAssetBytes) {
+      errors.push(
+        error(
+          'entry-too-large',
+          `Mask asset "${asset.name}" is ${asset.data.length} bytes; the safety limit is ${PACKAGE_SAFETY_LIMITS.maxMaskAssetBytes}.`,
+          asset.name,
+        ),
+      );
+    } else {
+      const glb = inspectGlb(asset.data);
+      if (!glb.ok) {
+        for (const glbIssue of glb.issues) errors.push({ ...glbIssue, path: asset.name });
+      } else {
+        assets.set(asset.name, asset.data);
+        maskAssetBytes = asset.data.length;
+        triangles = glb.summary.triangles;
+        meshes = glb.summary.meshes;
+        materials = glb.summary.materials;
+        nodes = glb.summary.nodes;
+        textures = glb.summary.textures;
+      }
+    }
+  }
+
+  const declaredBehaviors =
+    (Array.isArray((rawManifest as Record<string, unknown>).expressionReactions)
+      ? ((rawManifest as Record<string, unknown>).expressionReactions as unknown[]).length
+      : 0) +
+    (Array.isArray((rawManifest as Record<string, unknown>).behaviors)
+      ? ((rawManifest as Record<string, unknown>).behaviors as unknown[]).length
+      : 0);
+
+  if (errors.length > 0) {
+    return { ok: false, errors, warnings };
+  }
+
+  const complexity: PackageComplexity = {
+    archiveBytes: bytes.length,
+    entryCount: entries.length,
+    manifestBytes: manifestEntry.data.length,
+    maskAssetBytes,
+    triangles,
+    meshes,
+    materials,
+    nodes,
+    textures,
+    declaredBehaviors,
+    colorParameters: manifest.colorTreatment ? countDeclaredColorParameters(manifest.colorTreatment) : 0,
+  };
+  return { ok: true, package: { manifest, assets, complexity, warnings } };
+}

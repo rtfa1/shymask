@@ -232,6 +232,23 @@ select {
   word-break: break-all;
 }
 
+.package-result {
+  min-height: 16px;
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.package-result[data-state='success'] {
+  color: var(--accent);
+}
+
+.package-result[data-state='error'] {
+  color: #fca5a5;
+}
+
 .diagnostics dl {
   margin: 0;
   display: grid;
