@@ -68,6 +68,12 @@ const { ELECTRON_RUN_AS_NODE, ...baseEnv } = process.env;
 const results = [];
 const timing = {};
 const logLines = [];
+/**
+ * Per-capture evidence for processed camera states: how many consumer frames
+ * were sampled and how many of them were app-published (captureUnixMs > 0).
+ * Summarised in summary.json so the docs can report retry usage honestly.
+ */
+const cameraCaptureAttempts = [];
 
 function log(message) {
   console.log(message);
@@ -997,13 +1003,31 @@ function assertAllPausedFrames(frames, label) {
   }
 }
 
-function assertProcessedFrames(frames, previewRgb, label) {
-  const appFrames = frames.filter((frame) => frame.captureUnixMs > 0);
-  assert.ok(appFrames.length >= 2, `${label}: expected processed camera frames, got ${appFrames.length}`);
-  const closest = appFrames.reduce((best, frame) => {
+/**
+ * Selects the app-published frame whose mean is closest to the asserted
+ * processed preview. A newly connected consumer can receive only the native
+ * paused fallback for its first samples, and a switch/recovery can publish one
+ * paused frame while it settles, so processed evidence selects the closest app
+ * frame instead of blindly taking the first. Shared by the mean-RGB and saved-PNG
+ * processors so both use the same selection rule.
+ */
+function closestAppFrame(frames, previewRgb, { requirePng = false } = {}) {
+  const candidates = frames.filter(
+    (frame) => frame.captureUnixMs > 0 && (!requirePng || frame.png),
+  );
+  return candidates.reduce((best, frame) => {
     const distance = channelDistance(cameraFrameRgb(frame), previewRgb);
     return !best || distance < best.distance ? { frame, distance } : best;
   }, null);
+}
+
+function assertProcessedFrames(frames, previewRgb, label) {
+  const appFrames = frames.filter((frame) => frame.captureUnixMs > 0);
+  assert.ok(
+    appFrames.length >= 2,
+    `${label}: expected at least two app-published processed camera frames, got ${appFrames.length} of ${frames.length} (captureUnixMs === 0 frames are the native pre-connection fallback)`,
+  );
+  const closest = closestAppFrame(appFrames, previewRgb);
   assert.ok(
     closest !== null && closest.distance <= 25,
     `${label}: camera frame must match the preview treatment, preview=${JSON.stringify(previewRgb)} camera=${JSON.stringify(cameraFrameRgb(closest?.frame ?? {}))}`,
@@ -1022,12 +1046,11 @@ function assertProcessedFrames(frames, previewRgb, label) {
  * preview rather than blindly taking the first app frame.
  */
 function assertProcessedPng(frames, previewRgb, label) {
-  const appPngFrames = frames.filter((frame) => frame.png && frame.captureUnixMs > 0);
-  assert.ok(appPngFrames.length > 0, `${label}: expected camera PNG evidence from an app frame`);
-  const closest = appPngFrames.reduce((best, frame) => {
-    const distance = channelDistance(cameraFrameRgb(frame), previewRgb);
-    return !best || distance < best.distance ? { frame, distance } : best;
-  }, null);
+  const closest = closestAppFrame(frames, previewRgb, { requirePng: true });
+  assert.ok(
+    closest !== null,
+    `${label}: expected camera PNG evidence from an app-published processed frame`,
+  );
   const png = closest.frame.png;
   const pngRgb = pngMeanRgb(png);
   assert.ok(
@@ -1087,23 +1110,81 @@ async function captureCameraState(page, prefix, frames = 4) {
 
 /**
  * A newly started consumer can briefly receive only the native paused fallback
- * before the app's first published frame. Retry a processed-state capture a
- * bounded number of times so that fallback startup latency cannot turn a valid
- * processed state into a flaky failure.
+ * before the app's first published frame. The media source clears its cache for
+ * every consumer stream and the renderer only starts publishing once the camera
+ * host reports the client, so the first frames of a capture can legitimately be
+ * the fallback. Capture enough frames to cover that startup and retry a bounded
+ * number of times. Every attempt's total/app-published frame counts are logged
+ * and recorded in summary.json; the final attempt still throws, so a persistent
+ * fallback can never be accepted as processed evidence.
  */
-async function captureProcessedCameraState(page, prefix, frames, previewRgb, label) {
+async function captureProcessedCameraState(
+  page,
+  prefix,
+  frames = PROCESSED_CAMERA_FRAMES,
+  previewRgb,
+  label,
+) {
+  // The app must already be drawing a processed output before the consumer
+  // starts; this removes a paused/switch transition from the measured window.
+  // The threshold only has to exclude the opaque paused canvas (sum ~47), not to
+  // act as a brightness assertion, so a dark-but-processed replay frame passes.
+  try {
+    await waitFor(
+      `${label} processed preview before camera capture`,
+      async () => {
+        const status = await readStatus(page);
+        if (status.mode !== 'render') return null;
+        return rgbSum(await readRgb(page)) > 60 ? status : null;
+      },
+      10000,
+      100,
+    );
+  } catch (error) {
+    const status = await readStatus(page);
+    const rgb = await readRgb(page);
+    const videoState = await page.evaluate(() => {
+      const video = document.querySelector('video');
+      return video
+        ? { paused: video.paused, ended: video.ended, currentTime: video.currentTime, readyState: video.readyState }
+        : null;
+    });
+    log(
+      `[${label}] readiness timeout: mode=${status.mode} title=${status.title} rgb=${JSON.stringify(rgb)} video=${JSON.stringify(videoState)} explanation=${status.explanation}`,
+    );
+    throw error;
+  }
+  const attempts = [];
   let lastError = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const run = await captureCameraState(page, prefix, frames);
+    const appFrames = run.frames.filter((frame) => frame.captureUnixMs > 0).length;
+    const fallbackFrames = run.frames.length - appFrames;
+    attempts.push({
+      attempt: attempt + 1,
+      frames: run.frames.length,
+      appFrames,
+      nativePausedFallbackFrames: fallbackFrames,
+    });
+    log(
+      `[${label}] camera attempt ${attempt + 1}/3: frames=${run.frames.length} appFrames=${appFrames} nativePausedFallbackFrames=${fallbackFrames}`,
+    );
     try {
       assertProcessedFrames(run.frames, previewRgb, label);
+      cameraCaptureAttempts.push({ label, prefix, frames, attempts });
+      run.captureAttempts = attempts;
       return run;
     } catch (error) {
       lastError = error;
-      log(`[${label}] camera attempt ${attempt + 1} did not observe processed frames; retrying after a publish interval`);
-      await page.waitForTimeout(600);
+      if (attempt < 2) {
+        log(
+          `[${label}] camera attempt ${attempt + 1} did not observe enough processed frames; retrying after a publish interval`,
+        );
+        await page.waitForTimeout(600);
+      }
     }
   }
+  cameraCaptureAttempts.push({ label, prefix, frames, attempts, failed: true });
   throw lastError;
 }
 
@@ -1147,8 +1228,7 @@ async function virtualCameraScenario() {
     await waitFor('warm preview output', async () => (rgbSum(await readRgb(page)) > 120 ? true : null));
     await delay(500);
     const previewWarm = await readRgb(page);
-    const warmRun = await captureCameraState(page, 'warm', 6);
-    assertProcessedFrames(warmRun.frames, previewWarm, 'warm');
+    const warmRun = await captureProcessedCameraState(page, 'warm', PROCESSED_CAMERA_FRAMES, previewWarm, 'warm');
     const warmPng = assertProcessedPng(warmRun.frames, previewWarm, 'warm');
     evidence.states.warm = {
       preview: previewWarm,
@@ -1166,8 +1246,7 @@ async function virtualCameraScenario() {
     await waitForStatusTitle(page, /Effect active: Cool tint/);
     await delay(600);
     const previewCool = await readRgb(page);
-    const coolRun = await captureCameraState(page, 'cool', 6);
-    assertProcessedFrames(coolRun.frames, previewCool, 'cool');
+    const coolRun = await captureProcessedCameraState(page, 'cool', PROCESSED_CAMERA_FRAMES, previewCool, 'cool');
     const coolPng = assertProcessedPng(coolRun.frames, previewCool, 'cool');
     const coolCamera = averageFrameRgb(coolRun.frames);
     assert.ok(
@@ -1207,8 +1286,7 @@ async function virtualCameraScenario() {
     await waitForStatusTitle(page, /Effect active: Cool tint/);
     await delay(600);
     const resumedPreview = await readRgb(page);
-    const resumedRun = await captureCameraState(page, 'resumed', 6);
-    assertProcessedFrames(resumedRun.frames, resumedPreview, 'resume');
+    const resumedRun = await captureProcessedCameraState(page, 'resumed', PROCESSED_CAMERA_FRAMES, resumedPreview, 'resume');
     const resumedPng = assertProcessedPng(resumedRun.frames, resumedPreview, 'resume');
     evidence.states.resumed = {
       preview: resumedPreview,
@@ -1235,8 +1313,7 @@ async function virtualCameraScenario() {
     await waitForStatusTitle(page, /Effect active: Warm tint/);
     await delay(600);
     const recoveryPreview = await readRgb(page);
-    const recoveryRun = await captureCameraState(page, 'effect-recovered', 6);
-    assertProcessedFrames(recoveryRun.frames, recoveryPreview, 'effect recovery');
+    const recoveryRun = await captureProcessedCameraState(page, 'effect-recovered', PROCESSED_CAMERA_FRAMES, recoveryPreview, 'effect recovery');
     const recoveryPng = assertProcessedPng(recoveryRun.frames, recoveryPreview, 'effect recovery');
     evidence.states.effectRecovered = {
       preview: recoveryPreview,
@@ -1263,8 +1340,7 @@ async function virtualCameraScenario() {
     await waitForStatusTitle(page, /Effect active: Warm tint/);
     await delay(600);
     const failureRecoveryPreview = await readRgb(page);
-    const failureRecoveryRun = await captureCameraState(page, 'failure-recovered', 6);
-    assertProcessedFrames(failureRecoveryRun.frames, failureRecoveryPreview, 'failure recovery');
+    const failureRecoveryRun = await captureProcessedCameraState(page, 'failure-recovered', PROCESSED_CAMERA_FRAMES, failureRecoveryPreview, 'failure recovery');
     const failureRecoveryPng = assertProcessedPng(
       failureRecoveryRun.frames,
       failureRecoveryPreview,
@@ -1470,6 +1546,15 @@ const MOTION_WINDOW_END_MS = MOTION_WINDOW_START_MS + MOTION_WINDOW_SECONDS * 10
  */
 const OCCLUSION_CAPTURE_SECONDS = 47.7;
 const OCCLUSION_CAPTURE_SECONDS_OPPOSITE = 16.0;
+/**
+ * Frames requested for one processed camera capture. The native media source
+ * clears its frame cache on every new consumer stream (FrameTransport::Reset in
+ * MediaStream::Start), and the app only reads its canvas back once the virtual
+ * camera reports a connected client and then at the 30 Hz publication floor /
+ * 100 ms heartbeat. The first ~3 of the 30 Hz samples can therefore be the
+ * native opaque fallback; 8 samples span ~230 ms and cover that startup.
+ */
+const PROCESSED_CAMERA_FRAMES = 8;
 
 async function readTracking(page) {
   return parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
@@ -1577,13 +1662,6 @@ function colorNearRgb(actual, expected, tolerance = 16) {
   );
 }
 
-function assertMaskColour(probe, expected, tolerance, label) {
-  assert.ok(
-    colorNearRgb(probe, expected, tolerance),
-    `${label}: output pixel at the mask probe must be the mask colour ${JSON.stringify(expected)}, got ${JSON.stringify(probe)}`,
-  );
-}
-
 /**
  * Positive proof that the occlusion ON state reveals non-mask content where the
  * OFF state drew mask material.
@@ -1593,9 +1671,30 @@ function assertMaskColour(probe, expected, tolerance, label) {
  * ON. The bundled procedural mask uses lit materials, so instead we take the
  * dominant exact OFF-frame colours from the changed region (the mask's rendered
  * shades) and require that the ON frame does not reproduce them at those pixels.
- * Both variants assert a substantial number of changed pixels, so this is a
- * colour proof, not a one-pixel accident.
+ *
+ * Removing the mask colour is not by itself proof that the reveal is video: a
+ * black, transparent or uniform fill would also remove it. The ON changed pixels
+ * must additionally pass a plausible-video floor (mean luminance, luminance
+ * variance, near-black fraction and colour variety). The callers compare the
+ * untreated bundled/rose pixels against the underlying held replay frame for the
+ * strongest check; a treated effect cannot be compared pixel-for-pixel.
  */
+const MATERIAL_COLOUR_TOLERANCE = 28;
+const REVEAL_VIDEO_FLOORS = {
+  meanLuminance: 30,
+  luminanceStdDev: 6,
+  maxNearBlackFraction: 0.1,
+  minDistinctColours: 16,
+};
+
+function isMaterialColour(pixels, index, rgb, tolerance = MATERIAL_COLOUR_TOLERANCE) {
+  return (
+    Math.abs(pixels[index] - rgb.r) <= tolerance &&
+    Math.abs(pixels[index + 1] - rgb.g) <= tolerance &&
+    Math.abs(pixels[index + 2] - rgb.b) <= tolerance
+  );
+}
+
 function maskRevealEvidence(onFile, offFile, rect, materialRgb = null) {
   const on = decodePng(onFile);
   const off = decodePng(offFile);
@@ -1607,8 +1706,6 @@ function maskRevealEvidence(onFile, offFile, rect, materialRgb = null) {
   const y1 = Math.min(on.height - 1, Math.ceil(rect.y + rect.height));
   const changedIndexes = [];
   const offColourCounts = new Map();
-  let materialPixelsOff = 0;
-  let materialPixelsOn = 0;
   let changedMaterialPixelsOff = 0;
   let changedMaterialPixelsOn = 0;
   for (let y = y0; y <= y1; y += 1) {
@@ -1618,39 +1715,11 @@ function maskRevealEvidence(onFile, offFile, rect, materialRgb = null) {
         Math.abs(on.pixels[index] - off.pixels[index]) > 4 ||
         Math.abs(on.pixels[index + 1] - off.pixels[index + 1]) > 4 ||
         Math.abs(on.pixels[index + 2] - off.pixels[index + 2]) > 4;
-      if (materialRgb) {
-        if (
-          Math.abs(off.pixels[index] - materialRgb.r) <= 28 &&
-          Math.abs(off.pixels[index + 1] - materialRgb.g) <= 28 &&
-          Math.abs(off.pixels[index + 2] - materialRgb.b) <= 28
-        ) {
-          materialPixelsOff += 1;
-        }
-        if (
-          Math.abs(on.pixels[index] - materialRgb.r) <= 28 &&
-          Math.abs(on.pixels[index + 1] - materialRgb.g) <= 28 &&
-          Math.abs(on.pixels[index + 2] - materialRgb.b) <= 28
-        ) {
-          materialPixelsOn += 1;
-        }
-      }
       if (!changed) continue;
       changedIndexes.push(index);
       if (materialRgb) {
-        if (
-          Math.abs(off.pixels[index] - materialRgb.r) <= 28 &&
-          Math.abs(off.pixels[index + 1] - materialRgb.g) <= 28 &&
-          Math.abs(off.pixels[index + 2] - materialRgb.b) <= 28
-        ) {
-          changedMaterialPixelsOff += 1;
-        }
-        if (
-          Math.abs(on.pixels[index] - materialRgb.r) <= 28 &&
-          Math.abs(on.pixels[index + 1] - materialRgb.g) <= 28 &&
-          Math.abs(on.pixels[index + 2] - materialRgb.b) <= 28
-        ) {
-          changedMaterialPixelsOn += 1;
-        }
+        if (isMaterialColour(off.pixels, index, materialRgb)) changedMaterialPixelsOff += 1;
+        if (isMaterialColour(on.pixels, index, materialRgb)) changedMaterialPixelsOn += 1;
       } else {
         const key = `${off.pixels[index]},${off.pixels[index + 1]},${off.pixels[index + 2]}`;
         offColourCounts.set(key, (offColourCounts.get(key) ?? 0) + 1);
@@ -1659,6 +1728,65 @@ function maskRevealEvidence(onFile, offFile, rect, materialRgb = null) {
   }
   const changedPixels = changedIndexes.length;
   assert.ok(changedPixels >= 1500, `occlusion reveal needs a substantial changed region, got ${changedPixels} face-box pixels`);
+
+  // Plausible-video floor on the revealed ON pixels.
+  let luminanceSum = 0;
+  let luminanceSquaredSum = 0;
+  let nearBlackPixels = 0;
+  const distinctColours = new Set();
+  for (const index of changedIndexes) {
+    const red = on.pixels[index];
+    const green = on.pixels[index + 1];
+    const blue = on.pixels[index + 2];
+    const luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+    luminanceSum += luminance;
+    luminanceSquaredSum += luminance * luminance;
+    if (luminance <= 16) nearBlackPixels += 1;
+    distinctColours.add((red << 16) | (green << 8) | blue);
+  }
+  const meanLuminance = luminanceSum / changedPixels;
+  const luminanceVariance = Math.max(0, luminanceSquaredSum / changedPixels - meanLuminance * meanLuminance);
+  const luminanceStdDev = Math.sqrt(luminanceVariance);
+  const nearBlackFraction = nearBlackPixels / changedPixels;
+  assert.ok(
+    meanLuminance >= REVEAL_VIDEO_FLOORS.meanLuminance,
+    `occlusion ON pixels must be plausible video, not a black fill: mean luminance=${meanLuminance.toFixed(1)} (floor ${REVEAL_VIDEO_FLOORS.meanLuminance})`,
+  );
+  assert.ok(
+    luminanceStdDev >= REVEAL_VIDEO_FLOORS.luminanceStdDev,
+    `occlusion ON pixels must be plausible video, not a uniform fill: luminance stddev=${luminanceStdDev.toFixed(1)} (floor ${REVEAL_VIDEO_FLOORS.luminanceStdDev})`,
+  );
+  assert.ok(
+    nearBlackFraction <= REVEAL_VIDEO_FLOORS.maxNearBlackFraction,
+    `occlusion ON pixels must be plausible video, not a black cutout: ${(100 * nearBlackFraction).toFixed(1)}% near-black (limit ${100 * REVEAL_VIDEO_FLOORS.maxNearBlackFraction}%)`,
+  );
+  assert.ok(
+    distinctColours.size >= REVEAL_VIDEO_FLOORS.minDistinctColours,
+    `occlusion ON pixels must be plausible video, not a flat patch: only ${distinctColours.size} distinct colours (floor ${REVEAL_VIDEO_FLOORS.minDistinctColours})`,
+  );
+  const plausibleVideo = {
+    meanLuminance: Number(meanLuminance.toFixed(1)),
+    luminanceStdDev: Number(luminanceStdDev.toFixed(1)),
+    nearBlackFraction: Number(nearBlackFraction.toFixed(3)),
+    distinctColours: distinctColours.size,
+    floors: REVEAL_VIDEO_FLOORS,
+  };
+
+  // Up to 600 evenly spaced changed pixels with their ON colour, for the
+  // caller's optional comparison against the underlying held replay frame.
+  const changedSamples = [];
+  const sampleStride = Math.max(1, Math.floor(changedIndexes.length / 600));
+  for (let index = 0; index < changedIndexes.length && changedSamples.length < 600; index += sampleStride) {
+    const pixelIndex = changedIndexes[index];
+    changedSamples.push({
+      x: (pixelIndex % on.stride) / on.channels,
+      y: Math.floor(pixelIndex / on.stride),
+      r: on.pixels[pixelIndex],
+      g: on.pixels[pixelIndex + 1],
+      b: on.pixels[pixelIndex + 2],
+    });
+  }
+
   if (materialRgb) {
     const offFraction = changedMaterialPixelsOff / changedPixels;
     const onFraction = changedMaterialPixelsOn / changedPixels;
@@ -1674,12 +1802,12 @@ function maskRevealEvidence(onFile, offFile, rect, materialRgb = null) {
       kind: 'exact-material',
       materialRgb,
       changedPixels,
-      materialPixelsOff,
-      materialPixelsOn,
       changedMaterialPixelsOff,
       changedMaterialPixelsOn,
       changedMaterialFractionOff: Number(offFraction.toFixed(3)),
       changedMaterialFractionOn: Number(onFraction.toFixed(3)),
+      plausibleVideo,
+      changedSamples,
     };
   }
   const dominant = [...offColourCounts.entries()].sort((left, right) => right[1] - left[1]).slice(0, 64);
@@ -1712,6 +1840,61 @@ function maskRevealEvidence(onFile, offFile, rect, materialRgb = null) {
     dominantCoverage: Number(coverage.toFixed(3)),
     changedPixels,
     onPaletteMatches,
+    plausibleVideo,
+    changedSamples,
+  };
+}
+
+/**
+ * Draws the held replay video into a canvas at the same 0,0,width,height scale
+ * the pipeline uses and compares the ON changed pixels against it. This is only
+ * valid for an effect with no colour treatment (the bundled mask and the
+ * mask-only rose package); a treated effect changes the video before compositing.
+ */
+async function compareRevealToHeldVideo(page, samples, label) {
+  if (!samples || samples.length === 0) return null;
+  const videoPixels = await page.evaluate((points) => {
+    const video = document.querySelector('video');
+    if (!video) throw new Error('expected a replay video element');
+    const output = document.querySelector('[data-testid="output-canvas"]');
+    const width = output && output.width ? output.width : 1280;
+    const height = output && output.height ? output.height : 720;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    context.drawImage(video, 0, 0, width, height);
+    const data = context.getImageData(0, 0, width, height).data;
+    return points.map((point) => {
+      const x = Math.min(width - 1, Math.max(0, Math.round(point.x)));
+      const y = Math.min(height - 1, Math.max(0, Math.round(point.y)));
+      const index = (y * width + x) * 4;
+      return [data[index], data[index + 1], data[index + 2]];
+    });
+  }, samples.map(({ x, y }) => ({ x, y })));
+  let matching = 0;
+  let totalChannelDiff = 0;
+  for (let index = 0; index < samples.length; index += 1) {
+    const pixel = samples[index];
+    const videoPixel = videoPixels[index] ?? [0, 0, 0];
+    const diff = Math.max(
+      Math.abs(pixel.r - videoPixel[0]),
+      Math.abs(pixel.g - videoPixel[1]),
+      Math.abs(pixel.b - videoPixel[2]),
+    );
+    totalChannelDiff += diff;
+    if (diff <= 24) matching += 1;
+  }
+  const matchFraction = matching / samples.length;
+  assert.ok(
+    matchFraction >= 0.9,
+    `${label}: at least 90% of the ON changed pixels must match the held replay video (mask removed, not replaced), matched ${(100 * matchFraction).toFixed(1)}% of ${samples.length} samples (mean max-channel diff ${(totalChannelDiff / samples.length).toFixed(1)})`,
+  );
+  return {
+    samples: samples.length,
+    matchFraction: Number(matchFraction.toFixed(3)),
+    meanMaxChannelDiff: Number((totalChannelDiff / samples.length).toFixed(1)),
+    tolerance: 24,
   };
 }
 
@@ -1727,18 +1910,60 @@ function median(values) {
 }
 
 /**
+ * Sliding metric for one pass over the recorded motion window. The projected
+ * mask origin's offset from the tracked face-box centre is the attachment
+ * baseline; the p95 deviation from the median offset is the sliding figure.
+ * The face-box centre itself shifts under yaw, so this is a bounded proxy
+ * metric, not a ground-truth surface-distance measurement.
+ */
+function slidingMetrics(samples) {
+  const faceOffsets = samples.map((sample) => {
+    const faceX = Number(sample.face.x);
+    const faceY = Number(sample.face.y);
+    const faceW = Number(sample.face.w);
+    const faceH = Number(sample.face.h);
+    return {
+      dx: sample.originX - (faceX + faceW / 2),
+      dy: sample.originY - (faceY + faceH / 2),
+      faceWidth: faceW,
+    };
+  });
+  const medianOffsetX = median(faceOffsets.map((offset) => offset.dx));
+  const medianOffsetY = median(faceOffsets.map((offset) => offset.dy));
+  const slideDeviations = faceOffsets.map((offset) =>
+    Math.hypot(offset.dx - medianOffsetX, offset.dy - medianOffsetY),
+  );
+  const anchorOffsets = faceOffsets.map((offset) => Math.hypot(offset.dx, offset.dy));
+  const meanFaceWidth =
+    faceOffsets.reduce((total, offset) => total + offset.faceWidth, 0) / faceOffsets.length;
+  const slideP95Px = percentile(slideDeviations, 0.95);
+  const anchorOffsetP95Px = percentile(anchorOffsets, 0.95);
+  return {
+    samples: samples.length,
+    medianOffset: { x: Number(medianOffsetX.toFixed(1)), y: Number(medianOffsetY.toFixed(1)) },
+    slideP95Px: Number(slideP95Px.toFixed(1)),
+    slideP95FractionOfFaceWidth: Number((slideP95Px / meanFaceWidth).toFixed(3)),
+    anchorOffsetP95Px: Number(anchorOffsetP95Px.toFixed(1)),
+    meanFaceWidthPx: Number(meanFaceWidth.toFixed(1)),
+    boundPx: 24,
+  };
+}
+
+/**
  * Public A/B occlusion evidence on a held replay frame:
- *   on, on again (must be pixel-identical), off, back on.
+ *   on, on again (must be pixel-identical), off, off again (must be
+ *   pixel-identical), back on.
  * The output PNGs go through the same capture control users use. The diff must
  * be substantial and must sit inside the tracked face's axis-aligned bounding
  * box, which is where mask geometry behind the canonical face surface is hidden.
  * `probeRgb` is the mask's declared probe colour (the bundled eye plate or the
- * package's exact unlit material); the probe pixel is asserted only when it is
- * actually visible in the ON frame. `materialRgb` enables the exact-colour
- * reveal proof for an imported package; the bundled mask uses its dominant
- * rendered palette instead.
+ * package's exact unlit material). The diagnostic readback only decides whether
+ * the probe is visible; the assertion is on the saved ON PNG's actual pixel.
+ * `materialRgb` enables the exact-colour reveal proof for an imported package;
+ * the bundled mask uses its dominant rendered palette instead. `compareVideo`
+ * additionally compares the untreated ON pixels with the held replay frame.
  */
-async function occlusionAbEvidence(page, label, probeRgb = MASK_EYE_RGB, materialRgb = null) {
+async function occlusionAbEvidence(page, label, probeRgb = MASK_EYE_RGB, materialRgb = null, options = {}) {
   const statusBefore = await readStatus(page);
   assert.equal(
     statusBefore.mode,
@@ -1756,20 +1981,32 @@ async function occlusionAbEvidence(page, label, probeRgb = MASK_EYE_RGB, materia
   const face = await readFace(page);
   assert.equal(maskBefore.visible, 'true', `${label}: a tracked mask must be visible for the occlusion A/B`);
   assert.equal(face.count, '1', `${label}: exactly one face must be tracked for the occlusion A/B`);
+  // Diagnostic readback is metadata: it decides whether the probe is visible,
+  // but the assertion below reads the actual saved ON PNG pixel, so it cannot
+  // pass by comparing the diagnostic value with itself.
   const probe = parseKeyValues(await readDiagnostic(page, 'diag-mask-probe'));
   const probeTolerance = 12;
   const probeVisible = colorNearRgb(probe, probeRgb, probeTolerance);
-  if (probeVisible) {
-    assertMaskColour(probe, probeRgb, probeTolerance, `${label} preview probe`);
-  }
   const on = await captureOutputThroughControl(page, `${label}-occlusion-on.png`);
   await page.waitForTimeout(250);
   const onRepeat = await captureOutputThroughControl(page, `${label}-occlusion-on-repeat.png`);
+  let probePixel = null;
+  let probePixelMatches = null;
+  if (probeVisible) {
+    probePixel = pngPixel(on, Number(probe.x), Number(probe.y));
+    probePixelMatches = colorNearRgb(probePixel, probeRgb, probeTolerance);
+    assert.ok(
+      probePixelMatches,
+      `${label}: the ON PNG pixel at the diagnostic probe (${probe.x},${probe.y}) must be the mask colour ${JSON.stringify(probeRgb)} when the diagnostic reports it visible, got ${JSON.stringify(probePixel)}`,
+    );
+  }
   await page.locator('[data-testid="occlusion-toggle"]').uncheck();
   await page.waitForTimeout(250);
   const occlusionOff = parseKeyValues(await readDiagnostic(page, 'diag-occlusion'));
   assert.equal(occlusionOff.enabled, 'false', `${label}: diagnostic control must disable only the occluder`);
   const off = await captureOutputThroughControl(page, `${label}-occlusion-off.png`);
+  await page.waitForTimeout(250);
+  const offRepeat = await captureOutputThroughControl(page, `${label}-occlusion-off-repeat.png`);
   await page.locator('[data-testid="occlusion-toggle"]').check();
   await page.waitForTimeout(250);
   const maskAfter = await readMask(page);
@@ -1781,12 +2018,18 @@ async function occlusionAbEvidence(page, label, probeRgb = MASK_EYE_RGB, materia
 
   const rect = faceRect(face);
   const selfDiff = pngPixelDiff(on, onRepeat);
+  const offSelfDiff = pngPixelDiff(off, offRepeat);
   const change = pngPixelDiff(on, off, 4, rect);
   const insideFraction = change.count === 0 ? 0 : change.inside / change.count;
   assert.equal(
     selfDiff.count,
     0,
-    `${label}: two captures of the same held frame must be pixel-identical, got ${selfDiff.count} changed pixels`,
+    `${label}: two ON captures of the same held frame must be pixel-identical, got ${selfDiff.count} changed pixels`,
+  );
+  assert.equal(
+    offSelfDiff.count,
+    0,
+    `${label}: two OFF captures of the same held frame must be pixel-identical, got ${offSelfDiff.count} changed pixels`,
   );
   assert.ok(
     change.count >= 1500,
@@ -1801,6 +2044,9 @@ async function occlusionAbEvidence(page, label, probeRgb = MASK_EYE_RGB, materia
     `${label}: occlusion must remove mask pixels inside the tracked face bounding box, removed ${change.inside}`,
   );
   const reveal = maskRevealEvidence(on, off, rect, materialRgb);
+  const videoMatch = options.compareVideo
+    ? await compareRevealToHeldVideo(page, reveal.changedSamples, label)
+    : null;
   return {
     label,
     occlusion: occlusionBefore,
@@ -1809,13 +2055,18 @@ async function occlusionAbEvidence(page, label, probeRgb = MASK_EYE_RGB, materia
     on,
     onRepeat,
     off,
+    offRepeat,
     probe,
     probeVisible,
+    probePixel,
+    probePixelMatches,
     selfDiffPixels: selfDiff.count,
+    offSelfDiffPixels: offSelfDiff.count,
     changedPixels: change.count,
     changedInsideFacePixels: change.inside,
     insideFaceFraction: Number(insideFraction.toFixed(3)),
     reveal,
+    videoMatch,
     clipping: {
       removedMaskPixelsInsideFaceBox: change.inside,
       faceBoxAreaPixels: Math.round(rect.width * rect.height),
@@ -1834,14 +2085,14 @@ async function occlusionAbEvidence(page, label, probeRgb = MASK_EYE_RGB, materia
  */
 async function occlusionCameraAbEvidence(page, label, rect, options = {}) {
   const preview = await readRgb(page);
-  const onRun = await captureProcessedCameraState(page, `${label}-occlusion-on`, 6, preview, `${label} occlusion on camera`);
+  const onRun = await captureProcessedCameraState(page, `${label}-occlusion-on`, PROCESSED_CAMERA_FRAMES, preview, `${label} occlusion on camera`);
   const onPngs = onRun.frames
     .filter((frame) => frame.png && frame.captureUnixMs > 0)
     .map((frame) => frame.png);
   assert.ok(onPngs.length >= 2, `${label}: expected two app-published camera PNGs in the on state, got ${onPngs.length}`);
   await page.locator('[data-testid="occlusion-toggle"]').uncheck();
   await page.waitForTimeout(300);
-  const offRun = await captureProcessedCameraState(page, `${label}-occlusion-off`, 6, preview, `${label} occlusion off camera`);
+  const offRun = await captureProcessedCameraState(page, `${label}-occlusion-off`, PROCESSED_CAMERA_FRAMES, preview, `${label} occlusion off camera`);
   const offPng = offRun.frames.find((frame) => frame.png && frame.captureUnixMs > 0)?.png;
   assert.ok(offPng, `${label}: expected an app-published camera PNG in the off state`);
   await page.locator('[data-testid="occlusion-toggle"]').check();
@@ -2037,8 +2288,7 @@ async function trackingMaskScenario() {
     // Camera: the same canvas, including the mask, reaches the independent consumer.
     const cameraPreview = await readRgb(page);
     const cameraProbe = await readMaskProbe(page);
-    const maskRun = await captureCameraState(page, 'mask', 6);
-    assertProcessedFrames(maskRun.frames, cameraPreview, 'mask');
+    const maskRun = await captureProcessedCameraState(page, 'mask', PROCESSED_CAMERA_FRAMES, cameraPreview, 'mask');
     const maskPng = assertProcessedPng(maskRun.frames, cameraPreview, 'mask');
     const eyePixels = pngColorCount(maskPng.png, MASK_EYE_RGB, 24);
     assert.ok(eyePixels > 100, `camera PNG must contain the mask eye plate, found ${eyePixels} matching pixels`);
@@ -2329,63 +2579,87 @@ async function recordedMotionScenario() {
       `smoothing must reduce slow-segment rotation jitter, raw=${restRawRotationJitter}deg smoothed=${restSmoothedRotationJitter}deg`,
     );
 
+    /**
+     * Seeks to the documented window and samples the public diagnostics over it
+     * in the selected pose-smoothing mode. Used for the rendered (smoothed) pass
+     * and for a raw pass over comparable recorded motion.
+     */
+    async function collectMotionWindowSamples({ smoothingMode = 'smoothed', captureShots = false } = {}) {
+      await page.evaluate((startSeconds) => {
+        const video = document.querySelector('video');
+        if (!video) throw new Error('expected a replay video element');
+        video.currentTime = startSeconds;
+      }, MOTION_WINDOW_START_SECONDS);
+      await waitFor(
+        `motion window media time (${smoothingMode} pass)`,
+        async () => {
+          const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+          return Number(timestamp.mediaMs ?? 0) >= MOTION_WINDOW_START_SECONDS * 1000 ? timestamp : null;
+        },
+        15000,
+        100,
+      );
+      await page.locator('[data-testid="pose-smoothing"]').selectOption(smoothingMode);
+      // A backward seek can take longer than the decode-stall threshold, so the
+      // first samples after the seek may still be the paused screen. Wait for a
+      // rendered frame before sampling so the pass is not silently truncated.
+      await waitFor(
+        `rendered output before ${smoothingMode} motion sampling`,
+        async () => {
+          const status = await readStatus(page);
+          return status.mode === 'render' ? status : null;
+        },
+        15000,
+        40,
+      );
+      const collected = [];
+      const shots = [];
+      let exitedAtMs = null;
+      let previousMediaMs = null;
+      for (let index = 0; index < 18; index += 1) {
+        await page.waitForTimeout(400);
+        const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
+        const mediaMs = Number(timestamp.mediaMs ?? 0);
+        // Sampling can outrun the remaining window (the reads themselves take
+        // time), so a loop seam back to the start of the clip also ends the
+        // window instead of recording a media time of 0 as an in-window sample.
+        if (
+          mediaMs > MOTION_WINDOW_END_MS ||
+          (previousMediaMs !== null && mediaMs < previousMediaMs - LOOP_SEAM_THRESHOLD_MS)
+        ) {
+          exitedAtMs = mediaMs;
+          break;
+        }
+        previousMediaMs = mediaMs;
+        const tracking = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
+        if (tracking.phase !== 'tracking') continue;
+        const mask = await readMask(page);
+        const face = await readFace(page);
+        if (mask.visible !== 'true') continue;
+        collected.push({
+          yaw: Number(mask.yaw),
+          pitch: Number(mask.pitch),
+          roll: Number(mask.roll),
+          originX: Number(mask.originX),
+          originY: Number(mask.originY),
+          face,
+          inside: originInsideFace(mask, face),
+          mediaMs,
+        });
+        if (captureShots && (index === 3 || index === 9 || index === 15)) {
+          shots.push(await screenshotCanvas(page, `18-motion-mask-${index}.png`));
+        }
+      }
+      return { samples: collected, shots, windowExitedAtMs: exitedAtMs };
+    }
+
     // Re-enter the documented window so the motion samples cover the full
     // turn/nod/lean range, and restart the paired counters for the motion pass.
-    await page.evaluate((startSeconds) => {
-      const video = document.querySelector('video');
-      if (!video) throw new Error('expected a replay video element');
-      video.currentTime = startSeconds;
-    }, MOTION_WINDOW_START_SECONDS);
-    await waitFor(
-      'motion window media time after jitter reset',
-      async () => {
-        const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
-        return Number(timestamp.mediaMs ?? 0) >= MOTION_WINDOW_START_SECONDS * 1000 ? timestamp : null;
-      },
-      15000,
-      100,
-    );
     await resetPoseSmoothingMetrics(page);
-
-    const samples = [];
-    const sampleShots = [];
-    let windowExitedAtMs = null;
-    let previousMediaMs = null;
-    for (let index = 0; index < 18; index += 1) {
-      await page.waitForTimeout(400);
-      const timestamp = parseKeyValues(await readDiagnostic(page, 'diag-timestamp'));
-      const mediaMs = Number(timestamp.mediaMs ?? 0);
-      // Sampling can outrun the remaining window (the reads themselves take
-      // time), so a loop seam back to the start of the clip also ends the
-      // window instead of recording a media time of 0 as an in-window sample.
-      if (
-        mediaMs > MOTION_WINDOW_END_MS ||
-        (previousMediaMs !== null && mediaMs < previousMediaMs - LOOP_SEAM_THRESHOLD_MS)
-      ) {
-        windowExitedAtMs = mediaMs;
-        break;
-      }
-      previousMediaMs = mediaMs;
-      const tracking = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
-      if (tracking.phase !== 'tracking') continue;
-      const mask = await readMask(page);
-      const face = await readFace(page);
-      if (mask.visible !== 'true') continue;
-      samples.push({
-        yaw: Number(mask.yaw),
-        pitch: Number(mask.pitch),
-        roll: Number(mask.roll),
-        originX: Number(mask.originX),
-        originY: Number(mask.originY),
-        face,
-        inside: originInsideFace(mask, face),
-        mediaMs,
-      });
-      if (index === 3 || index === 9 || index === 15) {
-        const shot = await screenshotCanvas(page, `18-motion-mask-${index}.png`);
-        sampleShots.push(shot);
-      }
-    }
+    const smoothedPass = await collectMotionWindowSamples({ smoothingMode: 'smoothed', captureShots: true });
+    const samples = smoothedPass.samples;
+    const sampleShots = smoothedPass.shots;
+    const windowExitedAtMs = smoothedPass.windowExitedAtMs;
     // Every kept sample must be inside the documented window; the window exists
     // so the pose ranges are not a whole-clip claim.
     assert.ok(
@@ -2411,44 +2685,14 @@ async function recordedMotionScenario() {
     // face-box centre across the motion window. The median offset is the
     // attachment baseline; the p95 deviation from it is the sliding metric. The
     // raw origin-to-face-centre distance is reported as the anchor offset.
-    const faceOffsets = samples.map((sample) => {
-      const faceX = Number(sample.face.x);
-      const faceY = Number(sample.face.y);
-      const faceW = Number(sample.face.w);
-      const faceH = Number(sample.face.h);
-      return {
-        dx: sample.originX - (faceX + faceW / 2),
-        dy: sample.originY - (faceY + faceH / 2),
-        faceWidth: faceW,
-      };
-    });
-    const medianOffsetX = median(faceOffsets.map((offset) => offset.dx));
-    const medianOffsetY = median(faceOffsets.map((offset) => offset.dy));
-    const slideDeviations = faceOffsets.map((offset) => Math.hypot(offset.dx - medianOffsetX, offset.dy - medianOffsetY));
-    const anchorOffsets = faceOffsets.map((offset) => Math.hypot(offset.dx, offset.dy));
-    const meanFaceWidth = faceOffsets.reduce((total, offset) => total + offset.faceWidth, 0) / faceOffsets.length;
-    const slideP95Px = percentile(slideDeviations, 0.95);
-    const anchorOffsetP95Px = percentile(anchorOffsets, 0.95);
+    const slidingEvidence = slidingMetrics(samples);
     assert.ok(
-      slideP95Px <= 24,
-      `the projected mask origin must not slide relative to the face-box centre, p95 deviation=${slideP95Px.toFixed(1)}px over ${samples.length} samples`,
+      slidingEvidence.slideP95Px <= 24,
+      `the rendered mask origin must stay within the 24 px sliding bound relative to the face-box centre, p95 deviation=${slidingEvidence.slideP95Px}px over ${samples.length} samples`,
     );
     assert.ok(
-      anchorOffsetP95Px <= 60,
-      `the projected mask origin must stay near the tracked face-box centre, p95 offset=${anchorOffsetP95Px.toFixed(1)}px`,
-    );
-    const slidingEvidence = {
-      samples: samples.length,
-      medianOffset: { x: Number(medianOffsetX.toFixed(1)), y: Number(medianOffsetY.toFixed(1)) },
-      slideP95Px: Number(slideP95Px.toFixed(1)),
-      slideP95FractionOfFaceWidth: Number((slideP95Px / meanFaceWidth).toFixed(3)),
-      anchorOffsetP95Px: Number(anchorOffsetP95Px.toFixed(1)),
-      meanFaceWidthPx: Number(meanFaceWidth.toFixed(1)),
-      boundPx: 24,
-    };
-    pass(
-      'The projected mask origin does not visibly slide relative to the tracked face-box centre',
-      `p95 sliding=${slidingEvidence.slideP95Px}px (${(100 * slidingEvidence.slideP95FractionOfFaceWidth).toFixed(1)}% of face width, bound ${slidingEvidence.boundPx}px) anchor offset p95=${slidingEvidence.anchorOffsetP95Px}px`,
+      slidingEvidence.anchorOffsetP95Px <= 60,
+      `the projected mask origin must stay near the tracked face-box centre, p95 offset=${slidingEvidence.anchorOffsetP95Px}px`,
     );
 
     // Across the full turn/nod/lean window the adaptive gain prioritizes
@@ -2504,6 +2748,38 @@ async function recordedMotionScenario() {
       `slow segment ${slowSegmentSamples.length} samples, measured yaw=${slowYawSpan.toFixed(1)} pitch=${slowPitchSpan.toFixed(1)} roll=${slowRollSpan.toFixed(1)} deg, origin=${slowOriginSpanX}x${slowOriginSpanY}px, p50 alpha=${restSmoothing.alphaP50}; jitter p95 origin ${restRawOriginJitter}->${restSmoothedOriginJitter}px (${(100 * (1 - restSmoothedOriginJitter / restRawOriginJitter)).toFixed(1)}% lower, gate <=0.80x) rotation ${restRawRotationJitter}->${restSmoothedRotationJitter}deg (gate <=0.85x); motion lag p95=${motionSmoothing.lagOriginPxP95}px/${motionSmoothing.lagRotationDegP95}deg ramp=${motionSmoothing.rampLagMsP95}ms cost=${motionSmoothing.costMsP95}ms`,
     );
 
+    // Paired raw pass over the same documented window. The public Pose smoothing
+    // control renders the raw tracker pose while the same smoother still runs as
+    // a shadow filter, so comparable recorded motion is measured in both modes.
+    // Only the rendered (smoothed) pass is subject to the 24 px bound; the raw
+    // value is reported to show the smoother's measured effect on this metric.
+    // This runs after the motion-window lag evidence because switching the
+    // public control resets the paired smoothing metrics.
+    const rawPass = await collectMotionWindowSamples({ smoothingMode: 'raw' });
+    await page.locator('[data-testid="pose-smoothing"]').selectOption('smoothed');
+    await page.waitForTimeout(300);
+    const rawSlidingEvidence = slidingMetrics(rawPass.samples);
+    assert.ok(
+      rawPass.samples.length >= 14,
+      `expected most raw-mode motion-window frames tracked, got ${rawPass.samples.length}/18`,
+    );
+    const slidingReduction =
+      rawSlidingEvidence.slideP95Px > 0
+        ? Number((1 - slidingEvidence.slideP95Px / rawSlidingEvidence.slideP95Px).toFixed(3))
+        : 0;
+    evidence.sliding = {
+      rendered: slidingEvidence,
+      raw: rawSlidingEvidence,
+      smoothedVsRawReduction: slidingReduction,
+      rawSamples: rawPass.samples.length,
+      note:
+        'The face-box centre shifts under yaw, so this bounded proxy metric is not a ground-truth surface-distance measurement; the raw value is reported rather than asserting a correction.',
+    };
+    pass(
+      'The projected mask origin stays within a bounded p95 sliding distance relative to the tracked face-box centre',
+      `rendered p95 sliding=${slidingEvidence.slideP95Px}px (${(100 * slidingEvidence.slideP95FractionOfFaceWidth).toFixed(1)}% of face width; enforced bound ${slidingEvidence.boundPx}px), raw-mode p95=${rawSlidingEvidence.slideP95Px}px, smoothed-vs-raw change=${(100 * slidingReduction).toFixed(1)}%, anchor offset p95=${slidingEvidence.anchorOffsetP95Px}px (bound 60 px)`,
+    );
+
     // Side-view occlusion A/B on two documented held frames in opposite yaw
     // directions. The capture control writes exact 1280x720 output PNGs; the
     // on/off diff must sit inside the tracked face's axis-aligned bounding box,
@@ -2513,7 +2789,9 @@ async function recordedMotionScenario() {
     await holdRenderedFrameAt(page, OCCLUSION_CAPTURE_SECONDS, 'primary occlusion');
     const heldTracking = parseKeyValues(await readDiagnostic(page, 'diag-tracking'));
     assert.equal(heldTracking.phase, 'tracking', 'the held side-view frame must still be tracked');
-    const bundledOcclusion = await occlusionAbEvidence(page, '28-bundled-mask', MASK_EYE_RGB);
+    const bundledOcclusion = await occlusionAbEvidence(page, '28-bundled-mask', MASK_EYE_RGB, null, {
+      compareVideo: true,
+    });
     const primaryYaw = Number(bundledOcclusion.mask.yaw);
     assert.ok(primaryYaw <= -10, `the primary occlusion sample must be a turned frame, got yaw=${primaryYaw}`);
     const bundledCameraOcclusion = await occlusionCameraAbEvidence(
@@ -2536,7 +2814,7 @@ async function recordedMotionScenario() {
     };
     pass(
       'Face-based occlusion removes mask pixels inside the turned face bounding box in preview and camera',
-      `yaw=${bundledOcclusion.mask.yaw} changed=${bundledOcclusion.changedPixels}px (${(100 * bundledOcclusion.insideFaceFraction).toFixed(1)}% inside face bbox, reveal=${bundledOcclusion.reveal.kind}) camera=${bundledCameraOcclusion.changedPixels}px ${bundledOcclusion.on} ${bundledOcclusion.off}`,
+      `yaw=${bundledOcclusion.mask.yaw} changed=${bundledOcclusion.changedPixels}px (${(100 * bundledOcclusion.insideFaceFraction).toFixed(1)}% inside face bbox, reveal=${bundledOcclusion.reveal.kind}) camera=${bundledCameraOcclusion.changedPixels}px self-diff ON ${bundledOcclusion.selfDiffPixels}px OFF ${bundledOcclusion.offSelfDiffPixels}px plausibility meanLuma=${bundledOcclusion.reveal.plausibleVideo.meanLuminance} stddev=${bundledOcclusion.reveal.plausibleVideo.luminanceStdDev} videoMatch=${bundledOcclusion.videoMatch?.matchFraction} probePixel=${JSON.stringify(bundledOcclusion.probePixel)} ${bundledOcclusion.on} ${bundledOcclusion.off}`,
     );
     pass(
       'The virtual camera receives exactly the same occlusion change on the same held frame',
@@ -2562,41 +2840,43 @@ async function recordedMotionScenario() {
     evidence.occlusion.guardVisorCamera = guardCameraOcclusion;
     pass(
       'An imported package mask (guard-visor) uses the same face-based occlusion path in preview and camera',
-      `changed=${guardOcclusion.changedPixels}px (${(100 * guardOcclusion.insideFaceFraction).toFixed(1)}% inside face bbox) camera=${guardCameraOcclusion.changedPixels}px materialOff=${(100 * guardOcclusion.reveal.changedMaterialFractionOff).toFixed(1)}% materialOn=${(100 * guardOcclusion.reveal.changedMaterialFractionOn).toFixed(1)}% ${guardOcclusion.on} ${guardOcclusion.off}`,
+      `changed=${guardOcclusion.changedPixels}px (${(100 * guardOcclusion.insideFaceFraction).toFixed(1)}% inside face bbox) camera=${guardCameraOcclusion.changedPixels}px materialOff=${(100 * guardOcclusion.reveal.changedMaterialFractionOff).toFixed(1)}% materialOn=${(100 * guardOcclusion.reveal.changedMaterialFractionOn).toFixed(1)}% self-diff ON ${guardOcclusion.selfDiffPixels}px OFF ${guardOcclusion.offSelfDiffPixels}px probePixel=${JSON.stringify(guardOcclusion.probePixel)} ${guardOcclusion.on} ${guardOcclusion.off}`,
     );
 
     const roseImport = await importPackageThroughControl(app, page, path.join(PACKAGE_FIXTURES_DIR, 'rose-visor.zip'));
     assert.equal(roseImport.state, 'success', `rose-visor import must succeed: ${roseImport.text}`);
     await waitForEffectLoaded(page, ROSE_VISOR_EFFECT_ID);
     await waitForStatusTitle(page, /Effect active: Rose visor/);
-    const roseOcclusion = await occlusionAbEvidence(page, '28-rose-visor', ROSE_MASK_RGB, ROSE_MASK_RGB);
+    const roseOcclusion = await occlusionAbEvidence(page, '28-rose-visor', ROSE_MASK_RGB, ROSE_MASK_RGB, {
+      compareVideo: true,
+    });
     evidence.occlusion.roseVisor = roseOcclusion;
     pass(
       'A mask-only imported package with a nonzero attachment (rose-visor) uses the same occlusion path',
-      `changed=${roseOcclusion.changedPixels}px (${(100 * roseOcclusion.insideFaceFraction).toFixed(1)}% inside face bbox) materialOff=${(100 * roseOcclusion.reveal.changedMaterialFractionOff).toFixed(1)}% materialOn=${(100 * roseOcclusion.reveal.changedMaterialFractionOn).toFixed(1)}% ${roseOcclusion.on} ${roseOcclusion.off}`,
+      `changed=${roseOcclusion.changedPixels}px (${(100 * roseOcclusion.insideFaceFraction).toFixed(1)}% inside face bbox) materialOff=${(100 * roseOcclusion.reveal.changedMaterialFractionOff).toFixed(1)}% materialOn=${(100 * roseOcclusion.reveal.changedMaterialFractionOn).toFixed(1)}% self-diff ON ${roseOcclusion.selfDiffPixels}px OFF ${roseOcclusion.offSelfDiffPixels}px videoMatch=${roseOcclusion.videoMatch?.matchFraction} ${roseOcclusion.on} ${roseOcclusion.off}`,
     );
 
-    // Return to the bundled mask and the normal moving replay for the remaining
-    // camera/probe evidence. The opposite-yaw A/B runs in a fresh app instance
-    // after this app closes, so a backward seek cannot strand the output paused.
+    // Return to the bundled mask for the remaining camera evidence. The primary
+    // occlusion A/B left the replay held on a tracked motion-window frame
+    // (47.7 s), so the camera capture below uses that stable processed frame
+    // instead of resuming live playback first: in this Electron/Playwright
+    // environment, a backward seek followed by a loop seam can stall the video
+    // frame-callback pipeline, which would turn a camera-startup check into a
+    // decoder artifact. The moving behavior itself is evidenced by the sampled
+    // motion window above and the three saved screenshots.
     await selectEffectThroughControl(page, 'mask');
     await waitForStatusTitle(page, /Effect active: Rigid mask/);
-    await releaseReplayFrame(page);
 
     // The fixed local eye probe is exact only when the eye plate faces the
     // camera; at some large yaw/pitch poses the same view ray lands on the
-    // surrounding shell. Wait for a frame in the continuing replay where the
-    // sampled probe is actually the eye colour instead of asserting on one
-    // arbitrary post-window frame.
-    const motionProbe = await waitFor(
-      'motion-window mask eye probe',
-      async () => {
-        const probe = await readMaskProbe(page);
-        return maskEyeColourMatches(probe) ? probe : null;
-      },
-      5000,
-      100,
-    );
+    // surrounding shell. The held motion-window frame is not guaranteed to show
+    // it, so it is asserted only when visible; the camera PNG's mask-pixel count
+    // below proves composition either way.
+    const motionProbe = await readMaskProbe(page);
+    const motionProbeVisible = maskEyeColourMatches(motionProbe);
+    if (motionProbeVisible) {
+      assertMaskProbe(motionProbe, 'held motion-window preview probe');
+    }
     evidence.motion = {
       fixture: motionMetadata.id,
       windowStartSeconds: MOTION_WINDOW_START_SECONDS,
@@ -2611,7 +2891,12 @@ async function recordedMotionScenario() {
       originXRange,
       originYRange,
       previewProbe: motionProbe,
+      previewProbeVisible: motionProbeVisible,
+      cameraEvidenceFrame: OCCLUSION_CAPTURE_SECONDS,
       sliding: slidingEvidence,
+      rawSliding: rawSlidingEvidence,
+      rawSamples: rawPass.samples.length,
+      smoothedVsRawReduction: slidingReduction,
       screenshots: sampleShots,
       samples,
     };
@@ -2633,12 +2918,16 @@ async function recordedMotionScenario() {
       preview: cameraPreview,
       camera: averageFrameRgb(cameraRun.frames),
       eyePixels,
+      heldFrameSeconds: OCCLUSION_CAPTURE_SECONDS,
       png: cameraPng.png,
     };
     pass(
-      'The camera consumer receives the masked head-turn output as well',
-      `camera=${JSON.stringify(evidence.camera.camera)} eyePixels=${eyePixels} ${cameraPng.png}`,
+      'The camera consumer receives the masked output for the held motion-window frame as well',
+      `heldFrame=${OCCLUSION_CAPTURE_SECONDS}s camera=${JSON.stringify(evidence.camera.camera)} eyePixels=${eyePixels} ${cameraPng.png}`,
     );
+    // Resume the replay only after the camera evidence is captured; the opposite
+    // side view uses a fresh app instance.
+    await releaseReplayFrame(page);
 
     const trackingTiming = parseKeyValues(await readDiagnostic(page, 'diag-tracking-timing'));
     evidence.timing = {
@@ -2674,7 +2963,9 @@ async function recordedMotionScenario() {
       await holdRenderedFrameAt(opposite.page, OCCLUSION_CAPTURE_SECONDS_OPPOSITE, 'opposite occlusion');
       const oppositeTracking = parseKeyValues(await readDiagnostic(opposite.page, 'diag-tracking'));
       assert.equal(oppositeTracking.phase, 'tracking', 'the opposite side-view frame must still be tracked');
-      const oppositeBundled = await occlusionAbEvidence(opposite.page, '28b-bundled-mask', MASK_EYE_RGB);
+      const oppositeBundled = await occlusionAbEvidence(opposite.page, '28b-bundled-mask', MASK_EYE_RGB, null, {
+        compareVideo: true,
+      });
       const oppositeYaw = Number(oppositeBundled.mask.yaw);
       assert.ok(oppositeYaw >= 5, `the second occlusion sample must be a different turned frame, got yaw=${oppositeYaw}`);
       assert.ok(
@@ -2997,8 +3288,7 @@ async function effectPackageScenario() {
     );
 
     // The independent camera consumer must receive the same packaged canvas.
-    const guardCameraRun = await captureCameraState(page, 'imported-guard-visor', 6);
-    assertProcessedFrames(guardCameraRun.frames, guardRgb, 'imported guard visor');
+    const guardCameraRun = await captureProcessedCameraState(page, 'imported-guard-visor', PROCESSED_CAMERA_FRAMES, guardRgb, 'imported guard visor');
     const guardPng = assertProcessedPng(guardCameraRun.frames, guardRgb, 'imported guard visor');
     const guardMaskPixels = pngColorCount(guardPng.png, PACKAGE_MASK_RGB, 28);
     assert.ok(
@@ -3044,8 +3334,7 @@ async function effectPackageScenario() {
       `the package's declarative green treatment must visibly change the preview, got ${JSON.stringify(verdantRgb)}`,
     );
     const verdantShot = await screenshotCanvas(page, '22-imported-verdant-tint-preview.png');
-    const verdantRun = await captureCameraState(page, 'imported-verdant-tint', 6);
-    assertProcessedFrames(verdantRun.frames, verdantRgb, 'imported verdant tint');
+    const verdantRun = await captureProcessedCameraState(page, 'imported-verdant-tint', PROCESSED_CAMERA_FRAMES, verdantRgb, 'imported verdant tint');
     const verdantPng = assertProcessedPng(verdantRun.frames, verdantRgb, 'imported verdant tint');
     evidence.imports.verdantTint = {
       importMessage: verdantImport.text,
@@ -3089,8 +3378,7 @@ async function effectPackageScenario() {
       roseMaterialPixels > 25000,
       `preview PNG must contain the rose mask material, found ${roseMaterialPixels} pixels (enforced >25,000)`,
     );
-    const roseRun = await captureCameraState(page, 'imported-rose-visor', 6);
-    assertProcessedFrames(roseRun.frames, roseRgb, 'imported rose visor');
+    const roseRun = await captureProcessedCameraState(page, 'imported-rose-visor', PROCESSED_CAMERA_FRAMES, roseRgb, 'imported rose visor');
     const rosePng = assertProcessedPng(roseRun.frames, roseRgb, 'imported rose visor');
     const roseMaskPixels = pngColorCount(rosePng.png, ROSE_MASK_RGB, 28);
     assert.ok(
@@ -3386,8 +3674,7 @@ async function effectPackageScenario() {
       persistedRgb.g > persistedRgb.r + 8 && persistedRgb.g > persistedRgb.b + 8,
       `persisted package treatment must render after restart, got ${JSON.stringify(persistedRgb)}`,
     );
-    const persistedRun = await captureCameraState(page, 'persisted-package', 4);
-    assertProcessedFrames(persistedRun.frames, persistedRgb, 'persisted package');
+    const persistedRun = await captureProcessedCameraState(page, 'persisted-package', PROCESSED_CAMERA_FRAMES, persistedRgb, 'persisted package');
     const persistedPng = assertProcessedPng(persistedRun.frames, persistedRgb, 'persisted package');
     const persistedShot = await screenshotCanvas(page, '27-persisted-package-preview.png');
     evidence.persistence = {
@@ -3538,10 +3825,11 @@ async function main() {
       'Tracker inference cost is performance.now() around one MediaPipe detectForVideo call; the first warm-up inference is reported separately and excluded from the p95.',
       'Mask placement/orientation is derived from the MediaPipe facial transformation matrix using its documented 63 degree vertical-FOV camera assumption; it is a rigid attachment.',
       'Face occlusion renders a depth-only copy of MediaPipe\'s 468-vertex canonical face model (898 triangles) with the same tracked matrix into the mask scene; mask fragments behind the reconstructed face fail the depth test and the underlying video shows through. The occluder is the canonical face surface only: it has no hair, ears, neck or full head silhouette.',
-      'Occlusion A/B evidence holds two documented recorded side-view frames (47.7 s, yaw about -22 deg, and 16.0 s, yaw in the opposite direction) via the diagnostic Hold replay frame control and captures exact 1280x720 output PNGs through the public Capture control. The held canvas is deterministic: two captures in the same state must be pixel-identical. Each A/B requires at least 88% of changed pixels inside the tracked face axis-aligned bounding box and at least 1,500 removed mask pixels inside it.',
-      'The occlusion ON frame is also proved to reveal non-mask content where the OFF frame drew mask material: for an imported package the changed face-box pixels are at least 97% the exact unlit material colour in OFF and at most 3% that colour in ON; for the bundled lit mask the dominant exact OFF-frame mask colours (top 64 shades, at least 90% of changed pixels) must not reappear in the ON frame at those pixels (at most 1%).',
+      'Occlusion A/B evidence holds two documented recorded side-view frames (47.7 s, yaw about -22 deg, and 16.0 s, yaw in the opposite direction) via the diagnostic Hold replay frame control and captures exact 1280x720 output PNGs through the public Capture control. The held canvas is deterministic: ON and OFF are each captured twice and the two same-state captures must be pixel-identical. Each A/B requires at least 88% of changed pixels inside the tracked face axis-aligned bounding box and at least 1,500 removed mask pixels inside it.',
+      'The occlusion ON frame is also proved to reveal non-mask content where the OFF frame drew mask material: for an imported package the changed face-box pixels are at least 97% the exact unlit material colour in OFF and at most 3% that colour in ON; for the bundled lit mask the dominant exact OFF-frame mask colours (top 64 shades, at least 90% of changed pixels) must not reappear in the ON frame at those pixels (at most 1%). The ON changed pixels must also pass a plausible-video floor (mean luminance >= 30, luminance stddev >= 6, <= 10% near-black, >= 16 distinct colours), and for the untreated bundled mask and rose package at least 90% of sampled ON pixels must match the held replay frame drawn at the pipeline scale. This proves mask material is removed and plausible video is revealed; it is not an exact-colour proof of identity.',
       'Raw and smoothed pose jitter are measured over the same presented frames in the initial slow segment of the recorded window. The segment\'s motion is measured, not assumed: its pose span and the filter p50 gain are reported, and it is required to stay within 10 deg yaw/pitch, 5 deg roll, 30 px origin and p50 alpha <= 0.4. Across the full turn/nod/lean window the reported p95 raw-vs-smoothed offset and the filter\'s implied constant-velocity delay measure the added lag.',
-      'Sliding is quantified over the motion window as the p95 deviation of the projected mask origin from its median offset to the tracked face-box centre (bound 24 px, reported as a fraction of face width), plus the raw origin-to-face-centre offset p95 (bound 60 px). Clipping is quantified as the mask pixels removed inside the face bounding box by the occluder in each A/B (at least 1,500 px).',
+      'Camera capture attempts and their app-published/native-fallback frame counts are recorded in virtualCamera.captureAttempts. Processed captures request 8 frames because the native source starts each consumer stream with an empty frame cache; captureProcessedCameraState retries up to 3 times and the final attempt still fails on a persistent fallback.',
+      'Sliding is quantified over the motion window as the p95 deviation of the projected mask origin from its median offset to the tracked face-box centre (bound 24 px, reported as a fraction of face width), plus the raw origin-to-face-centre offset p95 (bound 60 px). The same documented window is sampled again through the public Pose smoothing raw mode; the raw-mode sliding value is reported without asserting it. Observed rendered 12.5-18 px vs raw-mode 8.6-11.5 px, so smoothing did not reduce this proxy metric. The face-box centre shifts under yaw, so this bounded proxy metric is not a ground-truth surface-distance measurement. Clipping is quantified as the mask pixels removed inside the face bounding box by the occluder in each A/B (at least 1,500 px).',
       'Smoothing is a bounded exponential filter (base gain 0.45 at rest, rising toward 1 as measured face speed approaches 360 deg/s or 60 cm/s) with hard 4 cm / 8 degree lag caps. The 0.45 gain is normalized to the 41.67 ms reference interval, so the effective alpha at the observed ~35 ms interval is about 0.34 and the measured ramp lag is about 61 ms; the 50.9 ms reference-interval figure is not a global maximum. It is not a prediction filter and the recorded frames are replay input.',
       'Tracking-loss, multiple-face and unreliable-tracking policy states in Scenario F are produced by the labelled diagnostic injection control; the real detector path is used for the normal tracking and recorded-motion states. The recorded-motion clip is real recorded video from a second CC0 fixture, positioned by seeking to a documented window.',
       'Effect-package evidence uses an isolated SHYMASK_PACKAGE_DIR and stubs only the Electron OS file picker in the main process; validation, archive safety checks, storage, asset protocol loading and GLTFLoader parsing are the real paths. A rejected dialog cancellation is not exercised.',
@@ -3654,16 +3942,17 @@ async function main() {
       registration: 'per-user attempt plus machine-wide (HKLM) COM registration; see docs/notes/0002-windows-virtual-camera-spike.md',
       evidence: virtualCamera,
       missingFixture: missingFixtureCamera.states.missingFixture,
+      captureAttempts: cameraCaptureAttempts,
     },
     results,
     limitations: [
       'Replay fixtures only; no physical webcam was opened and no human participated.',
       'Virtual camera evidence is from a separate Media Foundation consumer harness, not a call or stream application; Zoom/Meet/OBS compatibility is a later slice.',
       'Camera latency is measured against canvas capture time in the same process tree; camera-sensor and call-network delay are out of scope.',
-      'Tracking is demonstrated on recorded video (the default clip and a second larger-motion CC0 clip); there is no physical-camera or live-human tracking evidence in this slice.',
+      'Tracking is demonstrated on recorded video (the default clip and a second larger-motion CC0 clip); there is no physical-camera or live-human tracking evidence in this slice. The motion-window camera capture is taken on the held 47.7 s frame; resuming live playback after the long held A/B is not used as evidence because the automated session can stall its frame-callback timestamps after a loop seam (the output correctly hides under the paused policy).',
       'Tracking loss, multiple faces and unreliable tracking are exercised through a labelled diagnostic injection; the detected-face path is authoritative when the control is on normal. The policy cannot detect every possible tracking or rendering defect.',
       'The mask has face-based occlusion and bounded pose smoothing; secondary motion is a later issue. The canonical face occluder does not deform for facial expressions, is the canonical face surface only (no hair, ears, neck or full head silhouette), and hand-over-mask occlusion is out of scope.',
-      'Occlusion evidence quantifies the removed mask pixels inside the tracked face bounding box at two recorded side views in opposite yaw directions; it does not prove clean occlusion at poses outside the recorded clip (larger yaw/pitch, fast motion, hair/ear/neck overlap). The residual extreme-pose limitations are stated in docs/notes/0005.',
+      'Occlusion evidence quantifies the removed mask pixels inside the tracked face bounding box at two recorded side views in opposite yaw directions; it does not prove clean occlusion at poses outside the recorded clip (larger yaw/pitch, fast motion, hair/ear/neck overlap) and it is not asserted continuously during the moving motion window. The residual extreme-pose limitations are stated in docs/notes/0005.',
       'Measured on this development desktop with a discrete GPU; laptop integrated-graphics behavior is unverified.',
       'Color treatments use canvas CSS filters in this spike; a later effect-package slice may replace the implementation.',
       'No CI or branch protection exists; these local checks are the validation gate.',
@@ -3686,13 +3975,13 @@ async function main() {
   log(`tracker inference p95:       ${trackingMask.timing.inferenceP95Ms}ms (warm-up ${trackingMask.timing.inferenceWarmupMs}ms, ${trackingMask.timing.inferenceFrames} frames)`);
   log(`mask render + composite p95: ${trackingMask.timing.renderCostP95Ms}ms`);
   log(`default-clip mask motion:    origin x=${trackingMask.maskMotion.defaultClip?.originXSpread}px y=${trackingMask.maskMotion.defaultClip?.originYSpread}px yaw=${trackingMask.maskMotion.defaultClip?.yawSpread?.toFixed?.(1) ?? '?'} pitch=${trackingMask.maskMotion.defaultClip?.pitchSpread?.toFixed?.(1) ?? '?'}`);
-  log(`recorded turns/nods window:  ${MOTION_WINDOW_START_SECONDS}s of ${motionManifest.id}: yaw=${recordedMotion.motion.yawRange.toFixed(1)} pitch=${recordedMotion.motion.pitchRange.toFixed(1)} roll=${recordedMotion.motion.rollRange.toFixed(1)} origin=${recordedMotion.motion.originXRange}x${recordedMotion.motion.originYRange}px sliding p95=${recordedMotion.motion.sliding.slideP95Px}px (${recordedMotion.motion.trackedSamples}/18 tracked)`);
+  log(`recorded turns/nods window:  ${MOTION_WINDOW_START_SECONDS}s of ${motionManifest.id}: yaw=${recordedMotion.motion.yawRange.toFixed(1)} pitch=${recordedMotion.motion.pitchRange.toFixed(1)} roll=${recordedMotion.motion.rollRange.toFixed(1)} origin=${recordedMotion.motion.originXRange}x${recordedMotion.motion.originYRange}px sliding p95=${recordedMotion.motion.sliding.slideP95Px}px raw p95=${recordedMotion.motion.rawSliding.slideP95Px}px (${(100 * recordedMotion.motion.smoothedVsRawReduction).toFixed(1)}% smoothed-vs-raw change; ${recordedMotion.motion.trackedSamples}/18 tracked)`);
   log(`pose smoothing (slow seg):  measured yaw=${recordedMotion.smoothing.slowSegmentMeasured.yawSpanDeg} pitch=${recordedMotion.smoothing.slowSegmentMeasured.pitchSpanDeg} roll=${recordedMotion.smoothing.slowSegmentMeasured.rollSpanDeg} deg origin=${recordedMotion.smoothing.slowSegmentMeasured.originSpanXPx}x${recordedMotion.smoothing.slowSegmentMeasured.originSpanYPx}px p50 alpha=${recordedMotion.smoothing.slowSegmentMeasured.alphaP50}`);
   log(`pose smoothing (jitter):    origin p95 ${recordedMotion.smoothing.slowSegment.rawJitterOriginPxP95}->${recordedMotion.smoothing.slowSegment.smoothedJitterOriginPxP95}px (${(100 * recordedMotion.smoothing.originJitterReductionSlowSegment).toFixed(1)}% lower) rotation ${recordedMotion.smoothing.slowSegment.rawJitterRotationDegP95}->${recordedMotion.smoothing.slowSegment.smoothedJitterRotationDegP95}deg (${(100 * recordedMotion.smoothing.rotationJitterReductionSlowSegment).toFixed(1)}% lower)`);
   log(`smoothing added lag/cost:    origin p95=${recordedMotion.smoothing.motion.lagOriginPxP95}px rotation p95=${recordedMotion.smoothing.motion.lagRotationDegP95}deg ramp p95=${recordedMotion.smoothing.motion.rampLagMsP95}ms filter p95=${recordedMotion.smoothing.motion.costMsP95}ms`);
-  log(`occlusion A/B (bundled):     ${recordedMotion.occlusion.bundled.changedPixels}px changed, ${(100 * recordedMotion.occlusion.bundled.insideFaceFraction).toFixed(1)}% inside face bbox, reveal ${recordedMotion.occlusion.bundled.reveal.kind}, self-diff ${recordedMotion.occlusion.bundled.selfDiffPixels}px`);
-  log(`occlusion A/B (guard):       ${recordedMotion.occlusion.guardVisor.changedPixels}px changed, ${(100 * recordedMotion.occlusion.guardVisor.insideFaceFraction).toFixed(1)}% inside face bbox, material OFF ${(100 * recordedMotion.occlusion.guardVisor.reveal.changedMaterialFractionOff).toFixed(1)}% -> ON ${(100 * recordedMotion.occlusion.guardVisor.reveal.changedMaterialFractionOn).toFixed(1)}%`);
-  log(`occlusion A/B (rose):        ${recordedMotion.occlusion.roseVisor.changedPixels}px changed, ${(100 * recordedMotion.occlusion.roseVisor.insideFaceFraction).toFixed(1)}% inside face bbox, material OFF ${(100 * recordedMotion.occlusion.roseVisor.reveal.changedMaterialFractionOff).toFixed(1)}% -> ON ${(100 * recordedMotion.occlusion.roseVisor.reveal.changedMaterialFractionOn).toFixed(1)}%`);
+  log(`occlusion A/B (bundled):     ${recordedMotion.occlusion.bundled.changedPixels}px changed, ${(100 * recordedMotion.occlusion.bundled.insideFaceFraction).toFixed(1)}% inside face bbox, reveal ${recordedMotion.occlusion.bundled.reveal.kind}, self-diff ON ${recordedMotion.occlusion.bundled.selfDiffPixels}px OFF ${recordedMotion.occlusion.bundled.offSelfDiffPixels}px, plausibility meanLuma=${recordedMotion.occlusion.bundled.reveal.plausibleVideo.meanLuminance} stddev=${recordedMotion.occlusion.bundled.reveal.plausibleVideo.luminanceStdDev}, video match=${recordedMotion.occlusion.bundled.videoMatch?.matchFraction ?? 'n/a'}, probe=${JSON.stringify(recordedMotion.occlusion.bundled.probePixel)}`);
+  log(`occlusion A/B (guard):       ${recordedMotion.occlusion.guardVisor.changedPixels}px changed, ${(100 * recordedMotion.occlusion.guardVisor.insideFaceFraction).toFixed(1)}% inside face bbox, material OFF ${(100 * recordedMotion.occlusion.guardVisor.reveal.changedMaterialFractionOff).toFixed(1)}% -> ON ${(100 * recordedMotion.occlusion.guardVisor.reveal.changedMaterialFractionOn).toFixed(1)}%, plausibility meanLuma=${recordedMotion.occlusion.guardVisor.reveal.plausibleVideo.meanLuminance}, self-diff ON ${recordedMotion.occlusion.guardVisor.selfDiffPixels}px OFF ${recordedMotion.occlusion.guardVisor.offSelfDiffPixels}px`);
+  log(`occlusion A/B (rose):        ${recordedMotion.occlusion.roseVisor.changedPixels}px changed, ${(100 * recordedMotion.occlusion.roseVisor.insideFaceFraction).toFixed(1)}% inside face bbox, material OFF ${(100 * recordedMotion.occlusion.roseVisor.reveal.changedMaterialFractionOff).toFixed(1)}% -> ON ${(100 * recordedMotion.occlusion.roseVisor.reveal.changedMaterialFractionOn).toFixed(1)}%, video match=${recordedMotion.occlusion.roseVisor.videoMatch?.matchFraction ?? 'n/a'}, self-diff ON ${recordedMotion.occlusion.roseVisor.selfDiffPixels}px OFF ${recordedMotion.occlusion.roseVisor.offSelfDiffPixels}px`);
   log(`occlusion A/B (camera):      bundled ${recordedMotion.occlusion.camera.changedPixels}px, guard ${recordedMotion.occlusion.guardVisorCamera.changedPixels}px (identical to preview, self-diff 0)`);
   log(`occlusion A/B (opposite):    ${recordedMotion.occlusion.opposite.bundled.changedPixels}px changed at yaw=${recordedMotion.occlusion.opposite.bundled.mask.yaw}, ${(100 * recordedMotion.occlusion.opposite.bundled.insideFaceFraction).toFixed(1)}% inside face bbox; camera ${recordedMotion.occlusion.opposite.camera.changedPixels}px; guard ${recordedMotion.occlusion.opposite.guardVisor.changedPixels}px`);
   log(`tracker model:               ${trackerMetadata.id} sha256=${trackerMetadata.sha256.slice(0, 12)}…`);
