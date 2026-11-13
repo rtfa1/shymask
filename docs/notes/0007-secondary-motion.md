@@ -29,7 +29,7 @@ Schema version 3 adds one optional component to a mask package:
 | Field | Required | Bound |
 | --- | --- | --- |
 | `parts` | yes | 1-4 entries |
-| `node` | yes | exactly one node name in the mask GLB |
+| `node` | yes | an ASCII letter or digit first, then letters, digits, `_` or `-` (1-64 characters); exactly one node name in the mask GLB |
 | `axis` | yes | `"x"`, `"y"` or `"z"` |
 | `drive` | yes | `"yaw"`, `"pitch"` or `"roll"` |
 | `stiffness` | yes | `4`-`400` (1/s²) |
@@ -37,10 +37,12 @@ Schema version 3 adds one optional component to a mask package:
 | `maxAngleDeg` | yes | `1`-`60` |
 | `restAngleDeg` | no (default `0`) | within `maxAngleDeg`, ±60 |
 
-Each part is a **named GLB node** whose authored orientation is the rest pose.
-The node origin is the pivot; the mask geometry for that part is authored around
-it. The package supplies only bounded numbers and node names, never geometry,
-shader code, a skeleton, a movement clip or per-frame displacement.
+Each part is a **named GLB node**. The node's authored orientation is the
+zero-offset base; the declared rest pose is that orientation plus
+`restAngleDeg` (0 by default). The node origin is the pivot; the mask geometry
+for that part is authored around it. The package supplies only bounded numbers
+and node names, never geometry, shader code, a skeleton, a movement clip or
+per-frame displacement.
 
 **Why schema v3 rather than extending v2?** An older v2 build treats unknown
 top-level fields as warnings. It would import a package that declares moving
@@ -77,10 +79,11 @@ angle  = clamp(angle, -maxAngleDeg, +maxAngleDeg)
   sqrt(stiffness)` and `ζ = damping`. The target is proportional to head
   angular velocity, so a part lags while the head turns; when the head stops the
   target returns to rest and the underdamped spring keeps moving and settles.
-- Integration uses **fixed 120 Hz internal sub-steps** with semi-implicit Euler,
-  so the same accepted-pose sequence produces the same angles independent of the
-  presented-frame interval. `performance.now()` is only used for the reported
-  cost.
+- Integration splits each frame interval into equal sub-steps of **at most
+  1/120 s** (`ceil(dt / (1/120 s))` sub-steps) with semi-implicit Euler. A given
+  accepted-pose sequence therefore produces the same angles; this is not a fixed
+  120 Hz accumulator and is not a claim of frame-rate independence.
+  `performance.now()` is only used for the reported cost.
 - `dt` is clamped to `[0.5, 250]` ms. The angle is hard-clamped to the declared
   bound and an outward velocity is zeroed at the clamp, so a saturating drive or
   spring overshoot cannot exceed `maxAngleDeg`.
@@ -96,8 +99,8 @@ bundled mask could reuse the same renderer hooks without a schema change.
 
 ### Deliberate resets (no impulse)
 
-The spring state is dropped, and the part starts from the authored rest
-orientation with zero velocity, on:
+The spring state is dropped, and the part starts from the declared rest pose
+(the authored GLB orientation plus `restAngleDeg`) with zero velocity, on:
 
 | Trigger | Why |
 | --- | --- |
@@ -125,12 +128,13 @@ costMsLast=... costMsP95=... applied=simulated drawable=true
 ```
 
 The diagnostic **Apply secondary motion (A/B)** toggle keeps the effect selected
-and draws the authored rest orientation. Exact 1280×720 PNGs captured through
-the public **Capture evidence frame** control are compared: ON and OFF differ by
-thousands of pixels, all on the packaged mask, two same-state captures are
-pixel-identical, and the independent Media Foundation camera receives the
+and draws the declared rest pose. Exact 1280×720 PNGs captured through
+the public **Capture evidence frame** control are compared: ON and OFF changed
+1,864 pixels in the cited run, all on the packaged mask, two same-state captures
+are pixel-identical, and the independent Media Foundation camera receives the
 identical change. A dropped simulation makes ON == OFF; the OFF frame still comes
-from the mask renderer, not the raw video element.
+from the mask renderer, not the raw video element. This held-frame A/B isolates
+the simulated angle; it is not a live-motion capture.
 
 With the replay held, the diagnostic **Settle held frame** control advances the
 same simulator with the stationary accepted pose. This is the strict post-turn
@@ -162,14 +166,21 @@ Covered by `npm test` and `npm run check` scenario J:
   material, and samples the documented 8 s turn/nod/lean window: 17/18 frames
   tracked, per-part angle ranges 59.7°/59.7°/42.0° in the cited run, maximum
   observed 30.75° (all inside the declared 32/32/35° bounds). Three screenshots
-  are saved.
-- **Post-turn settling:** a separate documented window starts at 25.0 s for
-  1.9 s (the recorded head turn around 25.9 s is followed by about a second of
-  low head angular velocity). In the cited run the live window measured a spring
-  peak of 17.71°, still 7.90° after head angular speed fell to 8.5°/s, and a
-  near-rest 2.73° 833 ms after the peak (15.4% of peak). The recorded person
-  keeps producing small head motion later, so this live window reports the
-  residual and a near-rest sample rather than asserting a monotonic tail.
+  are saved. A camera-captured sequence runs during the same window: every
+  app-published PNG must contain the package material, while the diagnostic
+  samples over that interval report nonzero, bounded part angles. It does not
+  isolate the part-pixel change from the moving video; the held A/B isolates
+  the simulated angle.
+- **Post-turn residual (live):** a separate documented window starts at 25.0 s
+  for 1.9 s (the recorded head turn around 25.9 s is followed by about a second
+  of low head angular velocity). In the cited run the live window measured a
+  spring peak of 17.71°, still 7.90° after head angular speed fell to 8.5°/s, and
+  a near-rest 2.73° 833 ms after the peak (15.4% of peak). The recorded person
+  does not actually stop and keeps producing small head motion later, so this
+  live window is a **residual/near-rest observation**, not a demonstration of a
+  monotonic stop; the strict decay evidence is the held-frame settle below. A
+  second camera-captured sequence spans the same window and must contain the
+  package material in every app-published PNG.
 - **Held-frame settling (strict):** after the A/B, the replay stays held at the
   documented 47.7 s post-turn frame and the diagnostic **Settle held frame**
   control advances the same simulator with the stationary accepted pose. In the
@@ -178,11 +189,13 @@ Covered by `npm test` and `npm run check` scenario J:
   deterministic post-turn decay evidence; the head is stopped by the hold, so
   the spring's continued motion and settling are unambiguous.
 - **Loop boundary:** crossing a loop seam increased the reported reset count
-  (3 → 4) and the seam frame's angles were at rest (0.01°/0.01°/0.04°); the
-  angles stayed bounded.
+  (3 → 4) and the seam frame's angles were near rest
+  (-0.28°/-0.28°/1.18° in the cited run, all within 1.2° of the declared 0°
+  rest); the angles stayed bounded.
 - **Reacquisition:** tracking loss paused the output in preview and camera,
   reset the spring (angles exactly rest), and recovery resumed from rest; the
-  first reported recovery sample was 4.78° (bounded, driven by the new pose).
+  reported recovery sample was 5.02°/5.02°/10.11° (maximum 10.11°, bounded and
+  driven by the new pose).
 - **Published-output A/B:** on the held 47.7 s post-turn frame the retained
   angle was 8.70°; simulated vs rest changed 1,864 pixels, all inside the mask
   rectangle, with 0 same-state self-diff for ON and OFF. The independent camera
@@ -202,15 +215,16 @@ Covered by `npm test` and `npm run check` scenario J:
   cause no renderer console error.
 - **Replay-based workload:** the pure spring update measured about 0.1 ms p95
   (timer granularity, main thread only); the full render p95 was 5.8 ms with the
-  simulated pose versus 5.8 ms with the authored rest pose, and the presented
+  simulated pose versus 5.8 ms with the declared rest pose, and the presented
   frame interval p95 was 44.3 ms versus 44.3 ms in two sequential 2.2 s windows.
   The OFF state still runs the simulation but draws rest, so these deltas are
   observed run variation, not an isolated simulation cost.
 
 The cited run is `evidence/check-2026-11-13T22-22-14-119Z/summary.json` at code
-head `7a087d7ddaacf900657ba71a84f037dd4ebb2dd6` (94/94 checks). A later
-documentation-only commit does not change the validated behavior; values vary
-run to run under desktop load.
+head `7a087d7ddaacf900657ba71a84f037dd4ebb2dd6` (94/94 checks). A later fix
+round adds the camera sequences and the media-time residual gate without
+changing the fixture's observable simulation behavior; values vary run to run
+under desktop load.
 
 ## Supported parameters for the later AI creator skill
 
@@ -238,10 +252,11 @@ expect it to play; express the intent as these bounded parts. Run
   handled by the same bounds and discontinuity resets but is not separately
   evidenced.
 - **Replay only.** No physical-camera or live-human evidence exists in this
-  slice. The held A/B keeps the last simulated angle and is not a live-motion
-  capture; continuous moving camera evidence is not asserted. Physical-camera
-  behavior, camera-sensor latency and call-application compatibility remain for
-  final live acceptance.
+  slice. The camera sequences are replay-driven and show the packaged mask in
+  app-published frames during motion; they do not isolate the movable-part pixels
+  from the moving video, and the held A/B is not a live-motion capture.
+  Physical-camera behavior, camera-sensor latency and call-application
+  compatibility remain for final live acceptance.
 - **Desktop only.** Measured on the RTX 3070 Ti development desktop; laptop
   integrated-graphics behavior is unverified.
 - **Not a benchmark.** The timing numbers are replay-derived main-thread

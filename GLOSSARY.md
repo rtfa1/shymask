@@ -43,5 +43,8 @@ The hiding of an effect's elements where another surface, such as the person's f
 **Secondary motion**:
 Movement of an effect's elements in response to the person's movement, such as fake hair swaying after a head turn.
 
+**Movable part**:
+A named node in a mask's GLB that the runtime rotates about one declared local axis with a bounded spring driven by tracked head motion.
+
 **Paused output**:
 An opaque replacement for the entire webcam image while tracking or effect processing is unavailable.

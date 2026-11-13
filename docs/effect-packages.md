@@ -312,7 +312,7 @@ velocity every processed frame.
 | Field | Required | Range / default | Meaning |
 | --- | --- | --- | --- |
 | `parts` | yes | 1-4 entries | Each entry is one movable mask GLB node. |
-| `node` | yes | 1-64 ASCII letters/digits/`_`/`-` | Node name in the mask GLB. Exactly one node must match; a missing or duplicate name is rejected at import. |
+| `node` | yes | 1-64 characters: an ASCII letter or digit first, then letters, digits, `_` or `-` | Node name in the mask GLB. Exactly one node must match; a missing or duplicate name is rejected at import. |
 | `axis` | yes | `"x"`, `"y"` or `"z"` | Local rotation axis of that node. |
 | `drive` | yes | `"yaw"`, `"pitch"` or `"roll"` | Tracked head-rotation component that drives the spring. |
 | `stiffness` | yes | `4`-`400` (1/s²) | Angular spring stiffness. Natural frequency ≈ `sqrt(stiffness)` rad/s. |
@@ -320,10 +320,12 @@ velocity every processed frame.
 | `maxAngleDeg` | yes | `1`-`60` | Hard bound on the applied angle relative to the authored GLB pose. |
 | `restAngleDeg` | no | `-60`-`60`, default `0`, within `maxAngleDeg` | Constant offset from the authored GLB orientation at rest. |
 
-The node's **authored GLB orientation is the rest pose**. The part's node origin
-is the pivot; author the part geometry around that origin so a local-axis
-rotation swings it. A declared node may already carry a rotation in the GLB; the
-runtime applies the simulated angle relative to that orientation.
+The node's **authored GLB orientation is the zero-offset base**. The declared
+rest pose is that authored orientation plus `restAngleDeg` (0 by default), and
+the simulated angle is applied relative to it. The part's node origin is the
+pivot; author the part geometry around that origin so a local-axis rotation
+swings it. A declared node may already carry a rotation in the GLB; the runtime
+applies the simulated angle relative to that orientation.
 
 Fixed runtime model (not tunable per package):
 
@@ -334,14 +336,17 @@ angle  = clamp(angle, -maxAngle, +maxAngle)
 
 - Head angular velocity is computed from consecutive **accepted** tracked poses
   (the same pose the mask is attached to), with shortest-arc angle differences.
-- The spring is integrated with a fixed 120 Hz internal sub-step
-  (semi-implicit Euler), so a given accepted-pose sequence is deterministic and
-  frame-rate independent.
+- The spring is integrated with equal sub-steps of at most **1/120 s**
+  (semi-implicit Euler): each frame interval is split into
+  `ceil(dt / (1/120 s))` equal sub-steps, so a given accepted-pose sequence is
+  deterministic. This is not a fixed 120 Hz accumulator and not an assertion of
+  frame-rate independence.
 - `dt` is clamped and never exceeds **250 ms**. A longer gap, a per-sample pose
   jump over **45°** (or an implied speed over **1080 °/s**), a loop seam, a
   tracking reacquisition, and an explicit effect switch reset the spring to the
-  authored rest pose with zero velocity. Resets never inject an impulse: the
-  next frames drive from rest.
+  declared rest pose (the authored GLB orientation plus `restAngleDeg`) with
+  zero velocity. Resets never inject an impulse: the next frames drive from
+  rest.
 - A positive head angular velocity around `drive` moves the target toward
   `+maxAngleDeg`; when the head stops, the target returns to `restAngleDeg` and
   the underdamped spring keeps moving briefly and settles. This is why the
@@ -370,7 +375,7 @@ The public **Secondary motion** diagnostic reports the active part names,
 number of updates, reset count and last reset reason, head speed, per-part
 applied angles and their bounds, simulation cost, and whether the simulated or
 rest orientation is being drawn. The diagnostic **Apply secondary motion (A/B)**
-toggle keeps the effect selected and draws the authored rest orientation, so a
+toggle keeps the effect selected and draws the declared rest pose, so a
 held-frame A/B can prove the published output contains the simulated angle. With
 the replay held, the diagnostic **Settle held frame** control advances the same
 simulator with the stationary accepted pose, so the retained post-turn angle can
@@ -424,7 +429,7 @@ authoring output.
 | Movable-part damping ratio | 0.05-1.5 |
 | Movable-part maxAngleDeg | 1-60° |
 | Movable-part restAngleDeg | within maxAngleDeg, ±60° |
-| Secondary-motion simulation step | fixed 120 Hz, dt ≤ 250 ms |
+| Secondary-motion simulation step | equal sub-steps of at most 1/120 s, dt ≤ 250 ms |
 | Secondary-motion drive full scale | fixed 45°/s |
 
 Validation reports `PackageComplexity` measurements (archive/manifest/mask bytes,
@@ -632,7 +637,8 @@ for #11's complexity budgets.
   inflate bomb, CRC and corruption, encryption and unsupported compression), GLB
   feature rejection (including missing accessor `componentType`/`type`), effect
   resolution, nonzero mask attachment conversion, and the extended output
-  policy. Every stable validation code is asserted by
+  policy including the mask + secondary-motion and mask + distortion +
+  secondary-motion wording. Every stable validation code is asserted by
   `tests/validation-coverage.test.ts`.
 - Public workflow: `npm run check` scenario I imports the generated samples
   through the **Import package…** control (only the OS file picker is stubbed in
@@ -654,9 +660,14 @@ for #11's complexity budgets.
   switching, no-effect and removal), rejects the distortion negative fixtures,
   and records replay-based warp-submission/render/frame-pacing timing for the
   later benchmark. Scenario J imports the schema v3 `reactive-ears` sample
-  through the same control, asserts the three declared parts and their bounds
-  across the recorded turn/nod window, measures post-turn spring settling in a
-  documented recorded window, crosses a loop seam and a tracking reacquisition
+  through the same control, reads the committed manifest's 32/32/35 degree
+  declaration independently, asserts the three declared parts and those bounds
+  across the recorded turn/nod window, captures a live camera sequence during
+  that window and another across the post-turn residual (app-published frames
+  contain the package material while the diagnostic reports nonzero bounded
+  part angles), measures the post-turn residual/near-rest observation in a
+  documented recorded window, and uses the held-frame settle as the strict
+  decay evidence. It crosses a loop seam and a tracking reacquisition
   to verify deliberate resets with no impulse, runs a held-frame
   simulated-vs-rest A/B in preview and camera (with 0 same-state self-diff),
   exercises the paused-output policy, rejects every secondary-motion negative

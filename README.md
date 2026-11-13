@@ -77,7 +77,7 @@ If `npm install` blocks install scripts (newer npm releases gate them), run
 | **Recheck input** | Re-runs fixture size/checksum validation. Use after fetching a fixture that was missing at launch. |
 | **Capture evidence frame** | Writes the current output canvas (1280×720 PNG) to `evidence/` and shows the path in the app. |
 | **Apply face-distortion warp (diagnostic A/B)** | Keeps the distortion effect selected but draws the same uploaded frame through the identity shader, so a held-frame ON/OFF capture proves the warp reaches the published output. |
-| **Apply secondary motion (diagnostic A/B)** | Keeps the selected effect active but draws movable parts at their authored rest orientation, so a held-frame ON/OFF capture proves the simulated angles reach the published output. |
+| **Apply secondary motion (diagnostic A/B)** | Keeps the selected effect active but draws movable parts at their declared rest pose (authored GLB orientation plus `restAngleDeg`), so a held-frame ON/OFF capture proves the simulated angles reach the published output. |
 | **Settle held frame (diagnostic)** | With the replay held, advances the same spring simulator with the stationary accepted head pose so the retained post-turn angle can be observed decaying to rest. Diagnostic evidence only. |
 | **Simulate distortion WebGL context loss (diagnostic)** | Injects a WebGL context loss on the distortion renderer; the output hides after the existing undrawable guard and resumes after a browser restore. |
 | **Simulate effect-processing failure** | Diagnostic-only toggle that forces the failure policy to demonstrate the opaque paused output and automatic recovery. |
@@ -150,16 +150,18 @@ an explanation. Closing Shymask stops its camera output.
   the published-output proof is a held-frame warp ON/OFF A/B in preview and camera. See
   [`docs/notes/0006-face-distortion.md`](docs/notes/0006-face-distortion.md).
 - **Bounded secondary motion.** A schema-v3 package may declare 1-4 named mask GLB nodes as movable
-  parts. `src/core/secondary-motion.ts` is a pure, fixed-step spring simulation driven by the
-  accepted tracked head angular velocity (yaw/pitch/roll); `src/renderer/mask-renderer.ts` applies
-  each part's simulated angle to its node's authored rest orientation before rendering. Every part
-  is bounded by `maxAngleDeg`; `dt` is clamped, and a long gap, pose discontinuity, loop seam or
-  tracking reacquisition deliberately resets to rest instead of injecting an impulse. The public
-  **Secondary motion** diagnostic reports the per-part angles, bounds, head speed, reset reason and
-  simulation cost; the held-frame diagnostic toggle proves preview and camera contain the simulated
-  angle. There is no canned movement clip, package code, skeleton, strand-level hair, collision or
-  Blender-physics conversion. The bundled procedural mask stays rigid; the demonstration and the
-  contract are package-only. See
+  parts. `src/core/secondary-motion.ts` is a pure spring simulation with equal sub-steps of at most
+  1/120 s, driven by the accepted tracked head angular velocity (yaw/pitch/roll);
+  `src/renderer/mask-renderer.ts` applies each part's simulated angle to its node's authored rest
+  orientation plus the declared `restAngleDeg` before rendering. Every part is bounded by
+  `maxAngleDeg`; `dt` is clamped, and a long gap, pose discontinuity, loop seam or tracking
+  reacquisition deliberately resets to the declared rest pose instead of injecting an impulse. The
+  public **Secondary motion** diagnostic reports the per-part angles, bounds, head speed, reset reason
+  and simulation cost; a held-frame diagnostic toggle proves preview and camera contain the simulated
+  angle, and live camera sequences during the turn/nod window and the post-turn residual show the
+  packaged mask while the diagnostic reports nonzero bounded part angles. There is no canned movement
+  clip, package code, skeleton, strand-level hair, collision or Blender-physics conversion. The
+  bundled procedural mask stays rigid; the demonstration and the contract are package-only. See
   [`docs/notes/0007-secondary-motion.md`](docs/notes/0007-secondary-motion.md).
 - **Declarative effects.** Color treatments, the bundled rigid mask and the bounded face distortion
   and secondary-motion parameters are data/ids (`src/core/treatments.ts`,
@@ -298,7 +300,7 @@ npm run fetch:motion-fixture
 ```
 
 The public-workflow check asserts, through the app's visible controls, its diagnostics and the
-independent camera consumer (94/94 checks passed in the latest full run at this code head):
+independent camera consumer (the run cited in the measured baseline below):
 
 1. Startup is the opaque "Tracking paused" screen; no raw feed.
 2. Start renders a processed replay frame through the treatment control.
@@ -460,20 +462,24 @@ independent camera consumer (94/94 checks passed in the latest full run at this 
     and per-part bounds.
 42. On the recorded turn/nod/lean window, the two ears (yaw) and hair tuft (pitch) move within their
     declared bounds: 17/18 frames tracked, per-part angle ranges around 42–60°, maximum observed
-    ~29–31° against 32/32/35° bounds. Three moving screenshots are saved.
-43. A separate documented 25.0 s post-turn window reports live spring settling: the recorded turn
-    drives a peak angle, the spring is still deflected after head angular speed drops, and the angle
-    decays toward rest (the reported values vary per run). The strict post-turn settling gate holds
+    ~29–31° against 32/32/35° bounds. Three moving screenshots are saved. A live camera sequence over
+    the same window contains the package material in every app-published PNG while the diagnostic
+    reports nonzero, bounded angles; it does not isolate the part-pixel change from the moving video.
+43. A separate documented 25.0 s post-turn window reports a live **residual/near-rest observation**:
+    the recorded turn drives a peak angle, the spring is still deflected above the declared rest pose
+    after head angular speed drops, and a near-rest sample follows (the recorded person does not
+    actually stop, so this is not a monotonic-stop claim). The strict post-turn settling gate holds
     that frame and uses the diagnostic **Settle held frame** control to advance the same simulator
     with the stationary pose: the retained angle must decay to ≤20% of its initial value and ≤2.5°
-    with a near-rest minimum after one second.
-44. Crossing a replay loop seam deliberately resets the spring (reset count increases, seam-frame
-    angles at rest, bounded), and injected tracking loss resets to exactly rest while hiding the
+    with a near-rest minimum after one second. A second camera sequence covers the same window and
+    contains the package material.
+44. Crossing a replay loop seam deliberately resets the spring (reset count increases, near-rest
+    seam-frame angles, bounded), and injected tracking loss resets to exactly rest while hiding the
     effect; reacquisition resumes from rest and the recovered angle stays bounded.
-45. A held 47.7 s post-turn frame compares simulated part angles with the authored rest orientation
-    through the public diagnostic A/B: exact 1280×720 ON/OFF captures differ by thousands of pixels,
-    all on the packaged mask, with 0 same-state self-diff, and the independent camera receives the
-    identical change.
+45. A held 47.7 s post-turn frame compares simulated part angles with the declared rest pose
+    through the public diagnostic A/B: exact 1280×720 ON/OFF captures changed 1,864 pixels in the
+    cited run, all on the packaged mask, with 0 same-state self-diff, and the independent camera
+    receives the identical change.
 46. Manual pause, injected tracking loss, injected multiple faces, simulated processing failure, an
     async package switch and explicit `No effect` all keep the whole output hidden; manual pause,
     tracking loss and processing failure are camera-captured as the opaque paused canvas. Removing
@@ -484,7 +490,7 @@ independent camera consumer (94/94 checks passed in the latest full run at this 
     rendering, and produce no renderer console error.
 48. Replay-based workload for the secondary-motion path is recorded: the pure spring update p95
     (main-thread only), full render cost and presented-frame interval with the simulated pose versus
-    the authored rest pose in sequential windows, and the same-effect mask/camera output. These are
+    the declared rest pose in sequential windows, and the same-effect mask/camera output. These are
     observations for the later complete-effect benchmark, not a performance target.
 49. The check's `summary.json` records the secondary-motion contract, motion/settling windows,
     reset evidence, A/B and workload under `secondaryMotion`, with the replay/desktop boundary
@@ -603,8 +609,9 @@ rules and measured values are in
 ### Measured secondary-motion baseline (replay-based)
 
 From the full `npm run check` run at code head `7a087d7d` (`evidence/check-2026-11-13T22-22-14-119Z/summary.json`,
-`secondaryMotion`; replay-based development desktop; 94/94 checks). A later documentation-only
-commit does not change behavior. These are observations for the later complete-effect benchmark,
+`secondaryMotion`; replay-based development desktop; 94/94 checks). A later fix round adds the live
+camera sequences and the media-time residual gate without changing the fixture's observable
+simulation behavior. These are observations for the later complete-effect benchmark,
 not performance targets.
 
 | Measurement | Value |
@@ -615,7 +622,7 @@ not performance targets.
 | Held-frame settling (47.7 s) | retained 8.70° decayed to 0.03° (0.3%) in 2,913 ms through the same simulator with the accepted pose held stationary; minimum after one second 0.02°; two screenshots saved |
 | Published-output A/B (held 47.7 s) | 1,864 pixels changed, all on the packaged mask, two ON and two OFF captures pixel-identical (0 self-diff); the independent Media Foundation camera PNG changed by the identical 1,864 pixels. The retained held angle varies (8–24° across recent runs); the gates are ≥5° and ≥800 changed pixels |
 | Simulation cost, p95 | ~0.1 ms (timer granularity) for the pure spring update per accepted pose; main thread only |
-| Render + composite, p95 | 5.8 ms with the simulated pose vs 5.8 ms with the authored rest pose in the run's sequential 2.2 s windows; the OFF state still runs the simulator, so the difference is observed run variation, not an isolated cost |
+| Render + composite, p95 | 5.8 ms with the simulated pose vs 5.8 ms with the declared rest pose in the run's sequential 2.2 s windows; the OFF state still runs the simulator, so the difference is observed run variation, not an isolated cost |
 | Presented-frame interval, p95 | 44.3 ms vs 44.3 ms in the run's sequential 2.2 s windows; not isolated and not attributed to the simulation |
 | Paused-output captures | manual pause, tracking loss and processing failure delivered the opaque paused canvas in preview and camera (≈12,15,20); multiple faces (10,13,18) and no-effect were preview-asserted; removal fell back to no-effect |
 
@@ -740,7 +747,7 @@ with no physical camera or human participation. The imported-effect async switch
 switching-interruption sub-case: the whole output stays on the opaque paused screen until the new
 effect loads, or remains hidden with an explanation if the load fails.
 
-Deferred: physical webcam capture, live-human acceptance, secondary motion (issue #8), the
+Deferred: physical webcam capture, live-human acceptance, the
 Blender/AI authoring flow (issue #9), real Zoom/Meet/OBS compatibility (issue #10),
 final live acceptance, NV12 support, complexity budgets (issue #11), laptop integrated-graphics
 validation, and the 720p/30 FPS / ≤100 ms target. Two-person footage is not part of this slice;
