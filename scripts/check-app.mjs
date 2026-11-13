@@ -5208,8 +5208,8 @@ async function secondaryMotionScenario() {
       `tracked=${motionSamples.length}/18 part ranges=${partRanges.map((range) => range.toFixed(1)).join('/')} deg maxAngle=${maxObservedAngle.toFixed(2)} deg ${motionShots.join(' ')}`,
     );
     pass(
-      'The independent camera receives a live sequence of the packaged mask during the recorded turn/nod window',
-      `camera frames=${motionCameraEvidence.frames} material pixels ${motionCameraEvidence.minMaterialPixels}-${Math.max(...motionCameraEvidence.materialPixels)} (min enforced >10,000), max mean-RGB delta=${motionCameraEvidence.maxMeanRgbDelta}, sampled ${motionSamples[0]?.mediaMs}..${motionSamples[motionSamples.length - 1]?.mediaMs}ms ${motionCameraEvidence.pngs.join(' ')}`,
+      'The independent camera receives the packaged mask during the recorded turn/nod window (presence evidence; the held A/B isolates the simulated angle)',
+      `camera frames=${motionCameraEvidence.frames} material pixels ${motionCameraEvidence.minMaterialPixels}-${Math.max(...motionCameraEvidence.materialPixels)} (min enforced >10,000), max mean-RGB delta=${motionCameraEvidence.maxMeanRgbDelta}, sampled ${motionSamples[0]?.mediaMs}..${motionSamples[motionSamples.length - 1]?.mediaMs}ms; the consumer sequence may cross the loop seam and does not isolate part-pixel motion, which the held 47.7 s A/B does ${motionCameraEvidence.pngs.join(' ')}`,
     );
 
     // --- Post-turn settling -------------------------------------------------
@@ -5381,8 +5381,8 @@ async function secondaryMotionScenario() {
       `peak=${peak?.maxAbsAngleDeg}deg at ${peak?.mediaMs}ms (head ${peak?.headSpeedDegPerSec}deg/s), residual=${residual.maxAbsAngleDeg}deg after head slowed to ${residual.headSpeedDegPerSec}deg/s (floor ${residualFloorDeg}deg), near-rest=${settled.maxAbsAngleDeg}deg at ${settled.mediaMs}ms (${settled.mediaMs - (peak?.mediaMs ?? 0)}ms after peak, ${(100 * settled.maxAbsAngleDeg / (peak?.maxAbsAngleDeg ?? 1)).toFixed(1)}% of peak); strict decay is the held-frame settle`,
     );
     pass(
-      'The independent camera receives the packaged mask across the post-turn residual window',
-      `camera frames=${postTurnCameraEvidence.frames} material pixels ${postTurnCameraEvidence.minMaterialPixels}-${Math.max(...postTurnCameraEvidence.materialPixels)} (min enforced >10,000), max mean-RGB delta=${postTurnCameraEvidence.maxMeanRgbDelta}, window ${postTurnCameraStart.mediaMs}..${postTurnCameraEnd.mediaMs}ms ${postTurnCameraEvidence.pngs.join(' ')}`,
+      'The independent camera receives the packaged mask across the post-turn residual window (presence evidence; the held A/B isolates the simulated angle)',
+      `camera frames=${postTurnCameraEvidence.frames} material pixels ${postTurnCameraEvidence.minMaterialPixels}-${Math.max(...postTurnCameraEvidence.materialPixels)} (min enforced >10,000), max mean-RGB delta=${postTurnCameraEvidence.maxMeanRgbDelta}, window ${postTurnCameraStart.mediaMs}..${postTurnCameraEnd.mediaMs}ms; the sequence can cross the loop seam ${postTurnCameraEvidence.pngs.join(' ')}`,
     );
 
     // --- Loop boundary: deliberate reset, no unbounded motion --------------

@@ -152,8 +152,9 @@ an explanation. Closing Shymask stops its camera output.
 - **Bounded secondary motion.** A schema-v3 package may declare 1-4 named mask GLB nodes as movable
   parts. `src/core/secondary-motion.ts` is a pure spring simulation with equal sub-steps of at most
   1/120 s, driven by the accepted tracked head angular velocity (yaw/pitch/roll);
-  `src/renderer/mask-renderer.ts` applies each part's simulated angle to its node's authored rest
-  orientation plus the declared `restAngleDeg` before rendering. Every part is bounded by
+  `src/renderer/mask-renderer.ts` composes each part's absolute simulated angle (which already
+  includes `restAngleDeg`) about the declared axis on the node's authored orientation; the declared
+  rest pose is that authored orientation plus `restAngleDeg`. Every part is bounded by
   `maxAngleDeg`; `dt` is clamped, and a long gap, pose discontinuity, loop seam or tracking
   reacquisition deliberately resets to the declared rest pose instead of injecting an impulse. The
   public **Secondary motion** diagnostic reports the per-part angles, bounds, head speed, reset reason
@@ -464,7 +465,10 @@ independent camera consumer (the run cited in the measured baseline below):
     declared bounds: 17/18 frames tracked, per-part angle ranges around 42–60°, maximum observed
     ~29–31° against 32/32/35° bounds. Three moving screenshots are saved. A live camera sequence over
     the same window contains the package material in every app-published PNG while the diagnostic
-    reports nonzero, bounded angles; it does not isolate the part-pixel change from the moving video.
+    reports nonzero, bounded angles; it does not isolate the part-pixel change from the moving video
+    and can cross the loop seam. The held 47.7 s A/B is the camera-side proof of the simulated angle;
+    the coordinator accepted the presence sequences plus that A/B and the shared 1280×720 canvas as
+    the AC2 virtual-webcam evidence, with this limitation stated.
 43. A separate documented 25.0 s post-turn window reports a live **residual/near-rest observation**:
     the recorded turn drives a peak angle, the spring is still deflected above the declared rest pose
     after head angular speed drops, and a near-rest sample follows (the recorded person does not
@@ -608,17 +612,20 @@ rules and measured values are in
 
 ### Measured secondary-motion baseline (replay-based)
 
-From the full `npm run check` run at code head `7a087d7d` (`evidence/check-2026-11-13T22-22-14-119Z/summary.json`,
-`secondaryMotion`; replay-based development desktop; 94/94 checks). A later fix round adds the live
-camera sequences and the media-time residual gate without changing the fixture's observable
-simulation behavior. These are observations for the later complete-effect benchmark,
+From the full `npm run check` runs at code head `7a087d7d` (`evidence/check-2026-11-13T22-22-14-119Z/summary.json`,
+94/94) and the head-matched `evidence/check-2026-11-13T23-12-32-374Z/summary.json` (96/96, head
+`a8b0789`; an equivalent `23-06-36-331Z` run also passed). The numeric table below is the 22-22 run;
+the live camera sequences and the media-time residual gate exist only in the head-matched 23-12/23-06
+runs, and the 2b4c532 fix round changed the A/B OFF state to the declared rest pose (no effect for the
+sample's zero `restAngleDeg`) and equal-sub-step bookkeeping; it did not change the integrator formula.
+These are observations for the later complete-effect benchmark,
 not performance targets.
 
 | Measurement | Value |
 | --- | --- |
 | Secondary-motion package output | schema v3 `reactive-ears` imports through the public control; its exact unlit material colour (RGB 150,90,240) covers 78,546 preview and 107,615 camera pixels in exact 1280×720 PNGs (enforced >20,000) |
 | Recorded-motion window (41.6–49.6 s) | 17/18 sampled frames tracked; per-part angle ranges 59.7°/59.7°/42.0°; maximum observed 30.75° inside the declared 32/32/35° bounds; three screenshots saved |
-| Live post-turn residual (25.0–26.9 s) | peak 17.71° (head 3.4°/s at the sampled peak), still 7.90° after head speed fell to 8.5°/s, near-rest 2.73° 833 ms after the peak (15.4% of peak). Oscillatory and run-dependent; reported as residual + near-rest, not a monotonic claim |
+| Live post-turn residual (25.0–26.9 s) | In the 22-22 run the sampled peak was 17.71° at head 3.4°/s and the residual 7.90° at 8.5°/s, so that run does not show a monotonic speed fall; the head keeps moving. The head-matched 23-12 run measured peak 27.8° → residual 4.9° at 4.9°/s → near-rest 2.5° (23-06: 12.6° at 36.3°/s → 4.84° at 11.5°/s → 2.83° at 4.8°/s), coverage 833 ms. Oscillatory and run-dependent; reported as residual + near-rest, not a monotonic stop |
 | Held-frame settling (47.7 s) | retained 8.70° decayed to 0.03° (0.3%) in 2,913 ms through the same simulator with the accepted pose held stationary; minimum after one second 0.02°; two screenshots saved |
 | Published-output A/B (held 47.7 s) | 1,864 pixels changed, all on the packaged mask, two ON and two OFF captures pixel-identical (0 self-diff); the independent Media Foundation camera PNG changed by the identical 1,864 pixels. The retained held angle varies (8–24° across recent runs); the gates are ≥5° and ≥800 changed pixels |
 | Simulation cost, p95 | ~0.1 ms (timer granularity) for the pure spring update per accepted pose; main thread only |

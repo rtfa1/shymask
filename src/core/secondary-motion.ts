@@ -76,7 +76,7 @@ export interface SecondaryMotionFrame {
   /** True when this frame deliberately reset the spring state. */
   reset: boolean;
   resetReason: SecondaryMotionResetReason | null;
-  /** Fixed sub-steps integrated this frame (0 on a reset). */
+  /** Equal sub-steps of at most 1/120 s integrated this frame (0 on a reset). */
   steps: number;
   /** Cost of this update in milliseconds. */
   costMs: number;

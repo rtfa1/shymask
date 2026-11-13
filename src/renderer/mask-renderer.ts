@@ -66,8 +66,10 @@ export interface PackageMaskSummary {
 
 /**
  * A declared movable part resolved against the parsed package GLB. The node's
- * authored orientation is the rest pose; the simulator supplies an angle about
- * `axis` that is applied relative to that pose every rendered frame.
+ * authored orientation is the zero-offset base. The declared rest pose is that
+ * orientation plus `restAngleDeg`; the simulator supplies the absolute angle
+ * (including `restAngleDeg`) about `axis`, and the renderer composes
+ * `authored × rotation(angle)` every rendered frame.
  */
 export interface MaskMotionNode {
   node: THREE.Object3D;
@@ -381,10 +383,12 @@ export class MaskRenderer {
   }
 
   /**
-   * Applies one simulated angle per declared movable part, relative to the
-   * node's authored orientation plus the declared rest offset. Angles are
-   * clamped to the validated part bound as defense in depth; the simulator
-   * already enforces the same bound.
+   * Applies one absolute simulated angle per declared movable part about the
+   * declared axis, composed on the node's authored orientation. The declared
+   * rest pose is the authored orientation plus `restAngleDeg`, and the
+   * simulator's angle already includes that offset, so it is not applied twice.
+   * Angles are clamped to the validated part bound as defense in depth; the
+   * simulator already enforces the same bound.
    */
   setSecondaryMotionAngles(anglesRad: readonly number[]): void {
     for (const [index, motion] of this.motionNodes.entries()) {

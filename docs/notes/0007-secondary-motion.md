@@ -169,18 +169,26 @@ Covered by `npm test` and `npm run check` scenario J:
   are saved. A camera-captured sequence runs during the same window: every
   app-published PNG must contain the package material, while the diagnostic
   samples over that interval report nonzero, bounded part angles. It does not
-  isolate the part-pixel change from the moving video; the held A/B isolates
-  the simulated angle.
+  isolate the part-pixel change from the moving video and can cross the loop
+  seam (the head-matched 23-06/23-12 runs recorded the sequence ending after a
+  seam); the held A/B isolates the simulated angle. The coordinator accepted
+  this presence evidence plus the camera-identical held A/B and the shared
+  1280×720 canvas as the AC2 virtual-webcam evidence, with the limitation
+  stated here and in README.
 - **Post-turn residual (live):** a separate documented window starts at 25.0 s
   for 1.9 s (the recorded head turn around 25.9 s is followed by about a second
-  of low head angular velocity). In the cited run the live window measured a
-  spring peak of 17.71°, still 7.90° after head angular speed fell to 8.5°/s, and
-  a near-rest 2.73° 833 ms after the peak (15.4% of peak). The recorded person
-  does not actually stop and keeps producing small head motion later, so this
-  live window is a **residual/near-rest observation**, not a demonstration of a
-  monotonic stop; the strict decay evidence is the held-frame settle below. A
-  second camera-captured sequence spans the same window and must contain the
-  package material in every app-published PNG.
+  of low head angular velocity). In the 22-22 run the live window measured a
+  spring peak of 17.71° at head speed 3.4°/s and a residual 7.90° at 8.5°/s, so
+  that run's sampled peak does not show a monotonic speed fall (the recorded
+  person keeps moving); the head-matched 23-12 run measured peak 27.8° → 4.9°
+  at 4.9°/s → near-rest 2.5° and 23-06 measured 12.6° at 36.3°/s → 4.84° at
+  11.5°/s → 2.83° at 4.8°/s. The recorded person does not actually stop, so
+  this live window is a **residual/near-rest observation**, not a demonstration
+  of a monotonic stop; the strict decay evidence is the held-frame settle
+  below. A second camera-captured sequence spans the same window and must
+  contain the package material in every app-published PNG; like the turn/nod
+  sequence it is presence evidence and can cross the loop seam, while the held
+  A/B isolates the simulated angle.
 - **Held-frame settling (strict):** after the A/B, the replay stays held at the
   documented 47.7 s post-turn frame and the diagnostic **Settle held frame**
   control advances the same simulator with the stationary accepted pose. In the
@@ -220,11 +228,16 @@ Covered by `npm test` and `npm run check` scenario J:
   The OFF state still runs the simulation but draws rest, so these deltas are
   observed run variation, not an isolated simulation cost.
 
-The cited run is `evidence/check-2026-11-13T22-22-14-119Z/summary.json` at code
-head `7a087d7ddaacf900657ba71a84f037dd4ebb2dd6` (94/94 checks). A later fix
-round adds the camera sequences and the media-time residual gate without
-changing the fixture's observable simulation behavior; values vary run to run
-under desktop load.
+The numeric table above is from the cited
+`evidence/check-2026-11-13T22-22-14-119Z/summary.json` at code head
+`7a087d7ddaacf900657ba71a84f037dd4ebb2dd6` (94/94 checks). The live camera
+sequences and the media-time residual gate exist only in the head-matched runs
+`evidence/check-2026-11-13T23-06-36-331Z/summary.json` and
+`evidence/check-2026-11-13T23-12-32-374Z/summary.json` (96/96 checks, head
+`a8b0789`), which are cited for those claims. The 2b4c532 fix round changed the
+A/B OFF state to the declared rest pose (no effect for the sample's zero
+`restAngleDeg`) and equal-sub-step bookkeeping; it did not change the integrator
+formula. Values vary run to run under desktop load.
 
 ## Supported parameters for the later AI creator skill
 
