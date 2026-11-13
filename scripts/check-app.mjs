@@ -124,6 +124,27 @@ async function readRgb(page) {
   };
 }
 
+/**
+ * Reads the mean output colour only once the public status says the processed
+ * frame is being rendered and the throttled mean-RGB diagnostic has caught up
+ * with it (the paused canvas is ~{12,15,20}, sum 47). A package switch can leave
+ * `diag-rgb` one throttle tick behind the status, so a bare read can compare a
+ * camera frame against the previous paused mean.
+ */
+async function readProcessedRgb(page, label, timeoutMs = 15000) {
+  return waitFor(
+    `${label} processed preview mean RGB`,
+    async () => {
+      const status = await readStatus(page);
+      if (status.mode !== 'render') return null;
+      const rgb = await readRgb(page);
+      return rgbSum(rgb) > 60 ? rgb : null;
+    },
+    timeoutMs,
+    100,
+  );
+}
+
 function rgbSum(rgb) {
   return rgb.r + rgb.g + rgb.b;
 }
@@ -1227,7 +1248,7 @@ async function virtualCameraScenario() {
     await waitForStatusTitle(page, /Effect active: Warm tint/);
     await waitFor('warm preview output', async () => (rgbSum(await readRgb(page)) > 120 ? true : null));
     await delay(500);
-    const previewWarm = await readRgb(page);
+    const previewWarm = await readProcessedRgb(page, 'warm preview');
     const warmRun = await captureProcessedCameraState(page, 'warm', PROCESSED_CAMERA_FRAMES, previewWarm, 'warm');
     const warmPng = assertProcessedPng(warmRun.frames, previewWarm, 'warm');
     evidence.states.warm = {
@@ -1245,7 +1266,7 @@ async function virtualCameraScenario() {
     await page.locator('[data-testid="effect-select"]').selectOption('cool');
     await waitForStatusTitle(page, /Effect active: Cool tint/);
     await delay(600);
-    const previewCool = await readRgb(page);
+    const previewCool = await readProcessedRgb(page, 'cool preview');
     const coolRun = await captureProcessedCameraState(page, 'cool', PROCESSED_CAMERA_FRAMES, previewCool, 'cool');
     const coolPng = assertProcessedPng(coolRun.frames, previewCool, 'cool');
     const coolCamera = averageFrameRgb(coolRun.frames);
@@ -1285,7 +1306,7 @@ async function virtualCameraScenario() {
     await page.locator('[data-testid="pause-toggle"]').click();
     await waitForStatusTitle(page, /Effect active: Cool tint/);
     await delay(600);
-    const resumedPreview = await readRgb(page);
+    const resumedPreview = await readProcessedRgb(page, 'resumed preview');
     const resumedRun = await captureProcessedCameraState(page, 'resumed', PROCESSED_CAMERA_FRAMES, resumedPreview, 'resume');
     const resumedPng = assertProcessedPng(resumedRun.frames, resumedPreview, 'resume');
     evidence.states.resumed = {
@@ -1312,7 +1333,7 @@ async function virtualCameraScenario() {
     await page.locator('[data-testid="effect-select"]').selectOption('warm');
     await waitForStatusTitle(page, /Effect active: Warm tint/);
     await delay(600);
-    const recoveryPreview = await readRgb(page);
+    const recoveryPreview = await readProcessedRgb(page, 'effect recovery preview');
     const recoveryRun = await captureProcessedCameraState(page, 'effect-recovered', PROCESSED_CAMERA_FRAMES, recoveryPreview, 'effect recovery');
     const recoveryPng = assertProcessedPng(recoveryRun.frames, recoveryPreview, 'effect recovery');
     evidence.states.effectRecovered = {
@@ -1339,7 +1360,7 @@ async function virtualCameraScenario() {
     await page.locator('[data-testid="simulate-failure"]').uncheck();
     await waitForStatusTitle(page, /Effect active: Warm tint/);
     await delay(600);
-    const failureRecoveryPreview = await readRgb(page);
+    const failureRecoveryPreview = await readProcessedRgb(page, 'failure recovery preview');
     const failureRecoveryRun = await captureProcessedCameraState(page, 'failure-recovered', PROCESSED_CAMERA_FRAMES, failureRecoveryPreview, 'failure recovery');
     const failureRecoveryPng = assertProcessedPng(
       failureRecoveryRun.frames,
@@ -2084,7 +2105,7 @@ async function occlusionAbEvidence(page, label, probeRgb = MASK_EYE_RGB, materia
  * composition in that case.
  */
 async function occlusionCameraAbEvidence(page, label, rect, options = {}) {
-  const preview = await readRgb(page);
+  const preview = await readProcessedRgb(page, `${label} preview`);
   const onRun = await captureProcessedCameraState(page, `${label}-occlusion-on`, PROCESSED_CAMERA_FRAMES, preview, `${label} occlusion on camera`);
   const onPngs = onRun.frames
     .filter((frame) => frame.png && frame.captureUnixMs > 0)
@@ -2286,7 +2307,7 @@ async function trackingMaskScenario() {
     );
 
     // Camera: the same canvas, including the mask, reaches the independent consumer.
-    const cameraPreview = await readRgb(page);
+    const cameraPreview = await readProcessedRgb(page, 'mask camera preview');
     const cameraProbe = await readMaskProbe(page);
     const maskRun = await captureProcessedCameraState(page, 'mask', PROCESSED_CAMERA_FRAMES, cameraPreview, 'mask');
     const maskPng = assertProcessedPng(maskRun.frames, cameraPreview, 'mask');
@@ -2906,7 +2927,7 @@ async function recordedMotionScenario() {
     );
     pass('Masked motion-window screenshots captured at three points in the turn', sampleShots.join(' '));
 
-    const cameraPreview = await readRgb(page);
+    const cameraPreview = await readProcessedRgb(page, 'motion mask camera preview');
     // Give the renderer's 100 ms publish heartbeat time to replace any paused
     // frame cached from the preceding effect switch before the consumer samples.
     await page.waitForTimeout(500);
@@ -3256,7 +3277,7 @@ async function effectPackageScenario() {
     assert.equal(guardOcclusion.enabled, 'true', 'face occlusion must stay active for an imported package mask');
     assert.equal(guardOcclusion.vertices, '468');
     assert.equal(guardOcclusion.triangles, '898');
-    const guardRgb = await readRgb(page);
+    const guardRgb = await readProcessedRgb(page, 'imported guard visor preview');
     const guardShot = await screenshotCanvas(page, '21-imported-guard-visor-preview.png');
     // Exact 1280x720 canvas evidence through the public Capture control; the
     // exact unlit material colour proves the package GLB is composited even if
@@ -3328,7 +3349,7 @@ async function effectPackageScenario() {
     assert.equal(verdantLoaded.mask, 'none');
     assert.equal(verdantLoaded.treatment, 'yes');
     await page.waitForTimeout(350);
-    const verdantRgb = await readRgb(page);
+    const verdantRgb = await readProcessedRgb(page, 'imported verdant tint preview');
     assert.ok(
       verdantRgb.g > verdantRgb.r + 8 && verdantRgb.g > verdantRgb.b + 8,
       `the package's declarative green treatment must visibly change the preview, got ${JSON.stringify(verdantRgb)}`,
@@ -3370,7 +3391,7 @@ async function effectPackageScenario() {
     const roseOcclusion = parseKeyValues(await readDiagnostic(page, 'diag-occlusion'));
     assert.equal(roseOcclusion.enabled, 'true', 'face occlusion must stay active for a mask-only package');
     assert.equal(roseOcclusion.vertices, '468');
-    const roseRgb = await readRgb(page);
+    const roseRgb = await readProcessedRgb(page, 'imported rose visor preview');
     const roseShot = await screenshotCanvas(page, '22b-imported-rose-visor-preview.png');
     const roseMaterialPng = await captureOutputThroughControl(page, '22c-imported-rose-visor-material.png');
     const roseMaterialPixels = pngColorCount(roseMaterialPng, ROSE_MASK_RGB, 28);
@@ -3669,7 +3690,7 @@ async function effectPackageScenario() {
     await selectEffectThroughControl(page, VERDANT_TINT_EFFECT_ID);
     await waitForStatusTitle(page, /Effect active: Verdant tint/);
     await page.waitForTimeout(350);
-    const persistedRgb = await readRgb(page);
+    const persistedRgb = await readProcessedRgb(page, 'persisted package preview');
     assert.ok(
       persistedRgb.g > persistedRgb.r + 8 && persistedRgb.g > persistedRgb.b + 8,
       `persisted package treatment must render after restart, got ${JSON.stringify(persistedRgb)}`,
