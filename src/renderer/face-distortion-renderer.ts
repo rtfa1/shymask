@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import {
   faceDistortionContains,
+  distortionRenderable,
+  type DistortionRenderHealth,
   type FaceDistortionGeometry,
   type FrameDeltaStats,
 } from '../core/face-distortion';
@@ -19,6 +21,11 @@ import {
  * Like the mask renderer, this is an offscreen WebGL canvas, not a second
  * publication path: `src/core/pipeline.ts` draws it into the single 1280x720
  * output canvas that the preview and virtual camera share.
+ *
+ * A lost WebGL context makes the renderer non-drawable (`isDrawable()` false and
+ * `render()` null) instead of silently returning a stale canvas. The caller then
+ * reports an undrawable frame, the existing 250 ms guard hides the output, and
+ * the pipeline never falls back to the raw replay frame.
  */
 
 const VERTEX_SHADER = `
@@ -70,6 +77,15 @@ const IDENTITY_FRAGMENT_SHADER = `
 const METRIC_WIDTH = 64;
 const METRIC_HEIGHT = 36;
 
+/** Zeroed diagnostic result for a non-drawable renderer. */
+const EMPTY_DELTA: FrameDeltaStats = {
+  sampledPixels: 0,
+  insidePixels: 0,
+  meanAbsDiff: 0,
+  changedInsidePct: 0,
+  changedOutsidePct: 0,
+};
+
 export class FaceDistortionRenderer {
   readonly canvas: HTMLCanvasElement;
   private readonly renderer: THREE.WebGLRenderer;
@@ -86,6 +102,33 @@ export class FaceDistortionRenderer {
   private frameTexture: THREE.Texture | null = null;
   private frameSource: HTMLVideoElement | null = null;
   private disposed = false;
+  /** Set from the canvas `webglcontextlost` event until a restore event. */
+  private contextLost = false;
+  /**
+   * The WEBGL_lose_context extension is cached before a loss: WebGL returns
+   * null from getExtension() once the context is lost, so re-querying it after
+   * the failure would make a diagnostic restore impossible.
+   */
+  private contextExtension: WEBGL_lose_context | null | undefined = undefined;
+
+  /**
+   * Marks the renderer non-drawable as soon as the context is lost. Preventing
+   * the default lets the browser attempt a restore; either way no frame is
+   * composited while the canvas is invalid. Three.js also listens for these
+   * events and re-initialises its state on restore, so only our flag and the
+   * frame texture (whose GPU contents are gone) are cleared here.
+   */
+  private readonly handleContextLost = (event: Event): void => {
+    event.preventDefault();
+    this.contextLost = true;
+    this.frameTexture = null;
+    this.frameSource = null;
+    this.frameUniform.value = null;
+  };
+
+  private readonly handleContextRestored = (): void => {
+    this.contextLost = false;
+  };
 
   constructor(width: number, height: number) {
     this.canvas = document.createElement('canvas');
@@ -137,6 +180,8 @@ export class FaceDistortionRenderer {
     };
     this.warpTarget = new THREE.WebGLRenderTarget(METRIC_WIDTH, METRIC_HEIGHT, targetOptions);
     this.identityTarget = new THREE.WebGLRenderTarget(METRIC_WIDTH, METRIC_HEIGHT, targetOptions);
+    this.canvas.addEventListener('webglcontextlost', this.handleContextLost, false);
+    this.canvas.addEventListener('webglcontextrestored', this.handleContextRestored, false);
   }
 
   /** Uploads the per-frame warp ellipse and bounded strength. */
@@ -149,9 +194,63 @@ export class FaceDistortionRenderer {
     this.material.uniforms.uWarpFactor!.value = geometry.warpFactor;
   }
 
-  /** Renders the distorted full frame into this renderer's offscreen canvas. */
-  render(video: HTMLVideoElement): number {
-    if (this.disposed) return 0;
+  /** True when the offscreen context can draw a trustworthy frame. */
+  isDrawable(): boolean {
+    const gl = this.renderer.getContext();
+    const health: DistortionRenderHealth = {
+      disposed: this.disposed,
+      contextLost: this.contextLost,
+      glContextLost: gl.isContextLost(),
+    };
+    return distortionRenderable(health);
+  }
+
+  get contextIsLost(): boolean {
+    return this.contextLost || this.renderer.getContext().isContextLost();
+  }
+
+  /**
+   * Diagnostic-only failure injection: loses this renderer's WebGL context so
+   * the public workflow can prove the output hides instead of compositing a
+   * stale frame. Returns false when the browser has no WEBGL_lose_context.
+   */
+  loseContext(): boolean {
+    const extension = this.getContextExtension();
+    if (!extension) return false;
+    extension.loseContext();
+    return true;
+  }
+
+  /** Diagnostic-only recovery attempt; the browser must support restore. */
+  restoreContext(): boolean {
+    const extension = this.getContextExtension();
+    if (!extension) return false;
+    extension.restoreContext();
+    return true;
+  }
+
+  private getContextExtension(): WEBGL_lose_context | null {
+    if (this.contextExtension === undefined) {
+      this.contextExtension = this.renderer.getContext().getExtension('WEBGL_lose_context');
+    }
+    return this.contextExtension;
+  }
+
+  /**
+   * Renders the distorted full frame into this renderer's offscreen canvas and
+   * returns the main-thread WebGL submission time (`performance.now()` around
+   * `renderer.render()`), or null when the renderer cannot draw.
+   *
+   * This is submission cost only: there is no GPU sync or readback, so the GPU
+   * cost lands later in the compositor and is not part of this number. Do not
+   * report it as the total warp cost.
+   *
+   * `warp: false` is the public A/B diagnostic: it draws the same uploaded
+   * frame through the identity shader instead of the warp, keeping the effect
+   * active and the output path identical apart from the warp term.
+   */
+  render(video: HTMLVideoElement, options: { warp?: boolean } = {}): number | null {
+    if (!this.isDrawable()) return null;
     this.ensureFrameTexture(video);
     const startedAt = performance.now();
     // The replay can be held on a paused frame, where no new video-frame
@@ -159,7 +258,9 @@ export class FaceDistortionRenderer {
     // the mask pose and the pipeline composite were sampled from.
     if (this.frameTexture) this.frameTexture.needsUpdate = true;
     this.renderer.setRenderTarget(null);
+    this.plane.material = options.warp === false ? this.identityMaterial : this.material;
     this.renderer.render(this.scene, this.camera);
+    this.plane.material = this.material;
     return performance.now() - startedAt;
   }
 
@@ -173,14 +274,8 @@ export class FaceDistortionRenderer {
    * resamplers. Called at most every 200 ms, after `render()` uploaded the frame.
    */
   measureWarpDelta(geometry: FaceDistortionGeometry): FrameDeltaStats {
-    if (this.disposed) {
-      return {
-        sampledPixels: 0,
-        insidePixels: 0,
-        meanAbsDiff: 0,
-        changedInsidePct: 0,
-        changedOutsidePct: 0,
-      };
+    if (!this.isDrawable()) {
+      return { ...EMPTY_DELTA };
     }
     this.plane.material = this.material;
     this.renderer.setRenderTarget(this.warpTarget);
@@ -229,6 +324,8 @@ export class FaceDistortionRenderer {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.canvas.removeEventListener('webglcontextlost', this.handleContextLost, false);
+    this.canvas.removeEventListener('webglcontextrestored', this.handleContextRestored, false);
     this.frameTexture?.dispose();
     this.frameTexture = null;
     this.frameSource = null;

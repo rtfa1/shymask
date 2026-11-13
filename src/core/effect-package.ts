@@ -1,5 +1,5 @@
 /**
- * Pure, unit-testable validation for Shymask effect packages (contract v1).
+ * Pure, unit-testable validation for Shymask effect packages (schema v1/v2).
  *
  * `validateEffectPackage` takes archive bytes and returns either a validated,
  * in-memory package (manifest + declared asset bytes + complexity measurements)
@@ -9,7 +9,7 @@
  * arbitrary executable effect code".
  *
  * See docs/effect-packages.md for the schema, the error codes and what is
- * explicitly unsupported in v1.
+ * explicitly unsupported.
  */
 
 import {

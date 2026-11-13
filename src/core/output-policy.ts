@@ -173,22 +173,28 @@ export function resolveOutput(state: PreviewState): OutputDecision {
   const effectHasMask = state.effectHasMask ?? isMaskEffect(state.effect);
   const effectHasTreatment = state.effectHasTreatment ?? getTreatment(state.effect) !== null;
   const effectHasDistortion = state.effectHasDistortion ?? false;
-  let explanation: string;
-  if (effectHasMask && effectHasDistortion && effectHasTreatment) {
-    explanation = `Processing the replay input with the ${label.toLowerCase()} mask and face distortion attached to the tracked face, and its color treatment applied.`;
-  } else if (effectHasMask && effectHasDistortion) {
-    explanation = `Processing the replay input with the ${label.toLowerCase()} mask and face distortion attached to the tracked face.`;
-  } else if (effectHasMask && effectHasTreatment) {
-    explanation = `Processing the replay input with the ${label.toLowerCase()} mask attached to the tracked face and its color treatment applied.`;
+  // Compose the explanation from independent component phrases instead of one
+  // branch per combination, so adding a component cannot silently miss a case.
+  const labelLower = label.toLowerCase();
+  // A sample named "Face distortion" should not become "face distortion face
+  // distortion"; other labels keep the component noun for clarity.
+  const distortionNoun = /distortion/i.test(labelLower) ? labelLower : `${labelLower} face distortion`;
+  let subject: string;
+  if (effectHasMask && effectHasDistortion) {
+    subject = `the ${labelLower} mask and face distortion attached to the tracked face`;
   } else if (effectHasMask) {
-    explanation = `Processing the replay input with the ${label.toLowerCase()} attached to the tracked face.`;
-  } else if (effectHasDistortion && effectHasTreatment) {
-    explanation = `Processing the replay input with the ${label.toLowerCase()} face distortion applied around the tracked face and its color treatment applied.`;
+    subject = effectHasTreatment
+      ? `the ${labelLower} mask attached to the tracked face`
+      : `the ${labelLower} attached to the tracked face`;
   } else if (effectHasDistortion) {
-    explanation = `Processing the replay input with the ${label.toLowerCase()} face distortion applied around the tracked face.`;
+    subject = `the ${distortionNoun} applied around the tracked face`;
   } else {
-    explanation = `Processing the replay input with the ${label.toLowerCase()} color treatment.`;
+    subject = `the ${labelLower} color treatment`;
   }
+  const explanation =
+    effectHasTreatment && (effectHasMask || effectHasDistortion)
+      ? `Processing the replay input with ${subject}${effectHasMask && effectHasDistortion ? ',' : ''} and its color treatment applied.`
+      : `Processing the replay input with ${subject}.`;
   return {
     mode: 'render',
     reason: 'ready',

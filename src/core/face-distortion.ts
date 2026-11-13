@@ -98,6 +98,30 @@ export function faceDistortionGeometry(
 }
 
 /**
+ * Health inputs for the distortion renderer's drawability decision.
+ *
+ * A WebGL context can be lost at any time (GPU reset, driver restart, power
+ * state change). Three.js then silently returns from `render()` without drawing,
+ * so the caller must not composite the renderer canvas: it may hold a stale or
+ * blank frame. The renderer marks itself non-drawable and the pipeline keeps the
+ * previous output until the existing undrawable guard hides it; there is never
+ * a fallback to the raw frame.
+ */
+export interface DistortionRenderHealth {
+  /** The renderer was disposed and must not draw. */
+  disposed: boolean;
+  /** The canvas received a `webglcontextlost` event. */
+  contextLost: boolean;
+  /** The live WebGL context also reports itself lost (defensive check). */
+  glContextLost: boolean;
+}
+
+/** True only when the distortion renderer can draw a trustworthy frame. */
+export function distortionRenderable(health: DistortionRenderHealth): boolean {
+  return !health.disposed && !health.contextLost && !health.glContextLost;
+}
+
+/**
  * True when a normalized output point lies inside the warp ellipse. Used by the
  * renderer's local warp-delta diagnostic to report how much of the change is
  * inside the tracked face region versus outside it; the shader uses the same

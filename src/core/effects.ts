@@ -1,8 +1,8 @@
 /**
  * The active-effect registry shared by the renderer, the output policy and the
  * check harness. A complete effect is a single selectable definition that may
- * combine a rigid mask and a color treatment; there is deliberately no stacking
- * UI and no per-component selection (ADR-0004).
+ * combine a rigid mask, a bounded face distortion and a color treatment; there
+ * is deliberately no stacking UI and no per-component selection (ADR-0004).
  */
 
 import {

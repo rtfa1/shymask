@@ -1,5 +1,5 @@
 /**
- * Shymask effect package contract v1 (declarative, no executable effect code).
+ * Shymask effect package contract (declarative, no executable effect code).
  *
  * A package is a ZIP archive containing exactly one root `manifest.json` and
  * only the assets the manifest declares under `assets/`. This module owns the
@@ -12,17 +12,24 @@
  */
 
 /**
+ * Oldest schema this build still accepts. The supported list below is derived
+ * from this value and the current schema version, so the constants cannot drift
+ * apart.
+ */
+export const MIN_EFFECT_PACKAGE_SCHEMA_VERSION = 1;
+
+/**
  * Current package schema. Version 2 adds the optional `faceDistortion`
  * component; version 1 packages (mask and/or color treatment) remain accepted
  * unchanged.
  */
 export const EFFECT_PACKAGE_SCHEMA_VERSION = 2;
 
-/** Oldest schema this build still accepts. */
-export const MIN_EFFECT_PACKAGE_SCHEMA_VERSION = 1;
-
-/** Every schema version this build accepts. */
-export const SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS = [1, 2] as const;
+/** Every schema version this build accepts, in ascending order. */
+export const SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS = [
+  MIN_EFFECT_PACKAGE_SCHEMA_VERSION,
+  EFFECT_PACKAGE_SCHEMA_VERSION,
+] as const;
 
 export type EffectPackageSchemaVersion = (typeof SUPPORTED_EFFECT_PACKAGE_SCHEMA_VERSIONS)[number];
 

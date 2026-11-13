@@ -102,6 +102,8 @@ const packageResult = mustGet<HTMLParagraphElement>('package-result');
 const injectionSelect = mustGet<HTMLSelectElement>('tracking-injection');
 const poseSmoothingSelect = mustGet<HTMLSelectElement>('pose-smoothing');
 const occlusionToggle = mustGet<HTMLInputElement>('occlusion-toggle');
+const distortionWarpToggle = mustGet<HTMLInputElement>('distortion-warp-toggle');
+const distortionContextToggle = mustGet<HTMLInputElement>('distortion-context-loss');
 const recheckButton = mustGet<HTMLButtonElement>('recheck');
 const captureButton = mustGet<HTMLButtonElement>('capture');
 const failureToggle = mustGet<HTMLInputElement>('simulate-failure');
@@ -182,6 +184,13 @@ let distortionRenderCosts: number[] = [];
 let distortionRenderCostMs = 0;
 let lastWarpDelta: FrameDeltaStats | null = null;
 let lastWarpMetricAt = 0;
+/**
+ * Public diagnostic A/B: when false, the distortion effect stays selected but
+ * the offscreen pass draws the same frame through the identity shader. The
+ * output still comes from the distortion renderer canvas, never from the raw
+ * video element, and every paused-output rule still applies.
+ */
+let distortionWarpEnabled = true;
 let detectionErrors = 0;
 let detectionTimings: number[] = [];
 let detectedFrames = 0;
@@ -430,6 +439,12 @@ function bindControls(): void {
   });
   occlusionToggle.addEventListener('change', () => {
     setOcclusionEnabled(occlusionToggle.checked);
+  });
+  distortionWarpToggle.addEventListener('change', () => {
+    setDistortionWarpEnabled(distortionWarpToggle.checked);
+  });
+  distortionContextToggle.addEventListener('change', () => {
+    setDistortionContextLost(distortionContextToggle.checked);
   });
   vcamRestart.addEventListener('click', () => {
     if (!window.shymask) return;
@@ -848,6 +863,13 @@ function applyFixture(fixture: FixtureInfo): void {
   warmupInferenceMs = 0;
   persistentTrackerError = null;
   resetDistortionMetrics();
+  // A recheck/start begins a fresh diagnostic session; the warp is applied and
+  // the context-loss injection is off. A genuinely lost context is not silently
+  // restored here: the renderer stays non-drawable until the browser restores it
+  // or the tracker renderer is rebuilt.
+  distortionWarpEnabled = true;
+  distortionWarpToggle.checked = true;
+  distortionContextToggle.checked = false;
   timeline.reset();
   latestTimestamp = null;
   latestStats = null;
@@ -951,10 +973,7 @@ function disposeDistortionRenderer(): void {
   if (!distortionRenderer) return;
   distortionRenderer.dispose();
   distortionRenderer = null;
-  distortionRenderCosts = [];
-  distortionRenderCostMs = 0;
-  lastWarpDelta = null;
-  lastWarpMetricAt = 0;
+  resetDistortionMetrics();
 }
 
 /** Resets the per-session distortion evidence and rolling cost samples. */
@@ -994,6 +1013,9 @@ async function startPreview(): Promise<void> {
   warmupInferenceMs = 0;
   persistentTrackerError = null;
   resetDistortionMetrics();
+  distortionWarpEnabled = true;
+  distortionWarpToggle.checked = true;
+  distortionContextToggle.checked = false;
   timeline.reset();
   frameIntervals = [];
   renderCosts = [];
@@ -1090,7 +1112,9 @@ function processFrame(element: HTMLVideoElement, now: number, metadata: VideoFra
     state.ready = false;
     state.processingError = activeEffect.mask
       ? 'The face pose was not drawable for more than 250 ms. Output is hidden.'
-      : DECODE_STALL_MESSAGE;
+      : activeEffect.distortion
+        ? 'The face-distortion renderer is not drawable (its WebGL context may be lost). Output is hidden.'
+        : DECODE_STALL_MESSAGE;
   }
 
   const pausedDecision = resolveOutput(state);
@@ -1351,12 +1375,17 @@ function drawProcessedFrame(element: HTMLVideoElement): boolean {
     // this persists) is the only alternative to drawing the raw frame.
     if (!geometry || !distortionRenderer) return false;
     distortionRenderer.setGeometry(geometry);
-    distortionCostMs = distortionRenderer.render(element);
+    const renderCostMs = distortionRenderer.render(element, { warp: distortionWarpEnabled });
+    // A lost WebGL context is not drawable: return false so the caller keeps the
+    // previous processed frame and the 250 ms undrawable guard hides the output.
+    // The renderer never falls back to the raw video element.
+    if (renderCostMs === null) return false;
+    distortionCostMs = renderCostMs;
     distortionRenderCostMs = distortionCostMs;
     distortionRenderCosts = pushRolling(distortionRenderCosts, distortionCostMs);
     frameSource = distortionRenderer.canvas;
     const metricNow = performance.now();
-    if (metricNow - lastWarpMetricAt >= 200) {
+    if (distortionWarpEnabled && metricNow - lastWarpMetricAt >= 200) {
       lastWarpMetricAt = metricNow;
       lastWarpDelta = distortionRenderer.measureWarpDelta(geometry);
     }
@@ -1365,11 +1394,11 @@ function drawProcessedFrame(element: HTMLVideoElement): boolean {
   if (activeEffect.mask) {
     if (!maskRenderer || !lastMaskProjection.visible) return false;
     maskRenderCostMs = maskRenderer.render();
-    latestStats = pipeline.renderProcessedFrame(frameSource, treatment, maskRenderer.canvas);
+    latestStats = pipeline.renderProcessedFrame({ source: frameSource, treatment, overlay: maskRenderer.canvas });
     renderCosts = pushRolling(renderCosts, latestStats.renderCostMs + maskRenderCostMs + distortionCostMs);
   } else {
     if (!treatment && !activeEffect.distortion) return false;
-    latestStats = pipeline.renderProcessedFrame(frameSource, treatment, null);
+    latestStats = pipeline.renderProcessedFrame({ source: frameSource, treatment });
     renderCosts = pushRolling(renderCosts, latestStats.renderCostMs + distortionCostMs);
   }
   publishOutputFrame();
@@ -1477,6 +1506,47 @@ function setOcclusionEnabled(enabled: boolean): void {
 }
 
 /**
+ * Public diagnostic A/B for the distortion: applies or removes only the warp
+ * term while the effect stays selected. The offscreen canvas still produces the
+ * frame (identity pass when disabled), so this is not a passthrough path; all
+ * paused-output rules still gate the output.
+ */
+function setDistortionWarpEnabled(enabled: boolean): void {
+  if (distortionWarpEnabled === enabled) return;
+  distortionWarpEnabled = enabled;
+  if (!enabled) {
+    lastWarpDelta = null;
+    lastWarpMetricAt = 0;
+  }
+  renderNow();
+  updateDiagnostics(performance.now());
+}
+
+/**
+ * Diagnostic-only WebGL context-loss injection for the new renderer. The
+ * renderer marks itself non-drawable, `render()` returns null and
+ * `drawProcessedFrame` returns false, so the existing 250 ms undrawable guard
+ * hides the whole output instead of compositing a stale canvas. Unchecking
+ * requests a browser restore; the normal recovery path then redraws the effect.
+ */
+function setDistortionContextLost(lost: boolean): void {
+  if (!distortionRenderer) {
+    distortionContextToggle.checked = false;
+    return;
+  }
+  const applied = lost ? distortionRenderer.loseContext() : distortionRenderer.restoreContext();
+  if (!applied) {
+    // The browser has no WEBGL_lose_context extension; leave the control off and
+    // record the limitation rather than pretending the failure was injected.
+    distortionContextToggle.checked = false;
+    updateDiagnostics(performance.now());
+    return;
+  }
+  renderNow();
+  updateDiagnostics(performance.now());
+}
+
+/**
  * Freezes the replay image while keeping the processed output visible, so a
  * diagnostic comparison (occlusion on/off) is not polluted by the person moving
  * between captures. The decode-stall watchdog is told a frame is not expected;
@@ -1571,6 +1641,8 @@ function updateControls(): void {
   injectionSelect.disabled = !trackerReady;
   poseSmoothingSelect.disabled = !trackerReady;
   occlusionToggle.disabled = !trackerReady;
+  distortionWarpToggle.disabled = !trackerReady || !activeEffect.distortion;
+  distortionContextToggle.disabled = !trackerReady || !activeEffect.distortion;
   holdFrameToggle.disabled = !state.started;
   recheckButton.disabled = false;
   importPackageButton.disabled = importInFlight;
@@ -1696,8 +1768,11 @@ function updateOcclusionDiagnostics(): void {
 
 function updateDistortionDiagnostics(): void {
   const distortion = activeEffect.distortion;
+  const warpEnabled = distortion ? distortionWarpEnabled : false;
+  const drawable = distortionRenderer ? distortionRenderer.isDrawable() : false;
+  const contextLost = distortionRenderer ? distortionRenderer.contextIsLost : false;
   if (!distortion) {
-    setDiag('diag-distortion', 'active=false');
+    setDiag('diag-distortion', `active=false warpEnabled=${warpEnabled} drawable=${drawable} contextLost=${contextLost}`);
     return;
   }
   const face = lastAcceptedFaceBbox;
@@ -1708,7 +1783,7 @@ function updateDistortionDiagnostics(): void {
     : 'faceX=0 faceY=0 faceW=0 faceH=0 centerX=0 centerY=0 radiusX=0 radiusY=0';
   setDiag(
     'diag-distortion',
-    `active=true mode=${distortion.mode} strength=${distortion.strength} radiusScale=${distortion.radiusScale} centerOffset=${distortion.centerOffset.join(',')} ${geometryFields} costMsLast=${distortionRenderCostMs.toFixed(2)} costMsP95=${percentile95(distortionRenderCosts).toFixed(2)} warpDelta=${(delta?.meanAbsDiff ?? 0).toFixed(2)} changedInsidePct=${(delta?.changedInsidePct ?? 0).toFixed(1)} changedOutsidePct=${(delta?.changedOutsidePct ?? 0).toFixed(1)} insidePixels=${delta?.insidePixels ?? 0}`,
+    `active=true mode=${distortion.mode} strength=${distortion.strength} radiusScale=${distortion.radiusScale} centerOffset=${distortion.centerOffset.join(',')} warpEnabled=${warpEnabled} drawable=${drawable} contextLost=${contextLost} ${geometryFields} costMsLast=${distortionRenderCostMs.toFixed(2)} costMsP95=${percentile95(distortionRenderCosts).toFixed(2)} warpDelta=${(delta?.meanAbsDiff ?? 0).toFixed(2)} changedInsidePct=${(delta?.changedInsidePct ?? 0).toFixed(1)} changedOutsidePct=${(delta?.changedOutsidePct ?? 0).toFixed(1)} insidePixels=${delta?.insidePixels ?? 0}`,
   );
 }
 

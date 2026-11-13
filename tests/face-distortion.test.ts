@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { FaceDistortionParameters } from '../src/core/effect-package-contract';
-import { faceDistortionContains, faceDistortionGeometry } from '../src/core/face-distortion';
+import {
+  distortionRenderable,
+  faceDistortionContains,
+  faceDistortionGeometry,
+} from '../src/core/face-distortion';
 
 function parameters(overrides: Partial<FaceDistortionParameters> = {}): FaceDistortionParameters {
   return { mode: 'bulge', strength: 0.6, radiusScale: 1.35, centerOffset: [0, 0], ...overrides };
@@ -69,3 +73,19 @@ test('the ellipse containment test matches the shader region', () => {
     false,
   );
 });
+
+/**
+ * A lost or disposed WebGL context must make the renderer non-drawable. The
+ * caller then returns false from the processed-frame path, the existing 250 ms
+ * undrawable guard hides the output, and there is no raw-frame fallback. The
+ * WebGL integration itself is exercised through the public context-loss
+ * injection in `npm run check`; this covers the decision that gates it.
+ */
+test('a disposed or context-lost distortion renderer is never drawable', () => {
+  assert.equal(distortionRenderable({ disposed: false, contextLost: false, glContextLost: false }), true);
+  assert.equal(distortionRenderable({ disposed: true, contextLost: false, glContextLost: false }), false);
+  assert.equal(distortionRenderable({ disposed: false, contextLost: true, glContextLost: false }), false);
+  assert.equal(distortionRenderable({ disposed: false, contextLost: false, glContextLost: true }), false);
+  assert.equal(distortionRenderable({ disposed: true, contextLost: true, glContextLost: true }), false);
+});
+

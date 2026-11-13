@@ -67,6 +67,14 @@
             <input type="checkbox" id="occlusion-toggle" data-testid="occlusion-toggle" checked />
             Face occlusion (diagnostic)
           </label>
+          <label class="checkbox">
+            <input type="checkbox" id="distortion-warp-toggle" data-testid="distortion-warp-toggle" checked />
+            Apply face-distortion warp (diagnostic A/B)
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="distortion-context-loss" data-testid="distortion-context-loss" />
+            Simulate distortion WebGL context loss (diagnostic)
+          </label>
           <div class="button-row secondary">
             <button id="recheck" data-testid="recheck" type="button">Recheck input</button>
             <button id="capture" data-testid="capture" type="button">Capture evidence frame</button>
